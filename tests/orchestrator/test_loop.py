@@ -64,6 +64,10 @@ from orcest.shared.coordination import (
 )
 from orcest.shared.models import CONSUMER_GROUP, ResultStatus, TaskResult
 from orcest.shared.redis_client import RedisClient
+from orcest.shared.result_stream_health import (
+    RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS,
+    result_consumer_heartbeat_key,
+)
 
 
 def _consume_results(config: OrchestratorConfig, redis, logger):
@@ -2232,6 +2236,32 @@ def test_consume_results_empty(fake_redis_client, orchestrator_config, gh_mock):
     gh_mock.post_comment.assert_not_called()
     gh_mock.add_label.assert_not_called()
     gh_mock.remove_label.assert_not_called()
+    assert fake_redis_client.get(result_consumer_heartbeat_key()) == "1"
+    assert (
+        0
+        < fake_redis_client.ttl(result_consumer_heartbeat_key())
+        <= (RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS)
+    )
+
+
+def test_consume_results_failure_does_not_record_live_heartbeat(
+    fake_redis_client, orchestrator_config, gh_mock, mocker
+):
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    mocker.patch.object(
+        fake_redis_client,
+        "xreadgroup",
+        side_effect=RuntimeError("secret read failure"),
+    )
+
+    with pytest.raises(RuntimeError, match="secret read failure"):
+        _consume_results(
+            orchestrator_config,
+            fake_redis_client,
+            logging.getLogger("test"),
+        )
+
+    assert fake_redis_client.get(result_consumer_heartbeat_key()) is None
 
 
 def test_consume_results_xack_failure_continues(

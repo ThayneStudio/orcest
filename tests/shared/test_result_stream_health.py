@@ -5,6 +5,7 @@ import redis as redis_lib
 
 from orcest.shared.models import RESULTS_GROUP, RESULTS_STREAM
 from orcest.shared.result_stream_health import (
+    RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS,
     RESULT_CONSUMER_LIVE_IDLE_SECONDS,
     RESULT_PENDING_INSPECTION_LIMIT,
     RESULT_PENDING_PAGE_SIZE,
@@ -13,6 +14,7 @@ from orcest.shared.result_stream_health import (
     format_result_stream_metrics,
     format_result_stream_warning,
     inspect_result_stream_raw,
+    result_consumer_heartbeat_key,
 )
 
 pytestmark = pytest.mark.unit
@@ -32,7 +34,15 @@ def _pending_row(
     }
 
 
-def _mock_group(mocker, redis, *, pending: int, lag: int, consumer_idle_seconds: int = 0):
+def _mock_group(
+    mocker,
+    redis,
+    *,
+    pending: int,
+    lag: int,
+    consumer_idle_seconds: int = 0,
+    heartbeat_age_seconds: int | None = 0,
+):
     mocker.patch.object(
         redis.client,
         "xinfo_groups",
@@ -45,6 +55,12 @@ def _mock_group(mocker, redis, *, pending: int, lag: int, consumer_idle_seconds:
             }
         ],
     )
+    if heartbeat_age_seconds is not None:
+        redis.set_ex(
+            result_consumer_heartbeat_key(),
+            "1",
+            ttl=RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS - heartbeat_age_seconds,
+        )
     mocker.patch.object(
         redis.client,
         "xinfo_consumers",
@@ -172,7 +188,9 @@ def test_pending_page_error_preserves_secret_free_partial_coverage(fake_redis_cl
     assert "secret endpoint detail" not in str(health)
 
 
-def test_stale_registered_result_consumer_does_not_count_as_live(fake_redis_client, mocker):
+def test_registered_result_consumer_without_heartbeat_does_not_count_as_live(
+    fake_redis_client, mocker
+):
     stream = fake_redis_client._prefixed(RESULTS_STREAM)
     fake_redis_client.client.xadd(stream, {"task_id": "retained"})
     _mock_group(
@@ -180,7 +198,8 @@ def test_stale_registered_result_consumer_does_not_count_as_live(fake_redis_clie
         fake_redis_client,
         pending=0,
         lag=1,
-        consumer_idle_seconds=RESULT_CONSUMER_LIVE_IDLE_SECONDS,
+        consumer_idle_seconds=0,
+        heartbeat_age_seconds=None,
     )
 
     health = inspect_result_stream_raw(fake_redis_client, stream)
@@ -191,7 +210,9 @@ def test_stale_registered_result_consumer_does_not_count_as_live(fake_redis_clie
     assert "live_consumers=0/1" in format_result_stream_warning(health)
 
 
-def test_recently_active_result_consumer_keeps_fresh_lag_healthy(fake_redis_client, mocker):
+def test_fresh_heartbeat_keeps_fresh_lag_healthy_with_pre_7_2_idle_semantics(
+    fake_redis_client, mocker
+):
     stream = fake_redis_client._prefixed(RESULTS_STREAM)
     fake_redis_client.client.xadd(stream, {"task_id": "retained"})
     _mock_group(
@@ -199,7 +220,9 @@ def test_recently_active_result_consumer_keeps_fresh_lag_healthy(fake_redis_clie
         fake_redis_client,
         pending=0,
         lag=1,
-        consumer_idle_seconds=RESULT_CONSUMER_LIVE_IDLE_SECONDS - 1,
+        # Redis before 7.2 leaves this value stale when an XREADGROUP poll
+        # returns no entries. The independent heartbeat remains authoritative.
+        consumer_idle_seconds=RESULT_CONSUMER_LIVE_IDLE_SECONDS * 2,
     )
 
     health = inspect_result_stream_raw(fake_redis_client, stream)
@@ -210,7 +233,93 @@ def test_recently_active_result_consumer_keeps_fresh_lag_healthy(fake_redis_clie
     assert format_result_stream_warning(health) is None
 
 
+def test_malformed_heartbeat_is_explicit_and_secret_free(fake_redis_client, mocker):
+    stream = fake_redis_client._prefixed(RESULTS_STREAM)
+    fake_redis_client.client.xadd(stream, {"task_id": "retained"})
+    _mock_group(mocker, fake_redis_client, pending=0, lag=1)
+    fake_redis_client.set_ex(
+        result_consumer_heartbeat_key(),
+        "secret malformed heartbeat",
+        ttl=RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS,
+    )
+
+    health = inspect_result_stream_raw(fake_redis_client, stream)
+
+    assert health.inspection_error == f"{stream}: result consumer heartbeat is malformed"
+    assert "secret" not in str(health)
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"name": RESULTS_GROUP, "secret": "group collection"},
+        ["secret group row"],
+    ],
+)
+def test_malformed_group_collection_or_row_is_explicit_and_secret_free(
+    fake_redis_client, mocker, malformed
+):
+    stream = fake_redis_client._prefixed(RESULTS_STREAM)
+    fake_redis_client.client.xadd(stream, {"task_id": "retained"})
+    mocker.patch.object(fake_redis_client.client, "xinfo_groups", return_value=malformed)
+
+    health = inspect_result_stream_raw(fake_redis_client, stream)
+
+    assert health.inspection_error == (f"{stream}: results consumer group metadata is malformed")
+    assert "secret" not in str(health)
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"name": "orchestrator-main", "secret": "consumer collection"},
+        ["secret consumer row"],
+    ],
+)
+def test_malformed_consumer_collection_or_row_is_explicit_and_secret_free(
+    fake_redis_client, mocker, malformed
+):
+    stream = fake_redis_client._prefixed(RESULTS_STREAM)
+    fake_redis_client.client.xadd(stream, {"task_id": "retained"})
+    mocker.patch.object(
+        fake_redis_client.client,
+        "xinfo_groups",
+        return_value=[{"name": RESULTS_GROUP, "consumers": 1, "pending": 0, "lag": 1}],
+    )
+    mocker.patch.object(fake_redis_client.client, "xinfo_consumers", return_value=malformed)
+
+    health = inspect_result_stream_raw(fake_redis_client, stream)
+
+    assert health.inspection_error == f"{stream}: result consumer liveness is malformed"
+    assert "secret" not in str(health)
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"message_id": "1-0", "secret": "pending collection"},
+        ["secret pending row"],
+    ],
+)
+def test_malformed_pending_collection_or_row_is_explicit_and_secret_free(
+    fake_redis_client, mocker, malformed
+):
+    stream = fake_redis_client._prefixed(RESULTS_STREAM)
+    fake_redis_client.client.xadd(stream, {"task_id": "retained"})
+    _mock_group(mocker, fake_redis_client, pending=1, lag=0)
+    mocker.patch.object(fake_redis_client.client, "xpending_range", return_value=malformed)
+
+    health = inspect_result_stream_raw(fake_redis_client, stream)
+
+    assert health.inspection_error == f"{stream}: pending result metadata is malformed"
+    assert health.pending_inspection_complete is False
+    assert "secret" not in str(health)
+
+
 def test_results_constants_are_shared_by_worker_and_orchestrator_modules():
+    from orcest.canary_evidence import RESULTS_STREAM as canary_stream
+    from orcest.dashboard import RESULTS_STREAM as dashboard_stream
+    from orcest.fleet.pool_manager import RESULTS_STREAM as pool_manager_stream
     from orcest.orchestrator.loop import (
         RESULTS_GROUP as orchestrator_group,
         RESULTS_STREAM as orchestrator_stream,
@@ -220,3 +329,6 @@ def test_results_constants_are_shared_by_worker_and_orchestrator_modules():
     assert orchestrator_group == RESULTS_GROUP
     assert orchestrator_stream == RESULTS_STREAM
     assert worker_stream == RESULTS_STREAM
+    assert pool_manager_stream == RESULTS_STREAM
+    assert dashboard_stream == RESULTS_STREAM
+    assert canary_stream == RESULTS_STREAM

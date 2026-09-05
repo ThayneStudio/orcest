@@ -2,19 +2,39 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
 import redis as redis_lib
 
-from orcest.shared.models import RESULTS_GROUP, RESULTS_STREAM
+from orcest.shared.models import RESULTS_CONSUMER_NAME, RESULTS_GROUP, RESULTS_STREAM
 from orcest.shared.redis_client import RedisClient
 
 RESULT_PENDING_STALE_IDLE_SECONDS = 15 * 60
 RESULT_PENDING_STALE_DELIVERIES = 10
 RESULT_CONSUMER_LIVE_IDLE_SECONDS = 15 * 60
+# Keep stale heartbeat age observable for one additional liveness window. The
+# heartbeat is independent of XINFO CONSUMERS because Redis before 7.2 does not
+# reset consumer ``idle`` for an empty XREADGROUP poll.
+RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS = RESULT_CONSUMER_LIVE_IDLE_SECONDS * 2
 RESULT_PENDING_PAGE_SIZE = 100
 RESULT_PENDING_INSPECTION_LIMIT = 1000
+_RESULT_CONSUMER_HEARTBEAT_VALUE = "1"
+
+
+def result_consumer_heartbeat_key(consumer: str = RESULTS_CONSUMER_NAME) -> str:
+    """Return the project-local heartbeat key for a result consumer."""
+    return f"{RESULTS_STREAM}:consumer-heartbeat:{consumer}"
+
+
+def record_result_consumer_heartbeat(redis: RedisClient) -> None:
+    """Record a successful pass through the result-consumer loop."""
+    redis.set_ex(
+        result_consumer_heartbeat_key(),
+        _RESULT_CONSUMER_HEARTBEAT_VALUE,
+        RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS,
+    )
 
 
 @dataclass(frozen=True)
@@ -27,7 +47,7 @@ class ResultStreamHealth:
     lag: int
     consumers: int
     live_consumers: int
-    youngest_consumer_idle_seconds: int | None
+    youngest_consumer_heartbeat_age_seconds: int | None
     sampled_oldest_pending_idle_seconds: int | None
     sampled_max_delivery_count: int
     sampled_pending: int
@@ -91,14 +111,42 @@ def inspect_result_stream_raw(redis: RedisClient, stream: str) -> ResultStreamHe
             )
 
         retained_entries = int(cast(Any, redis.client.xlen(stream)))
-        groups = cast(list[dict[str, Any]], redis.client.xinfo_groups(stream))
-        matching = [group for group in groups if _text(group.get("name")) == RESULTS_GROUP]
+        raw_groups = cast(Any, redis.client.xinfo_groups(stream))
+        groups = _mapping_rows(raw_groups)
+        if groups is None:
+            return _result(
+                stream,
+                stream_exists=True,
+                retained_entries=retained_entries,
+                inspection_error=f"{stream}: results consumer group metadata is malformed",
+            )
+
+        named_groups: list[tuple[str, Mapping[str, Any]]] = []
+        for group in groups:
+            name = _text_or_none(group.get("name"))
+            if name is None:
+                return _result(
+                    stream,
+                    stream_exists=True,
+                    retained_entries=retained_entries,
+                    inspection_error=f"{stream}: results consumer group metadata is malformed",
+                )
+            named_groups.append((name, group))
+        matching = [group for name, group in named_groups if name == RESULTS_GROUP]
         if not matching:
             return _result(
                 stream,
                 stream_exists=True,
                 retained_entries=retained_entries,
                 inspection_error=f"{stream}: results consumer group {RESULTS_GROUP!r} is missing",
+            )
+
+        if len(matching) != 1:
+            return _result(
+                stream,
+                stream_exists=True,
+                retained_entries=retained_entries,
+                inspection_error=f"{stream}: results consumer group metadata is malformed",
             )
 
         group = matching[0]
@@ -116,7 +164,7 @@ def inspect_result_stream_raw(redis: RedisClient, stream: str) -> ResultStreamHe
 
         (
             live_consumers,
-            youngest_consumer_idle_seconds,
+            youngest_consumer_heartbeat_age_seconds,
             consumer_error,
         ) = _inspect_consumer_liveness(redis, stream, consumers)
         if consumer_error is not None:
@@ -146,14 +194,14 @@ def inspect_result_stream_raw(redis: RedisClient, stream: str) -> ResultStreamHe
             lag=lag,
             consumers=consumers,
             live_consumers=live_consumers,
-            youngest_consumer_idle_seconds=youngest_consumer_idle_seconds,
+            youngest_consumer_heartbeat_age_seconds=(youngest_consumer_heartbeat_age_seconds),
             sampled_oldest_pending_idle_seconds=sampled_oldest_pending_idle_seconds,
             sampled_max_delivery_count=sampled_max_delivery_count,
             sampled_pending=sampled_pending,
             pending_inspection_complete=pending_inspection_complete,
             inspection_error=pending_error,
         )
-    except (redis_lib.RedisError, TypeError, ValueError) as exc:
+    except (redis_lib.RedisError, AttributeError, TypeError, ValueError) as exc:
         return _result(stream, inspection_error=f"{stream}: {type(exc).__name__}")
 
 
@@ -164,13 +212,13 @@ def format_result_stream_warning(health: ResultStreamHealth) -> str | None:
     if health.unconsumed:
         youngest = (
             "none"
-            if health.youngest_consumer_idle_seconds is None
-            else f"{health.youngest_consumer_idle_seconds}s"
+            if health.youngest_consumer_heartbeat_age_seconds is None
+            else f"{health.youngest_consumer_heartbeat_age_seconds}s"
         )
         return (
             f"UNCONSUMED result handling on {health.stream}: pending={health.pending} "
             f"lag={health.lag} live_consumers={health.live_consumers}/"
-            f"{health.consumers} youngest_consumer_idle={youngest}"
+            f"{health.consumers} youngest_consumer_heartbeat_age={youngest}"
         )
     if not health.stale:
         return None
@@ -201,8 +249,8 @@ def format_result_stream_metrics(health: ResultStreamHealth) -> tuple[tuple[str,
     )
     youngest_consumer = (
         "--"
-        if health.youngest_consumer_idle_seconds is None
-        else f"{health.youngest_consumer_idle_seconds}s"
+        if health.youngest_consumer_heartbeat_age_seconds is None
+        else f"{health.youngest_consumer_heartbeat_age_seconds}s"
     )
     coverage = f"{health.sampled_pending}/{health.pending}"
     if not health.pending_inspection_complete:
@@ -216,7 +264,7 @@ def format_result_stream_metrics(health: ResultStreamHealth) -> tuple[tuple[str,
         ("Max deliveries", max_deliveries),
         ("Pending inspected", coverage),
         ("Live/registered consumers", f"{health.live_consumers}/{health.consumers}"),
-        ("Newest consumer idle", youngest_consumer),
+        ("Newest consumer heartbeat age", youngest_consumer),
     )
 
 
@@ -238,7 +286,7 @@ def _result(
     lag: int = 0,
     consumers: int = 0,
     live_consumers: int = 0,
-    youngest_consumer_idle_seconds: int | None = None,
+    youngest_consumer_heartbeat_age_seconds: int | None = None,
     sampled_oldest_pending_idle_seconds: int | None = None,
     sampled_max_delivery_count: int = 0,
     sampled_pending: int = 0,
@@ -252,7 +300,7 @@ def _result(
         retained_entries=retained_entries,
         consumers=consumers,
         live_consumers=live_consumers,
-        youngest_consumer_idle_seconds=youngest_consumer_idle_seconds,
+        youngest_consumer_heartbeat_age_seconds=youngest_consumer_heartbeat_age_seconds,
         pending=pending,
         lag=lag,
         sampled_oldest_pending_idle_seconds=sampled_oldest_pending_idle_seconds,
@@ -267,26 +315,51 @@ def _inspect_consumer_liveness(
     redis: RedisClient, stream: str, registered_consumers: int
 ) -> tuple[int, int | None, str | None]:
     try:
-        rows = cast(
-            list[dict[str, Any]],
-            redis.client.xinfo_consumers(stream, RESULTS_GROUP),
-        )
-    except (redis_lib.RedisError, TypeError, ValueError) as exc:
+        raw_rows = cast(Any, redis.client.xinfo_consumers(stream, RESULTS_GROUP))
+    except (redis_lib.RedisError, AttributeError, TypeError, ValueError) as exc:
         return 0, None, f"{stream}: result consumer liveness {type(exc).__name__}"
+    rows = _mapping_rows(raw_rows)
+    if rows is None:
+        return 0, None, f"{stream}: result consumer liveness is malformed"
     if len(rows) != registered_consumers:
         return 0, None, f"{stream}: result consumer liveness is unavailable"
 
-    idle_values: list[int] = []
+    heartbeat_ages: list[int] = []
+    seen_names: set[str] = set()
     for row in rows:
+        name = _text_or_none(row.get("name"))
+        consumer_pending = _non_negative_int(row.get("pending"))
         idle_ms = _non_negative_int(row.get("idle"))
-        if idle_ms is None:
+        if name is None or name in seen_names or consumer_pending is None or idle_ms is None:
             return 0, None, f"{stream}: result consumer liveness is malformed"
-        idle_values.append(idle_ms)
+        seen_names.add(name)
 
-    live_consumers = sum(
-        idle_ms < RESULT_CONSUMER_LIVE_IDLE_SECONDS * 1000 for idle_ms in idle_values
-    )
-    youngest_idle_seconds = min(idle_values) // 1000 if idle_values else None
+        try:
+            heartbeat_key = _raw_result_consumer_heartbeat_key(stream, name)
+            raw_heartbeat = cast(Any, redis.client.get(heartbeat_key))
+            if raw_heartbeat is None:
+                continue
+            if _text_or_none(raw_heartbeat) != _RESULT_CONSUMER_HEARTBEAT_VALUE:
+                return 0, None, f"{stream}: result consumer heartbeat is malformed"
+            raw_ttl = cast(
+                Any,
+                redis.client.ttl(heartbeat_key),
+            )
+        except (redis_lib.RedisError, AttributeError, TypeError, ValueError) as exc:
+            return 0, None, f"{stream}: result consumer heartbeat {type(exc).__name__}"
+        heartbeat_ttl = _int_or_none(raw_ttl)
+        if heartbeat_ttl == -2:
+            continue
+        if (
+            heartbeat_ttl is None
+            or heartbeat_ttl < 0
+            or heartbeat_ttl > RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS
+        ):
+            return 0, None, f"{stream}: result consumer heartbeat is malformed"
+        heartbeat_ages.append(RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS - heartbeat_ttl)
+
+    live_consumers = sum(age < RESULT_CONSUMER_LIVE_IDLE_SECONDS for age in heartbeat_ages)
+    youngest_idle_seconds = min(heartbeat_ages) if heartbeat_ages else None
     return live_consumers, youngest_idle_seconds, None
 
 
@@ -306,17 +379,13 @@ def _inspect_pending_entries(
     while sampled_pending < target:
         count = min(RESULT_PENDING_PAGE_SIZE, target - sampled_pending)
         try:
-            rows = cast(
-                list[dict[str, Any]],
+            raw_rows = cast(
+                Any,
                 redis.client.xpending_range(
-                    stream,
-                    RESULTS_GROUP,
-                    min=cursor,
-                    max="+",
-                    count=count,
+                    stream, RESULTS_GROUP, min=cursor, max="+", count=count
                 ),
             )
-        except (redis_lib.RedisError, TypeError, ValueError) as exc:
+        except (redis_lib.RedisError, AttributeError, TypeError, ValueError) as exc:
             return (
                 sampled_pending,
                 oldest_idle_ms // 1000 if sampled_pending else None,
@@ -324,6 +393,15 @@ def _inspect_pending_entries(
                 False,
                 f"{stream}: pending result inspection {type(exc).__name__} after "
                 f"{sampled_pending} of {pending} entries",
+            )
+        rows = _mapping_rows(raw_rows)
+        if rows is None or len(rows) > count:
+            return (
+                sampled_pending,
+                oldest_idle_ms // 1000 if sampled_pending else None,
+                max_delivery_count,
+                False,
+                f"{stream}: pending result metadata is malformed",
             )
         if not rows:
             return (
@@ -337,19 +415,17 @@ def _inspect_pending_entries(
 
         last_id: str | None = None
         for row in rows:
-            raw_id = row.get("message_id")
-            if not isinstance(raw_id, (str, bytes)):
-                return (
-                    sampled_pending,
-                    oldest_idle_ms // 1000 if sampled_pending else None,
-                    max_delivery_count,
-                    False,
-                    (f"{stream}: pending result metadata is malformed"),
-                )
-            message_id = _text(raw_id)
+            message_id = _text_or_none(row.get("message_id"))
+            consumer = _text_or_none(row.get("consumer"))
             idle_ms = _non_negative_int(row.get("time_since_delivered"))
             deliveries = _non_negative_int(row.get("times_delivered"))
-            if not message_id or message_id in seen_ids or idle_ms is None or deliveries is None:
+            if (
+                message_id is None
+                or consumer is None
+                or message_id in seen_ids
+                or idle_ms is None
+                or deliveries is None
+            ):
                 return (
                     sampled_pending,
                     oldest_idle_ms // 1000 if sampled_pending else None,
@@ -392,11 +468,35 @@ def _non_negative_int(value: Any) -> int | None:
 
 
 def _int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, str, bytes)):
+        return None
     try:
         return int(value)
     except (TypeError, ValueError):
         return None
 
 
-def _text(value: Any) -> str:
-    return value.decode() if isinstance(value, bytes) else str(value)
+def _mapping_rows(value: Any) -> list[Mapping[str, Any]] | None:
+    if not isinstance(value, (list, tuple)):
+        return None
+    if not all(isinstance(row, Mapping) for row in value):
+        return None
+    return list(value)
+
+
+def _text_or_none(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value or None
+    if isinstance(value, bytes):
+        try:
+            decoded = value.decode()
+        except UnicodeDecodeError:
+            return None
+        return decoded or None
+    return None
+
+
+def _raw_result_consumer_heartbeat_key(stream: str, consumer: str) -> str:
+    return f"{stream}:consumer-heartbeat:{consumer}"

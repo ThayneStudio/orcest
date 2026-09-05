@@ -204,7 +204,7 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
     # Recent results (most recent first)
     recent_results = []
     try:
-        entries: list[Any] = redis.xrevrange("results", count=max_results)
+        entries: list[Any] = redis.xrevrange(RESULTS_STREAM, count=max_results)
     except redis_lib.ResponseError:
         entries = []
     for _entry_id, fields in entries:

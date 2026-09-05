@@ -10,6 +10,10 @@ from click.testing import CliRunner
 from rich.console import Console
 
 from orcest.cli import _dead_letters_command, _status_once, _validate_ssh_input, main
+from orcest.shared.result_stream_health import (
+    RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS,
+    result_consumer_heartbeat_key,
+)
 
 
 @pytest.fixture
@@ -447,6 +451,11 @@ def test_status_once_always_renders_complete_fresh_result_metrics(fake_redis_cli
         "orchestrator", "orchestrator-main", "results", count=2, block_ms=None
     )
     fake_redis_client.xack("results", "orchestrator", entries[0][0])
+    fake_redis_client.set_ex(
+        result_consumer_heartbeat_key(),
+        "1",
+        ttl=RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS,
+    )
     buf = io.StringIO()
     with patch(
         "orcest.cli.Console",
@@ -464,7 +473,7 @@ def test_status_once_always_renders_complete_fresh_result_metrics(fake_redis_cli
         "Max deliveries",
         "Pending inspected",
         "Live/registered consumers",
-        "Newest consumer idle",
+        "Newest consumer heartbeat age",
     ):
         assert metric in output
     for metric, value in (
@@ -540,6 +549,11 @@ def test_status_once_warns_for_stale_results_without_result_body(fake_redis_clie
         },
     )
     fake_redis_client.xreadgroup("orchestrator", "orchestrator-main", "results", block_ms=None)
+    fake_redis_client.set_ex(
+        result_consumer_heartbeat_key(),
+        "1",
+        ttl=RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS,
+    )
     mocker.patch.object(
         fake_redis_client.client,
         "xpending_range",

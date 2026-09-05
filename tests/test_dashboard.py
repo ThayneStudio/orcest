@@ -27,7 +27,11 @@ from orcest.shared.provider_stream_health import (
     StreamHealthState,
     stream_health_snapshot_key,
 )
-from orcest.shared.result_stream_health import RESULT_PENDING_STALE_IDLE_SECONDS
+from orcest.shared.result_stream_health import (
+    RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS,
+    RESULT_PENDING_STALE_IDLE_SECONDS,
+    result_consumer_heartbeat_key,
+)
 
 
 def test_empty_redis_returns_valid_snapshot(fake_redis_client):
@@ -1045,7 +1049,7 @@ class TestDashboardResultHealthRendering:
                     "Max deliveries": "0",
                     "Pending inspected": "0/0",
                     "Live/registered consumers": "0/0",
-                    "Newest consumer idle": "--",
+                    "Newest consumer heartbeat age": "--",
                 }
 
         _run_async(scenario())
@@ -1061,6 +1065,11 @@ class TestDashboardResultHealthRendering:
             "orchestrator", "orchestrator-main", "results", count=2, block_ms=None
         )
         fake_redis_client.xack("results", "orchestrator", entries[0][0])
+        fake_redis_client.set_ex(
+            result_consumer_heartbeat_key(),
+            "1",
+            ttl=RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS,
+        )
 
         async def scenario():
             app = _build_dashboard_app(fake_redis_client)
@@ -1087,6 +1096,11 @@ class TestDashboardResultHealthRendering:
         fake_redis_client.ensure_consumer_group("results", "orchestrator")
         fake_redis_client.xadd("results", {"task_id": "pending"})
         fake_redis_client.xreadgroup("orchestrator", "orchestrator-main", "results", block_ms=None)
+        fake_redis_client.set_ex(
+            result_consumer_heartbeat_key(),
+            "1",
+            ttl=RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS,
+        )
         mocker.patch.object(
             fake_redis_client.client,
             "xpending_range",

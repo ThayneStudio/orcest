@@ -551,7 +551,9 @@ def collect_rollout_health(
         "result_lag": result_lag,
         "result_consumers": result_health.consumers,
         "result_live_consumers": result_health.live_consumers,
-        "result_youngest_consumer_idle_seconds": result_health.youngest_consumer_idle_seconds,
+        "result_youngest_consumer_heartbeat_age_seconds": (
+            result_health.youngest_consumer_heartbeat_age_seconds
+        ),
         "result_oldest_pending_idle_seconds": result_health.oldest_pending_idle_seconds,
         "result_max_delivery_count": result_health.max_delivery_count,
         "result_sampled_oldest_pending_idle_seconds": (
@@ -617,7 +619,9 @@ def collect_rollout_health(
                 "lag": result_health.lag,
                 "live_consumers": result_health.live_consumers,
                 "registered_consumers": result_health.consumers,
-                "youngest_consumer_idle_seconds": (result_health.youngest_consumer_idle_seconds),
+                "youngest_consumer_heartbeat_age_seconds": (
+                    result_health.youngest_consumer_heartbeat_age_seconds
+                ),
                 "oldest_pending_idle_seconds": result_health.oldest_pending_idle_seconds,
                 "max_delivery_count": result_health.max_delivery_count,
                 "sampled_oldest_pending_idle_seconds": (
