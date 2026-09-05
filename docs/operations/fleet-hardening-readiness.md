@@ -26,7 +26,7 @@ its store tests do not prove recovery of the currently deployed legacy queue.
 | Session/output behavior | Expiry, logout, token rotation, reconnect, bounded connections and output queues | Existing tests cover these boundaries; local process rehearsal passed |
 | Queue recovery | Crash before ACK, durable pending state, replay, ownership safety under concurrency | Existing unit and real-Redis tests identified; local process rehearsal passed; managed Redis integration/concurrency: 12 passed |
 | External outages | GitHub/Redis failures pause safely and recover without lost outcomes or repeated effects | Unit result-replay coverage passes; local process rehearsal passed |
-| Restore and rollback | Restore data into an isolated instance; verify candidate rollback with exact artifacts | Local isolated restore rehearsal passed; prior rollout evidence must be checked for applicability |
+| Restore and rollback | Restore data into an isolated instance; verify candidate rollback with exact artifacts | Local restore and real-script rollback rehearsals passed; deployment-specific validation remains |
 | Sustained operation | 24 hours of timestamped measurements with representative work and no unexplained failure | Not started |
 
 ## PR 814 comment dispositions
@@ -104,3 +104,20 @@ that run was stopped and is not counted as passing. The isolated Linux run passe
 The first Node 24 container smoke caught a read-only `navigator` global in the
 browser smoke helper. The helper now installs its fixture with `defineProperty`;
 the Node 24 bundle smoke passes. No production browser code changed for this fix.
+
+## Rollback rehearsal result
+
+On 2026-09-05, a dedicated local Docker VM ran the real
+`dashboard/scripts/deploy-compose-dashboard.sh` against a uniquely named,
+synthetic Compose project. The previous dashboard was built from merged commit
+`27b9c5648500121e772940a8909f128ff82ac606` (Node 20); the candidate was built
+from `9dcca93` (Node 24). An invalid candidate Redis port forced published
+readiness to fail after replacement.
+
+The script rejected the candidate and restored the exact previous image ID and
+last-known-good Compose configuration. The restored dashboard reported its
+baseline revision and successful readiness. Redis kept the same container ID,
+a sentinel value, and the synthetic queued task. The candidate configuration
+file was restored for correction after rollback. The test project and its
+resources were then removed. This is executable rollback evidence for this
+runtime transition; it is not a claim that a live rollback or deployment occurred.
