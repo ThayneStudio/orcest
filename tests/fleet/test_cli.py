@@ -1,7 +1,11 @@
 """Tests for orcest.fleet.cli."""
 
+import hashlib
+import os
 import subprocess
+import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import click
@@ -1622,24 +1626,46 @@ class TestVerifyProviderClis:
 # ── image-digest verification wiring tests (M5-infra repair 3) ──
 
 
-def test_create_vm_from_cloud_image_passes_verified_checksum(mocker):
-    """M5-infra (repair 3): the sole download caller must resolve a verified
-    sha256 and forward it to download_image (checksum + algorithm), so the
-    Proxmox node actually verifies the cloud image. Round 1 passed nothing,
-    so download_image never verified.
-    """
+def test_create_vm_from_cloud_image_imports_exact_verified_temp_path_and_cleans(mocker, tmp_path):
     from rich.console import Console
 
-    from orcest.fleet.cli import _create_vm_from_cloud_image
+    from orcest.fleet.cli import _CLOUD_IMAGE_MAX_BYTES, _create_vm_from_cloud_image
 
-    cfg = _proxmox_cfg()
-    mock_px = mocker.MagicMock()
-    # The resolver returns a verified digest (GPG-checked SHA256SUMS upstream).
-    mocker.patch(
-        "orcest.fleet.cli._resolve_image_checksum",
-        return_value="deadbeef" * 8,
+    image = b"verified cloud image bytes"
+    cfg = _proxmox_cfg(
+        pool=PoolConfig(
+            storage="ssd-pool",
+            expected_image_sha256=hashlib.sha256(image).hexdigest(),
+        )
     )
-    mocker.patch("orcest.fleet.cli.subprocess.run", return_value=mocker.MagicMock(returncode=0))
+    mock_px = mocker.MagicMock()
+    workspace = tmp_path / "image-workspace"
+    mocker.patch(
+        "orcest.fleet.cli.tempfile.mkdtemp",
+        side_effect=lambda **_kwargs: workspace.mkdir() or str(workspace),
+    )
+    fetched_paths: list[Path] = []
+
+    def fetch(_url, destination, **kwargs):
+        assert kwargs["phase"] == "image"
+        assert kwargs["max_bytes"] == _CLOUD_IMAGE_MAX_BYTES
+        destination.write_bytes(image)
+        fetched_paths.append(destination)
+
+    mocker.patch("orcest.fleet.cli._fetch_cloud_image_file", side_effect=fetch)
+    imported_paths: list[Path] = []
+
+    def run_image(command, **kwargs):
+        assert command[:2] == ["qm", "set"]
+        import_arg = next(item for item in command if "import-from=" in item)
+        imported = Path(import_arg.split("import-from=", 1)[1].split(",", 1)[0])
+        assert imported == fetched_paths[0]
+        assert imported.read_bytes() == image
+        assert kwargs["termination_grace_seconds"] == 30
+        imported_paths.append(imported)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    mocker.patch("orcest.fleet.cli._run_image_command", side_effect=run_image)
 
     _create_vm_from_cloud_image(
         mock_px,
@@ -1651,28 +1677,34 @@ def test_create_vm_from_cloud_image_passes_verified_checksum(mocker):
         snippet_storage="local",
     )
 
-    mock_px.download_image.assert_called_once()
-    kwargs = mock_px.download_image.call_args.kwargs
-    assert kwargs.get("checksum") == "deadbeef" * 8
-    assert kwargs.get("checksum_algorithm") == "sha256"
+    assert imported_paths == fetched_paths
+    assert not workspace.exists()
+    assert not imported_paths[0].exists()
+    assert mock_px.create_vm.call_args.kwargs["name"].startswith("orcest-worker-template-build-")
+    mock_px.download_image.assert_not_called()
 
 
-def test_create_vm_from_cloud_image_aborts_when_checksum_unresolvable(mocker):
+def test_create_vm_from_cloud_image_aborts_when_checksum_unresolvable(mocker, tmp_path):
     """M5-infra (repair 3): verification is FAIL-CLOSED. If the digest cannot
     be resolved/verified, the bake must raise -- never download unverified.
     """
     from rich.console import Console
 
-    from orcest.fleet.cli import _create_vm_from_cloud_image
+    from orcest.fleet.cli import _CloudImageError, _create_vm_from_cloud_image
 
     cfg = _proxmox_cfg()
     mock_px = mocker.MagicMock()
+    workspace = tmp_path / "failed-workspace"
     mocker.patch(
+        "orcest.fleet.cli.tempfile.mkdtemp",
+        side_effect=lambda **_kwargs: workspace.mkdir() or str(workspace),
+    )
+    resolve = mocker.patch(
         "orcest.fleet.cli._resolve_image_checksum",
-        side_effect=RuntimeError("GPG signature verification failed"),
+        side_effect=_CloudImageError("signature failure", "manifest signature invalid"),
     )
 
-    with pytest.raises(RuntimeError, match="GPG signature verification failed"):
+    with pytest.raises(RuntimeError, match="cloud image signature failure"):
         _create_vm_from_cloud_image(
             mock_px,
             cfg,
@@ -1683,6 +1715,9 @@ def test_create_vm_from_cloud_image_aborts_when_checksum_unresolvable(mocker):
             snippet_storage="local",
         )
     mock_px.download_image.assert_not_called()
+    mock_px.create_vm.assert_not_called()
+    resolve.assert_called_once()
+    assert not workspace.exists()
 
 
 class TestResolveImageChecksum:
@@ -1698,7 +1733,8 @@ class TestResolveImageChecksum:
         from orcest.fleet.cli import _resolve_image_checksum
 
         cfg = _proxmox_cfg(pool=PoolConfig(expected_image_sha256="f" * 64))
-        run = mocker.patch("orcest.fleet.cli.subprocess.run")
+        run = mocker.patch("orcest.fleet.cli._run_image_command")
+        fetch = mocker.patch("orcest.fleet.cli._fetch_cloud_image_file")
         digest = _resolve_image_checksum(
             "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
             cfg,
@@ -1706,6 +1742,7 @@ class TestResolveImageChecksum:
         )
         assert digest == "f" * 64
         run.assert_not_called()
+        fetch.assert_not_called()
 
     def test_gpg_verifies_and_extracts_sha_for_filename(self, mocker, tmp_path):
         """Without a pinned digest: fetch SHA256SUMS + .gpg, GPG-verify against
@@ -1724,29 +1761,27 @@ class TestResolveImageChecksum:
             "ffff000000000000000000000000000000000000000000000000000000000000 *other.img\n"
         )
 
-        # Sequence of subprocess.run calls inside the resolver:
-        #   1. fetch SHA256SUMS, 2. fetch SHA256SUMS.gpg,
-        #   3. gpg --recv-keys (import), 4. gpg --verify (VALIDSIG present)
-        def fake_run(cmd, *args, **kwargs):
-            joined = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
-            if "curl" in joined and "-o" in cmd:
-                # curl -f -o <path> writes the file on success. The .gpg
-                # detached signature content is opaque to the resolver.
-                out = cmd[cmd.index("-o") + 1]
-                Path(out).write_text(sums if out.endswith("SHA256SUMS") else "SIG")
-                return mocker.MagicMock(returncode=0, stdout="", stderr="")
-            if "--recv-keys" in joined or "--list-keys" in joined:
-                return mocker.MagicMock(returncode=0, stdout="", stderr="")
-            if "--verify" in joined:
-                return mocker.MagicMock(
-                    returncode=0,
-                    stdout="[GNUPG:] VALIDSIG X D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81\n",
-                    stderr="",
-                )
-            return mocker.MagicMock(returncode=0, stdout="", stderr="")
+        fetch_calls = []
 
-        mocker.patch("orcest.fleet.cli.subprocess.run", side_effect=fake_run)
-        mocker.patch("orcest.fleet.cli.tempfile.mkdtemp", return_value=str(tmp_path))
+        def fake_fetch(_url, destination, **kwargs):
+            destination.write_text(sums if destination.name == "SHA256SUMS" else "SIG")
+            fetch_calls.append((destination, kwargs))
+
+        mocker.patch("orcest.fleet.cli._fetch_cloud_image_file", side_effect=fake_fetch)
+        command_calls = []
+
+        def fake_command(command, **kwargs):
+            command_calls.append(command)
+            stdout = ""
+            if "--verify" in command:
+                stdout = (
+                    "[GNUPG:] VALIDSIG "
+                    f"{'B' * 40} 20260905 0 0 4 0 1 10 00 "
+                    "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81\n"
+                )
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        mocker.patch("orcest.fleet.cli._run_image_command", side_effect=fake_command)
 
         digest = _resolve_image_checksum(
             "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
@@ -1754,6 +1789,9 @@ class TestResolveImageChecksum:
             Console(),
         )
         assert digest == target_sha
+        assert fetch_calls[0][1]["max_bytes"] > len(sums)
+        assert fetch_calls[1][1]["max_bytes"] > len("SIG")
+        assert any(command[0] == "gpgconf" for command in command_calls)
 
     def test_raises_when_gpg_signature_invalid(self, mocker, tmp_path):
         """Fail-closed: a bad/missing GPG signature must raise, never return a
@@ -1767,21 +1805,20 @@ class TestResolveImageChecksum:
             pool=PoolConfig(expected_image_gpg_key="D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81")
         )
 
-        def fake_run(cmd, *args, **kwargs):
-            joined = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
-            if "SHA256SUMS" in joined and "curl" in joined and "-o" in cmd:
-                out = cmd[cmd.index("-o") + 1]
-                Path(out).write_text("deadbeef *noble-server-cloudimg-amd64.img\n")
-                return mocker.MagicMock(returncode=0, stdout="", stderr="")
-            if "--verify" in joined:
-                # No VALIDSIG line / non-zero => signature failed.
-                return mocker.MagicMock(returncode=1, stdout="", stderr="BADSIG")
-            return mocker.MagicMock(returncode=0, stdout="", stderr="")
+        def fake_fetch(_url, destination, **_kwargs):
+            destination.write_text(
+                f"{'a' * 64} *noble-server-cloudimg-amd64.img\n"
+                if destination.name == "SHA256SUMS"
+                else "SIG"
+            )
 
-        mocker.patch("orcest.fleet.cli.subprocess.run", side_effect=fake_run)
-        mocker.patch("orcest.fleet.cli.tempfile.mkdtemp", return_value=str(tmp_path))
+        mocker.patch("orcest.fleet.cli._fetch_cloud_image_file", side_effect=fake_fetch)
+        mocker.patch(
+            "orcest.fleet.cli._run_image_command",
+            return_value=subprocess.CompletedProcess(["gpg"], 0, "[GNUPG:] BADSIG\n", ""),
+        )
 
-        with pytest.raises(RuntimeError, match="GPG"):
+        with pytest.raises(RuntimeError, match="cloud image signature failure"):
             _resolve_image_checksum(
                 "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
                 cfg,
@@ -1800,29 +1837,475 @@ class TestResolveImageChecksum:
             pool=PoolConfig(expected_image_gpg_key="D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81")
         )
 
-        def fake_run(cmd, *args, **kwargs):
-            joined = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
-            if "SHA256SUMS" in joined and "curl" in joined and "-o" in cmd:
-                out = cmd[cmd.index("-o") + 1]
-                Path(out).write_text("aaaa *some-other-image.img\n")
-                return mocker.MagicMock(returncode=0, stdout="", stderr="")
-            if "--verify" in joined:
-                return mocker.MagicMock(
-                    returncode=0,
-                    stdout="[GNUPG:] VALIDSIG X D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81\n",
-                    stderr="",
-                )
-            return mocker.MagicMock(returncode=0, stdout="", stderr="")
+        def fake_fetch(_url, destination, **_kwargs):
+            destination.write_text(
+                f"{'a' * 64} *some-other-image.img\n" if destination.name == "SHA256SUMS" else "SIG"
+            )
 
-        mocker.patch("orcest.fleet.cli.subprocess.run", side_effect=fake_run)
-        mocker.patch("orcest.fleet.cli.tempfile.mkdtemp", return_value=str(tmp_path))
+        mocker.patch("orcest.fleet.cli._fetch_cloud_image_file", side_effect=fake_fetch)
+        fingerprint = "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81"
+        mocker.patch(
+            "orcest.fleet.cli._run_image_command",
+            return_value=subprocess.CompletedProcess(
+                ["gpg"],
+                0,
+                f"[GNUPG:] VALIDSIG {fingerprint}\n",
+                "",
+            ),
+        )
 
-        with pytest.raises(RuntimeError, match="noble-server-cloudimg-amd64.img"):
+        with pytest.raises(RuntimeError, match="malformed manifest"):
             _resolve_image_checksum(
                 "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
                 cfg,
                 Console(),
             )
+
+    @pytest.mark.parametrize("fingerprint", ["DEADBEEF", "G" * 40])
+    def test_rejects_non_full_gpg_fingerprint_before_network(self, mocker, fingerprint):
+        from rich.console import Console
+
+        from orcest.fleet.cli import _resolve_image_checksum
+
+        cfg = _proxmox_cfg(pool=PoolConfig(expected_image_gpg_key=fingerprint))
+        fetch = mocker.patch("orcest.fleet.cli._fetch_cloud_image_file")
+
+        with pytest.raises(RuntimeError, match="full 40- or 64-hex fingerprint"):
+            _resolve_image_checksum(
+                "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
+                cfg,
+                Console(),
+            )
+
+        fetch.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("phase", "category", "detail"),
+    [
+        ("manifest", "malformed manifest", "SHA256SUMS exceeded its limit"),
+        ("manifest signature", "signature failure", "signature exceeded its limit"),
+        ("image", "storage failure", "image exceeded its safe size limit"),
+    ],
+)
+def test_fetch_cloud_image_file_enforces_in_flight_size_cap(
+    mocker, tmp_path, phase, category, detail
+):
+    from orcest.fleet.cli import _CloudImageError, _fetch_cloud_image_file
+
+    destination = tmp_path / "partial"
+
+    def oversized(command, **_kwargs):
+        assert command[command.index("--max-filesize") + 1] == "32"
+        destination.write_bytes(b"x" * 33)
+        return subprocess.CompletedProcess(command, 63)
+
+    mocker.patch("orcest.fleet.cli.subprocess.run", side_effect=oversized)
+
+    with pytest.raises(_CloudImageError) as raised:
+        _fetch_cloud_image_file(
+            "https://example.invalid/artifact",
+            destination,
+            phase=phase,
+            max_bytes=32,
+            oversized_category=category,
+            oversized_detail=detail,
+        )
+
+    assert raised.value.category == category
+    assert detail in str(raised.value)
+    assert len(str(raised.value)) <= 240
+
+
+@pytest.mark.parametrize(
+    ("returncode", "category"),
+    [(22, "transport failure"), (23, "storage failure")],
+)
+def test_fetch_cloud_image_file_keeps_transport_and_storage_failures_distinct(
+    mocker, tmp_path, returncode, category
+):
+    from orcest.fleet.cli import _CloudImageError, _fetch_cloud_image_file
+
+    mocker.patch(
+        "orcest.fleet.cli.subprocess.run",
+        return_value=subprocess.CompletedProcess(["curl"], returncode),
+    )
+
+    with pytest.raises(_CloudImageError) as raised:
+        _fetch_cloud_image_file(
+            "https://user:secret@example.invalid/image",
+            tmp_path / "partial",
+            phase="image",
+        )
+
+    assert raised.value.category == category
+    assert "secret" not in str(raised.value)
+
+
+def test_run_image_command_bounds_gpg_status_and_reaps_process(mocker):
+    from orcest.fleet.cli import _CloudImageError, _run_image_command
+
+    popen = mocker.spy(subprocess, "Popen")
+    with pytest.raises(_CloudImageError, match="GPG status output exceeded"):
+        _run_image_command(
+            [
+                sys.executable,
+                "-c",
+                "import os, time; os.write(1, b'x' * 33); time.sleep(30)",
+            ],
+            category="signature failure",
+            detail="signature verification failed",
+            stdout_limit=32,
+            oversized_detail="GPG status output exceeded its limit",
+            timeout_seconds=2,
+        )
+
+    process = popen.spy_return
+    assert process.returncode is not None
+    with pytest.raises(ChildProcessError):
+        os.waitpid(process.pid, os.WNOHANG)
+
+
+def test_run_image_command_accepts_exact_status_limit():
+    from orcest.fleet.cli import _run_image_command
+
+    result = _run_image_command(
+        [sys.executable, "-c", "import os; os.write(1, b'x' * 32)"],
+        category="signature failure",
+        detail="signature verification failed",
+        stdout_limit=32,
+        timeout_seconds=2,
+    )
+
+    assert result.stdout == "x" * 32
+
+
+def test_run_image_command_forwards_qm_grace_when_timeout_requires_cleanup(mocker):
+    from orcest.fleet.cli import _CloudImageError, _run_image_command
+
+    process = mocker.MagicMock(pid=1234, returncode=None)
+    process.wait.side_effect = subprocess.TimeoutExpired(["qm"], 1)
+    mocker.patch("orcest.fleet.cli.subprocess.Popen", return_value=process)
+    terminate = mocker.patch("orcest.fleet.cli._terminate_and_reap_image_command")
+
+    with pytest.raises(_CloudImageError, match="provisioning failure"):
+        _run_image_command(
+            ["qm", "set", "9001"],
+            category="provisioning failure",
+            detail="boot-disk import failed",
+            timeout_seconds=1,
+            termination_grace_seconds=30,
+        )
+
+    terminate.assert_called_once_with(process, grace_seconds=30)
+
+
+def test_set_vm_cloud_init_uses_bounded_qm_process_group(mocker):
+    from orcest.fleet.cli import _set_vm_cloud_init
+
+    mocker.patch("pathlib.Path.mkdir")
+    write = mocker.patch("pathlib.Path.write_text")
+    run = mocker.patch("orcest.fleet.cli._run_image_command")
+
+    _set_vm_cloud_init(mocker.MagicMock(), 9001, "#cloud-config", "local")
+
+    write.assert_called_once_with("#cloud-config")
+    command = run.call_args.args[0]
+    assert command == [
+        "qm",
+        "set",
+        "9001",
+        "--cicustom",
+        "user=local:snippets/orcest-template-9001-user.yaml",
+    ]
+    assert run.call_args.kwargs["timeout_seconds"] == 120
+    assert run.call_args.kwargs["termination_grace_seconds"] == 30
+
+
+def test_cloud_image_error_categories_and_messages_are_fixed_and_bounded():
+    from orcest.fleet.cli import _CLOUD_IMAGE_ERROR_CATEGORIES, _CloudImageError
+
+    error = _CloudImageError("transport failure", "x" * 10_000)
+
+    assert error.category in _CLOUD_IMAGE_ERROR_CATEGORIES
+    assert len(str(error)) == 240
+    with pytest.raises(ValueError, match="unsupported cloud-image error category"):
+        _CloudImageError("unknown", "detail")  # type: ignore[arg-type]
+
+
+def test_verified_cloud_image_refetches_manifest_and_image_per_attempt(mocker, tmp_path):
+    from rich.console import Console
+
+    from orcest.fleet.cli import _verified_cloud_image
+
+    generation_a = b"generation-a"
+    generation_b = b"generation-b"
+    cfg = _proxmox_cfg(pool=PoolConfig(expected_image_gpg_key="A" * 40))
+    resolve = mocker.patch(
+        "orcest.fleet.cli._resolve_image_checksum",
+        side_effect=[
+            hashlib.sha256(generation_a).hexdigest(),
+            hashlib.sha256(generation_b).hexdigest(),
+        ],
+    )
+    fetched_paths: list[Path] = []
+
+    def fetch(_url, destination, **kwargs):
+        assert kwargs["phase"] == "image"
+        if fetched_paths:
+            assert not fetched_paths[-1].parent.exists()
+        destination.write_bytes(generation_b)
+        fetched_paths.append(destination)
+
+    mocker.patch("orcest.fleet.cli._fetch_cloud_image_file", side_effect=fetch)
+    workspace = tmp_path / "retry-workspace"
+    mocker.patch(
+        "orcest.fleet.cli.tempfile.mkdtemp",
+        side_effect=lambda **_kwargs: workspace.mkdir() or str(workspace),
+    )
+
+    with _verified_cloud_image("https://example.invalid/current/image.img", cfg, Console()) as path:
+        assert path == fetched_paths[1]
+        assert path.read_bytes() == generation_b
+
+    assert resolve.call_count == 2
+    assert [call.kwargs["deadline"] for call in resolve.call_args_list] == [
+        resolve.call_args_list[0].kwargs["deadline"],
+        resolve.call_args_list[0].kwargs["deadline"],
+    ]
+    assert len(set(fetched_paths)) == 2
+    assert not workspace.exists()
+
+
+def test_verified_cloud_image_permanent_skew_fails_closed_and_cleans(mocker, tmp_path):
+    from rich.console import Console
+
+    from orcest.fleet.cli import (
+        _IMAGE_CONVERGENCE_ATTEMPTS,
+        _CloudImageError,
+        _verified_cloud_image,
+    )
+
+    cfg = _proxmox_cfg(pool=PoolConfig(expected_image_gpg_key="A" * 40))
+    resolve = mocker.patch(
+        "orcest.fleet.cli._resolve_image_checksum",
+        return_value=hashlib.sha256(b"generation-a").hexdigest(),
+    )
+    fetched_paths: list[Path] = []
+
+    def fetch(_url, destination, **_kwargs):
+        destination.write_bytes(b"generation-b")
+        fetched_paths.append(destination)
+
+    mocker.patch("orcest.fleet.cli._fetch_cloud_image_file", side_effect=fetch)
+    workspace = tmp_path / "skew-workspace"
+    mocker.patch(
+        "orcest.fleet.cli.tempfile.mkdtemp",
+        side_effect=lambda **_kwargs: workspace.mkdir() or str(workspace),
+    )
+
+    with pytest.raises(_CloudImageError) as raised:
+        with _verified_cloud_image("https://example.invalid/current/image.img", cfg, Console()):
+            pytest.fail("permanently mismatched bytes must not be yielded")
+
+    assert raised.value.category == "manifest/image generation skew"
+    assert resolve.call_count == _IMAGE_CONVERGENCE_ATTEMPTS
+    assert len(fetched_paths) == _IMAGE_CONVERGENCE_ATTEMPTS
+    assert all(not path.exists() for path in fetched_paths)
+    assert not workspace.exists()
+
+
+def test_verified_cloud_image_pinned_mismatch_is_local_checksum_failure(mocker, tmp_path):
+    from rich.console import Console
+
+    from orcest.fleet.cli import _CloudImageError, _verified_cloud_image
+
+    cfg = _proxmox_cfg(pool=PoolConfig(expected_image_sha256="a" * 64))
+    mocker.patch(
+        "orcest.fleet.cli._fetch_cloud_image_file",
+        side_effect=lambda _url, destination, **_kwargs: destination.write_bytes(b"wrong"),
+    )
+    workspace = tmp_path / "pinned-workspace"
+    mocker.patch(
+        "orcest.fleet.cli.tempfile.mkdtemp",
+        side_effect=lambda **_kwargs: workspace.mkdir() or str(workspace),
+    )
+
+    with pytest.raises(_CloudImageError) as raised:
+        with _verified_cloud_image("https://example.invalid/current/image.img", cfg, Console()):
+            pytest.fail("bad pinned bytes must not be yielded")
+
+    assert raised.value.category == "local checksum failure"
+    assert not workspace.exists()
+
+
+def test_verification_budget_exhaustion_after_mismatch_reports_timeout(mocker, tmp_path):
+    from rich.console import Console
+
+    from orcest.fleet.cli import _CloudImageError, _verified_cloud_image
+
+    cfg = _proxmox_cfg(pool=PoolConfig(expected_image_gpg_key="A" * 40))
+    resolve = mocker.patch(
+        "orcest.fleet.cli._resolve_image_checksum",
+        return_value=hashlib.sha256(b"generation-a").hexdigest(),
+    )
+    mocker.patch(
+        "orcest.fleet.cli._fetch_cloud_image_file",
+        side_effect=lambda _url, destination, **_kwargs: destination.write_bytes(b"generation-b"),
+    )
+    mocker.patch("orcest.fleet.cli.time.monotonic", side_effect=[0, 1, 2, 601])
+
+    with pytest.raises(_CloudImageError) as raised:
+        with _verified_cloud_image("https://example.invalid/current/image.img", cfg, Console()):
+            pytest.fail("mismatched bytes must not be yielded")
+
+    assert raised.value.category == "verification timeout"
+    assert "after a generation mismatch" in str(raised.value)
+    assert resolve.call_count == 1
+
+
+def test_create_vm_timeout_cleans_only_exact_marker_owned_vm(mocker, tmp_path):
+    from rich.console import Console
+
+    from orcest.fleet.cli import _create_vm_from_cloud_image, _OwnedTemplateVmCreationError
+
+    image_path = tmp_path / "verified.img"
+    image_path.write_bytes(b"verified")
+
+    @contextmanager
+    def verified(*_args, **_kwargs):
+        yield image_path
+
+    mocker.patch("orcest.fleet.cli._verified_cloud_image", side_effect=verified)
+    mock_px = mocker.MagicMock()
+
+    def ambiguous_create(**kwargs):
+        mock_px.list_vms.return_value = [{"vmid": 200, "name": kwargs["name"]}]
+        raise TimeoutError("API response lost")
+
+    mock_px.create_vm.side_effect = ambiguous_create
+
+    with pytest.raises(_OwnedTemplateVmCreationError):
+        _create_vm_from_cloud_image(
+            mock_px,
+            _proxmox_cfg(),
+            200,
+            "https://example.invalid/current/image.img",
+            Console(),
+        )
+
+
+def test_create_vm_timeout_does_not_claim_foreign_vmid(mocker, tmp_path):
+    from rich.console import Console
+
+    from orcest.fleet.cli import (
+        _CloudImageError,
+        _create_vm_from_cloud_image,
+        _OwnedTemplateVmCreationError,
+    )
+
+    image_path = tmp_path / "verified.img"
+    image_path.write_bytes(b"verified")
+
+    @contextmanager
+    def verified(*_args, **_kwargs):
+        yield image_path
+
+    mocker.patch("orcest.fleet.cli._verified_cloud_image", side_effect=verified)
+    mock_px = mocker.MagicMock()
+    mock_px.create_vm.side_effect = TimeoutError("API response lost")
+    mock_px.list_vms.return_value = [{"vmid": 200, "name": "foreign-vm"}]
+
+    with pytest.raises(_CloudImageError) as raised:
+        _create_vm_from_cloud_image(
+            mock_px,
+            _proxmox_cfg(),
+            200,
+            "https://example.invalid/current/image.img",
+            Console(),
+        )
+
+    assert not isinstance(raised.value, _OwnedTemplateVmCreationError)
+
+
+def test_import_failure_is_owned_and_cleans_verified_artifact(mocker, tmp_path):
+    from rich.console import Console
+
+    from orcest.fleet.cli import (
+        _CloudImageError,
+        _create_vm_from_cloud_image,
+        _OwnedTemplateVmCreationError,
+    )
+
+    image_path = tmp_path / "verified.img"
+
+    @contextmanager
+    def verified(*_args, **_kwargs):
+        image_path.write_bytes(b"verified")
+        try:
+            yield image_path
+        finally:
+            image_path.unlink(missing_ok=True)
+
+    mocker.patch("orcest.fleet.cli._verified_cloud_image", side_effect=verified)
+    mocker.patch(
+        "orcest.fleet.cli._run_image_command",
+        side_effect=_CloudImageError("provisioning failure", "boot-disk import failed"),
+    )
+    mock_px = mocker.MagicMock()
+
+    with pytest.raises(_OwnedTemplateVmCreationError, match="boot-disk import failed"):
+        _create_vm_from_cloud_image(
+            mock_px,
+            _proxmox_cfg(),
+            200,
+            "https://example.invalid/current/image.img",
+            Console(),
+        )
+
+    mock_px.create_vm.assert_called_once()
+    assert not image_path.exists()
+
+
+def test_rebake_service_timeout_covers_bounded_bake_and_cleanup_budget():
+    from orcest.fleet.cli import (
+        _IMAGE_FETCH_TIMEOUT_SECONDS,
+        _IMAGE_VERIFICATION_TIMEOUT_SECONDS,
+    )
+
+    service = (
+        Path(__file__).resolve().parents[2] / "provision/systemd/orcest-rebake-template.service"
+    ).read_text(encoding="utf-8")
+    timeout = int(
+        next(
+            line.split("=", 1)[1]
+            for line in service.splitlines()
+            if line.startswith("TimeoutStartSec=")
+        )
+    )
+    known_phase_budget = (
+        _IMAGE_VERIFICATION_TIMEOUT_SECONDS
+        + _IMAGE_FETCH_TIMEOUT_SECONDS  # qm import
+        + 30  # qm TERM grace
+        + 300  # Proxmox create task
+        + 120  # cloud-init attachment
+        + 30  # GPG helper shutdowns
+        + 30  # disk-resize API
+        + 300  # VM-start API/task allowance
+        + 600  # IP discovery
+        + 300  # initial SSH
+        + 695  # cloud-init plus bounded final status read
+        + 180  # three provider probes
+        + 420  # source copy and install
+        + 240  # final guest commands
+        + 60  # shutdown
+        + 300  # template conversion
+        + 600  # cleanup headroom
+        + 1200  # bounded allowance for the service's two GC passes
+    )
+
+    assert timeout == 7200
+    assert timeout >= known_phase_budget
 
 
 # ── rebake / destroy-template / gc-templates tests ──────────

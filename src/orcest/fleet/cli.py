@@ -9,21 +9,27 @@ from __future__ import annotations
 
 import fcntl
 import functools
+import os
 import re
+import selectors
 import shlex
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterator, ParamSpec, TextIO, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, ParamSpec, TextIO, TypeVar
 
 import click
 from rich.console import Console
 from rich.table import Table
 
 from orcest.fleet.config import DEFAULT_CONFIG_PATH
+from orcest.workflow_contract.v1.digest import sha256_chunks_hex
 
 if TYPE_CHECKING:
     from orcest.fleet.config import FleetConfig, ProjectEntry
@@ -39,6 +45,15 @@ _COORDINATED_BACKEND_CHANGE_META_KEY = "orcest_coordinated_backend_change"
 _DEFER_PROJECT_START_META_KEY = "orcest_defer_project_start"
 _CANDIDATE_WORKER_WAIT_SECONDS = 900
 _FLEET_OPERATION_LOCK_PATH = "/run/lock/orcest-fleet-operation.lock"
+_IMAGE_CONVERGENCE_ATTEMPTS = 3
+_IMAGE_FETCH_TIMEOUT_SECONDS = 600
+_IMAGE_VERIFICATION_TIMEOUT_SECONDS = 600
+_CLOUD_IMAGE_MAX_BYTES = 8 * 1024 * 1024 * 1024
+_IMAGE_MANIFEST_MAX_BYTES = 1024 * 1024
+_IMAGE_SIGNATURE_MAX_BYTES = 1024 * 1024
+_IMAGE_GPG_STATUS_MAX_BYTES = 64 * 1024
+_IMAGE_ERROR_MAX_CHARS = 240
+_CURL_FILESIZE_EXCEEDED = 63
 _fleet_operation_lock_depth = 0
 _fleet_operation_lock_handle: TextIO | None = None
 _P = ParamSpec("_P")
@@ -47,6 +62,43 @@ _R = TypeVar("_R")
 
 class _OwnedTemplateVmCreationError(RuntimeError):
     """Template creation failed after this invocation created the VM ID."""
+
+
+_CloudImageErrorCategory = Literal[
+    "configuration failure",
+    "transport failure",
+    "storage failure",
+    "signature failure",
+    "malformed manifest",
+    "local checksum failure",
+    "manifest/image generation skew",
+    "verification timeout",
+    "provisioning failure",
+]
+_CLOUD_IMAGE_ERROR_CATEGORIES = frozenset(
+    {
+        "configuration failure",
+        "transport failure",
+        "storage failure",
+        "signature failure",
+        "malformed manifest",
+        "local checksum failure",
+        "manifest/image generation skew",
+        "verification timeout",
+        "provisioning failure",
+    }
+)
+
+
+class _CloudImageError(RuntimeError):
+    """Bounded, secret-free cloud-image preparation or provisioning failure."""
+
+    def __init__(self, category: _CloudImageErrorCategory, detail: str) -> None:
+        if category not in _CLOUD_IMAGE_ERROR_CATEGORIES:
+            raise ValueError("unsupported cloud-image error category")
+        message = f"cloud image {category}: {detail}"
+        super().__init__(message[:_IMAGE_ERROR_MAX_CHARS])
+        self.category = category
 
 
 @contextmanager
@@ -1567,44 +1619,36 @@ def status(config: str) -> None:
         _print_worker_provider_cli_heartbeats(console, cfg.ssh_target())
 
 
-def _resolve_image_checksum(image_url: str, cfg: FleetConfig, console: Console) -> str:
-    """Return a VERIFIED sha256 hex digest for *image_url* (M5-infra).
-
-    Fail-closed image integrity for the template cloud image, mirroring
-    ``provision/create-vm.sh`` (GPG-verify ``SHA256SUMS`` then ``sha256sum -c``)
-    so the Proxmox node can verify the bytes it downloads as root.
-
-    Resolution order:
-
-    1. If ``pool.expected_image_sha256`` is set (64 hex chars), use it directly
-       -- the offline / air-gapped pin. No network, no GPG fetch.
-    2. Otherwise fetch the image's published ``SHA256SUMS`` + ``SHA256SUMS.gpg``
-       (same directory as the image), import + GPG-verify against
-       ``pool.expected_image_gpg_key`` (the ``VALIDSIG ... <fpr>`` line), and
-       extract the digest for the pinned image filename.
-
-    Raises:
-        RuntimeError: on any verification failure (bad signature, missing
-            filename in SHA256SUMS, fetch failure). The caller aborts the bake
-            rather than download the image unverified.
-    """
+def _resolve_image_checksum(
+    image_url: str,
+    cfg: FleetConfig,
+    console: Console,
+    *,
+    deadline: float | None = None,
+) -> str:
+    """Resolve one pinned or freshly GPG-verified manifest digest."""
     from urllib.parse import urlparse
 
-    # 1) Pinned digest short-circuit (offline / air-gapped).
     pinned = (cfg.pool.expected_image_sha256 or "").strip().lower()
     if pinned:
         if not re.fullmatch(r"[0-9a-f]{64}", pinned):
-            raise RuntimeError(f"pool.expected_image_sha256 must be 64 hex chars, got {pinned!r}")
+            raise _CloudImageError(
+                "configuration failure",
+                "pool.expected_image_sha256 must contain exactly 64 hex characters",
+            )
         console.print("  Image checksum: [green]pinned (config)[/green]")
         return pinned
 
-    # 2) Fetch + GPG-verify the published SHA256SUMS.
-    gpg_key = (cfg.pool.expected_image_gpg_key or "").strip()
+    gpg_key = (cfg.pool.expected_image_gpg_key or "").strip().upper()
     if not gpg_key:
-        raise RuntimeError(
-            "Image integrity is unverifiable: neither pool.expected_image_sha256"
-            " nor pool.expected_image_gpg_key is set. Refusing to download the"
-            " cloud image unverified."
+        raise _CloudImageError(
+            "configuration failure",
+            "neither an expected SHA-256 nor an expected GPG signing key is configured",
+        )
+    if re.fullmatch(r"(?:[0-9A-F]{40}|[0-9A-F]{64})", gpg_key) is None:
+        raise _CloudImageError(
+            "configuration failure",
+            "pool.expected_image_gpg_key must be a full 40- or 64-hex fingerprint",
         )
 
     parsed = urlparse(image_url)
@@ -1613,60 +1657,73 @@ def _resolve_image_checksum(image_url: str, cfg: FleetConfig, console: Console) 
     sums_url = f"{base_url}/SHA256SUMS"
     sig_url = f"{base_url}/SHA256SUMS.gpg"
 
-    console.print("  Verifying image checksum (GPG)...", end=" ")
-    workdir = Path(tempfile.mkdtemp(prefix="orcest-img-verify-"))
-    sums_path = workdir / "SHA256SUMS"
-    sig_path = workdir / "SHA256SUMS.gpg"
+    try:
+        workdir = Path(tempfile.mkdtemp(prefix="orcest-image-manifest-"))
+    except OSError as exc:
+        raise _CloudImageError("storage failure", "could not create manifest workspace") from exc
     gnupg_home = workdir / "gnupg"
     try:
+        sums_path = workdir / "SHA256SUMS"
+        sig_path = workdir / "SHA256SUMS.gpg"
         gnupg_home.mkdir(mode=0o700, exist_ok=True)
-
-        def _run(cmd: list[str], *, what: str) -> subprocess.CompletedProcess[str]:
-            try:
-                return subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            except (OSError, subprocess.SubprocessError) as exc:
-                raise RuntimeError(f"image checksum: {what} failed: {exc}") from exc
-
-        # Fetch SHA256SUMS and its detached signature (no redirects).
-        r = _run(
-            ["curl", "-fsSL", "--max-redirs", "0", "-o", str(sums_path), sums_url],
-            what="fetch SHA256SUMS",
+        _fetch_cloud_image_file(
+            sums_url,
+            sums_path,
+            phase="manifest",
+            timeout_seconds=_remaining_image_timeout(deadline, 120),
+            max_bytes=_IMAGE_MANIFEST_MAX_BYTES,
+            oversized_category="malformed manifest",
+            oversized_detail="SHA256SUMS exceeded its limit",
         )
-        if r.returncode != 0 or not sums_path.exists():
-            raise RuntimeError(f"image checksum: could not fetch {sums_url}: {r.stderr.strip()}")
-        r = _run(
-            ["curl", "-fsSL", "--max-redirs", "0", "-o", str(sig_path), sig_url],
-            what="fetch SHA256SUMS.gpg",
+        _fetch_cloud_image_file(
+            sig_url,
+            sig_path,
+            phase="manifest signature",
+            timeout_seconds=_remaining_image_timeout(deadline, 120),
+            max_bytes=_IMAGE_SIGNATURE_MAX_BYTES,
+            oversized_category="signature failure",
+            oversized_detail="manifest signature exceeded its limit",
         )
-        if r.returncode != 0 or not sig_path.exists():
-            raise RuntimeError(f"image checksum: could not fetch {sig_url}: {r.stderr.strip()}")
-
-        # Import the expected signing key into the throwaway keyring, then
-        # GPG-verify the signature. Anchor on the primary-key fingerprint in
-        # the VALIDSIG status line (Ubuntu may sign with a subkey).
         gpg_base = ["gpg", "--homedir", str(gnupg_home), "--batch"]
-        _run(
-            [*gpg_base, "--keyserver", "hkps://keyserver.ubuntu.com", "--recv-keys", gpg_key],
-            what="import signing key",
+        _run_image_command(
+            [
+                *gpg_base,
+                "--keyserver",
+                "hkps://keyserver.ubuntu.com",
+                "--recv-keys",
+                gpg_key,
+            ],
+            category="transport failure",
+            detail="could not retrieve the configured image signing key",
+            timeout_seconds=_remaining_image_timeout(deadline, 120),
         )
-        verify = _run(
+        verify = _run_image_command(
             [*gpg_base, "--status-fd", "1", "--verify", str(sig_path), str(sums_path)],
-            what="gpg --verify",
+            category="signature failure",
+            detail="manifest signature verification failed",
+            stdout_limit=_IMAGE_GPG_STATUS_MAX_BYTES,
+            oversized_detail="GPG status output exceeded its limit",
+            timeout_seconds=_remaining_image_timeout(deadline, 120),
         )
         validsig = any(
-            line.startswith("[GNUPG:] VALIDSIG") and line.rstrip().endswith(gpg_key)
-            for line in (verify.stdout or "").splitlines()
+            _validsig_primary_fingerprint(line) == gpg_key for line in verify.stdout.splitlines()
         )
-        if verify.returncode != 0 or not validsig:
-            raise RuntimeError(
-                "image checksum: GPG signature verification failed or was signed by"
-                f" an unexpected key (expected {gpg_key})."
+        if not validsig:
+            raise _CloudImageError(
+                "signature failure",
+                "manifest was not signed by the configured image signing key",
             )
-
-        # Extract the digest for the pinned image filename. Lines look like
-        # "<sha256> *noble-server-cloudimg-amd64.img" (or two-space separator).
+        _remaining_image_timeout(deadline, 120)
+        try:
+            if sums_path.stat().st_size > _IMAGE_MANIFEST_MAX_BYTES:
+                raise _CloudImageError("malformed manifest", "SHA256SUMS exceeded its limit")
+            manifest = sums_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise _CloudImageError("malformed manifest", "SHA256SUMS is not UTF-8") from exc
+        except OSError as exc:
+            raise _CloudImageError("storage failure", "could not read SHA256SUMS") from exc
         digest = ""
-        for line in sums_path.read_text().splitlines():
+        for line in manifest.splitlines():
             parts = line.split()
             if len(parts) == 2:
                 sha, name = parts
@@ -1674,18 +1731,304 @@ def _resolve_image_checksum(image_url: str, cfg: FleetConfig, console: Console) 
                     digest = sha.strip().lower()
                     break
         if not re.fullmatch(r"[0-9a-f]{64}", digest):
-            raise RuntimeError(
-                f"image checksum: no sha256 for {image_filename!r} found in the"
-                " GPG-verified SHA256SUMS."
+            raise _CloudImageError(
+                "malformed manifest",
+                "SHA256SUMS has no valid digest for the requested image filename",
             )
-        console.print("[green]ok[/green]")
         return digest
-    except RuntimeError:
+    except OSError as exc:
+        raise _CloudImageError("storage failure", "manifest workspace operation failed") from exc
+    finally:
+        _shutdown_image_gpg_home(gnupg_home)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _validsig_primary_fingerprint(line: str) -> str | None:
+    """Extract an exact full primary fingerprint from one GPG status line."""
+    fields = line.split()
+    if len(fields) < 3 or fields[:2] != ["[GNUPG:]", "VALIDSIG"]:
+        return None
+    fingerprint = fields[11] if len(fields) >= 12 else fields[2]
+    fingerprint = fingerprint.upper()
+    if re.fullmatch(r"(?:[0-9A-F]{40}|[0-9A-F]{64})", fingerprint) is None:
+        return None
+    return fingerprint
+
+
+def _remaining_image_timeout(deadline: float | None, maximum: float) -> float:
+    """Return a per-phase timeout constrained by the total verification budget."""
+    if deadline is None:
+        return maximum
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _CloudImageError(
+            "verification timeout",
+            "cloud-image verification exceeded its total time budget",
+        )
+    return min(maximum, remaining)
+
+
+def _shutdown_image_gpg_home(gnupg_home: Path) -> None:
+    """Best-effort stop daemons GPG may have launched for this temporary home."""
+    try:
+        _run_image_command(
+            ["gpgconf", "--homedir", str(gnupg_home), "--kill", "all"],
+            category="storage failure",
+            detail="could not stop temporary GPG helper processes",
+            timeout_seconds=10,
+        )
+    except _CloudImageError:
+        pass
+
+
+def _run_image_command(
+    command: list[str],
+    *,
+    category: _CloudImageErrorCategory,
+    detail: str,
+    stdout_limit: int | None = None,
+    oversized_detail: str | None = None,
+    timeout_seconds: float = 120,
+    termination_grace_seconds: float = 0.5,
+) -> subprocess.CompletedProcess[str]:
+    """Run a helper with secret-free output and optional in-flight stdout cap."""
+    process: subprocess.Popen[bytes] | None
+    if stdout_limit is None:
+        process = None
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            process.wait(timeout=max(0, timeout_seconds))
+        except (OSError, subprocess.SubprocessError) as exc:
+            if process is not None and process.returncode is None:
+                _terminate_and_reap_image_command(
+                    process,
+                    grace_seconds=termination_grace_seconds,
+                )
+            raise _CloudImageError(category, detail) from exc
+        if process.returncode != 0:
+            raise _CloudImageError(category, detail)
+        return subprocess.CompletedProcess(command, process.returncode, "", "")
+
+    process = None
+    selector: selectors.BaseSelector | None = None
+    stdout = bytearray()
+    deadline = time.monotonic() + max(0, timeout_seconds)
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        if process.stdout is None:
+            raise OSError("bounded command stdout pipe was not created")
+        os.set_blocking(process.stdout.fileno(), False)
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout_seconds)
+            events = selector.select(remaining)
+            if not events:
+                raise subprocess.TimeoutExpired(command, timeout_seconds)
+            for key, _events in events:
+                read_size = min(64 * 1024, stdout_limit + 1 - len(stdout))
+                chunk = os.read(key.fd, read_size)
+                if not chunk:
+                    selector.unregister(process.stdout)
+                    process.stdout.close()
+                    continue
+                stdout.extend(chunk)
+                if len(stdout) > stdout_limit:
+                    _terminate_and_reap_image_command(
+                        process,
+                        grace_seconds=termination_grace_seconds,
+                    )
+                    raise _CloudImageError(category, oversized_detail or detail)
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(command, timeout_seconds)
+        process.wait(timeout=remaining)
+    except _CloudImageError:
+        raise
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        if process is not None and process.returncode is None:
+            _terminate_and_reap_image_command(
+                process,
+                grace_seconds=termination_grace_seconds,
+            )
+        raise _CloudImageError(category, detail) from exc
+    finally:
+        if selector is not None:
+            selector.close()
+        if process is not None and process.stdout is not None and not process.stdout.closed:
+            process.stdout.close()
+
+    assert process is not None
+    if process.returncode != 0:
+        raise _CloudImageError(category, detail)
+    return subprocess.CompletedProcess(
+        command,
+        process.returncode,
+        bytes(stdout).decode("utf-8", errors="replace"),
+        "",
+    )
+
+
+def _terminate_and_reap_image_command(
+    process: subprocess.Popen[bytes],
+    *,
+    grace_seconds: float = 0.5,
+) -> None:
+    """Terminate an isolated image-helper group and reap its leader."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
+def _fetch_cloud_image_file(
+    url: str,
+    destination: Path,
+    *,
+    phase: str,
+    timeout_seconds: float = _IMAGE_FETCH_TIMEOUT_SECONDS,
+    max_bytes: int | None = None,
+    oversized_category: _CloudImageErrorCategory = "storage failure",
+    oversized_detail: str = "download exceeded its limit",
+) -> None:
+    """Fetch one file with an optional in-flight cap and no URL logging."""
+    command = [
+        "curl",
+        "-fsSL",
+        "--max-redirs",
+        "0",
+    ]
+    if max_bytes is not None:
+        command.extend(["--max-filesize", str(max_bytes)])
+    command.extend(["-o", str(destination), url])
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _CloudImageError("transport failure", f"{phase} download failed") from exc
+    if result.returncode == _CURL_FILESIZE_EXCEEDED:
+        raise _CloudImageError(oversized_category, oversized_detail)
+    if result.returncode in {23, 26}:
+        raise _CloudImageError("storage failure", f"could not store the downloaded {phase}")
+    if result.returncode != 0 or not destination.is_file():
+        raise _CloudImageError("transport failure", f"{phase} download failed")
+    if max_bytes is not None:
+        try:
+            if destination.stat().st_size > max_bytes:
+                raise _CloudImageError(oversized_category, oversized_detail)
+        except OSError as exc:
+            raise _CloudImageError(
+                "storage failure", f"could not inspect the downloaded {phase}"
+            ) from exc
+
+
+def _sha256_cloud_image(path: Path, *, deadline: float | None = None) -> str:
+    def chunks() -> Iterator[bytes]:
+        with path.open("rb") as image_file:
+            while chunk := image_file.read(1024 * 1024):
+                _remaining_image_timeout(deadline, _IMAGE_FETCH_TIMEOUT_SECONDS)
+                yield chunk
+
+    try:
+        return sha256_chunks_hex(chunks())
+    except OSError as exc:
+        raise _CloudImageError("storage failure", "could not read the downloaded image") from exc
+
+
+@contextmanager
+def _verified_cloud_image(
+    image_url: str,
+    cfg: FleetConfig,
+    console: Console,
+) -> Iterator[Path]:
+    """Yield exact locally downloaded bytes only after fail-closed verification."""
+    try:
+        workdir = Path(tempfile.mkdtemp(prefix="orcest-cloud-image-"))
+    except OSError as exc:
+        raise _CloudImageError("storage failure", "could not create image workspace") from exc
+
+    pinned = bool((cfg.pool.expected_image_sha256 or "").strip())
+    attempts = 1 if pinned else _IMAGE_CONVERGENCE_ATTEMPTS
+    deadline = time.monotonic() + _IMAGE_VERIFICATION_TIMEOUT_SECONDS
+    console.print("  Downloading and verifying cloud image...", end=" ")
+    try:
+        for attempt in range(1, attempts + 1):
+            attempt_dir = workdir / f"attempt-{attempt}"
+            try:
+                attempt_dir.mkdir(mode=0o700)
+                expected_digest = _resolve_image_checksum(
+                    image_url,
+                    cfg,
+                    console,
+                    deadline=deadline,
+                )
+                image_path = attempt_dir / "cloud-image.img"
+                _fetch_cloud_image_file(
+                    image_url,
+                    image_path,
+                    phase="image",
+                    timeout_seconds=_remaining_image_timeout(
+                        deadline, _IMAGE_FETCH_TIMEOUT_SECONDS
+                    ),
+                    max_bytes=_CLOUD_IMAGE_MAX_BYTES,
+                    oversized_category="storage failure",
+                    oversized_detail="downloaded image exceeded its safe size limit",
+                )
+                actual_digest = _sha256_cloud_image(image_path, deadline=deadline)
+            except OSError as exc:
+                raise _CloudImageError(
+                    "storage failure", "image workspace operation failed"
+                ) from exc
+            if actual_digest == expected_digest:
+                console.print("[green]ok[/green]")
+                yield image_path
+                return
+            shutil.rmtree(attempt_dir, ignore_errors=True)
+            if pinned:
+                raise _CloudImageError(
+                    "local checksum failure",
+                    "downloaded image does not match pool.expected_image_sha256",
+                )
+            if attempt < attempts and time.monotonic() >= deadline:
+                raise _CloudImageError(
+                    "verification timeout",
+                    "cloud-image verification budget expired after a generation mismatch",
+                )
+        raise _CloudImageError(
+            "manifest/image generation skew",
+            f"manifest and image did not converge after {attempts} attempts",
+        )
+    except _CloudImageError:
         console.print("[red]failed[/red]")
         raise
     finally:
-        import shutil
-
         shutil.rmtree(workdir, ignore_errors=True)
 
 
@@ -1699,11 +2042,7 @@ def _create_vm_from_cloud_image(
     storage: str | None = None,
     snippet_storage: str = "local",
 ) -> None:
-    """Download a cloud image and create a VM with it as the boot disk.
-
-    Uses the Proxmox ``download-url`` API to fetch the image, then creates
-    a VM with ``import-from`` to use the downloaded image as the boot disk.
-    Disk is resized to ``cfg.pool.worker_disk_size``.
+    """Verify one local cloud-image byte stream and import those exact bytes.
 
     Args:
         storage: Proxmox storage for the VM boot disk. Falls back to
@@ -1720,89 +2059,70 @@ def _create_vm_from_cloud_image(
 
     if storage is None:
         storage = cfg.pool.storage
-    # Derive filename from the URL path and sanitize it
-    raw_filename = image_url.rsplit("/", 1)[-1].split("?")[0] or "cloud-image.img"
-    filename = re.sub(r"[^a-zA-Z0-9._-]", "_", raw_filename)
-    if not filename or filename.startswith("."):
-        filename = "cloud-image.img"
 
-    # Step 0: Resolve a VERIFIED sha256 for the image (fail-closed). Either a
-    # GPG-verified entry from the image's published SHA256SUMS, or a pinned
-    # pool.expected_image_sha256. Raises (aborting the bake) if the digest
-    # cannot be resolved/verified -- we never download the cloud image (run as
-    # root on the Proxmox node) without integrity verification.
-    image_sha256 = _resolve_image_checksum(image_url, cfg, console)
-
-    # Step 1: Download cloud image to Proxmox local storage (skip if already
-    # present). The node verifies the downloaded bytes against image_sha256.
-    download_storage = "local"
-    console.print("  Downloading cloud image...", end=" ")
-    try:
-        px.download_image(
-            image_url,
-            filename,
-            storage=download_storage,
-            checksum=image_sha256,
-            checksum_algorithm="sha256",
-        )
-        console.print("[green]ok[/green]")
-    except RuntimeError as exc:
-        if "already exists" in str(exc) or "override existing" in str(exc):
-            console.print("[yellow]already cached[/yellow]")
-        else:
-            raise
-
-    # Step 2: Create VM (without disk — import-from requires root which
-    # API tokens don't have, so we import the disk via qm CLI in step 3)
-    console.print("  Creating VM...", end=" ")
-    px.create_vm(
-        vm_id=vm_id,
-        name="orcest-worker-template",
-        memory=cfg.pool.worker_memory,
-        cores=cfg.pool.worker_cores,
-        cpu="host",
-        scsihw="virtio-scsi-pci",
-        ide2=f"{storage}:cloudinit",
-        net0="virtio,bridge=vmbr0",
-        ipconfig0="ip=dhcp",
-        serial0="socket",
-        vga="serial0",
-        agent="1",
-    )
-    console.print("[green]ok[/green]")
-
-    try:
-        # Step 3: Import cloud image as boot disk via qm CLI (runs as root
-        # on the Proxmox host, bypassing API token filesystem path restrictions)
-        image_path = f"/var/lib/vz/template/iso/{filename}"
-        console.print("  Importing boot disk...", end=" ")
-        result = subprocess.run(
-            [
-                "qm",
-                "set",
-                str(vm_id),
-                "--scsi0",
-                f"{storage}:0,import-from={image_path},discard=on,ssd=1",
-                "--boot",
-                "order=scsi0",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"qm set failed: {(result.stderr or result.stdout).strip()}")
+    with _verified_cloud_image(image_url, cfg, console) as image_path:
+        console.print("  Creating VM...", end=" ")
+        creation_name = f"orcest-worker-template-build-{uuid.uuid4().hex[:12]}"
+        try:
+            px.create_vm(
+                vm_id=vm_id,
+                name=creation_name,
+                memory=cfg.pool.worker_memory,
+                cores=cfg.pool.worker_cores,
+                cpu="host",
+                scsihw="virtio-scsi-pci",
+                ide2=f"{storage}:cloudinit",
+                net0="virtio,bridge=vmbr0",
+                ipconfig0="ip=dhcp",
+                serial0="socket",
+                vga="serial0",
+                agent="1",
+            )
+        except Exception as exc:
+            error = _CloudImageError(
+                "provisioning failure",
+                "VM creation did not complete before ownership was established",
+            )
+            try:
+                owned = any(
+                    int(record.get("vmid", -1)) == vm_id
+                    and str(record.get("name") or "") == creation_name
+                    for record in px.list_vms()
+                )
+            except Exception:
+                owned = False
+            if owned:
+                raise _OwnedTemplateVmCreationError(str(error)) from exc
+            raise error from exc
         console.print("[green]ok[/green]")
 
-        # Step 4: Resize disk to configured worker size
-        console.print(f"  Resizing disk to {cfg.pool.worker_disk_size}G...", end=" ")
-        px.resize_disk(vm_id, "scsi0", f"{cfg.pool.worker_disk_size}G")
-        console.print("[green]ok[/green]")
-    except Exception as exc:
-        # ``create_vm`` returned successfully, so the operation lock plus the
-        # previously-free VMID proves this invocation owns cleanup. A failure
-        # before that point is deliberately left untouched because an API
-        # timeout/collision cannot prove ownership.
-        raise _OwnedTemplateVmCreationError(str(exc)) from exc
+        try:
+            console.print("  Importing boot disk...", end=" ")
+            _run_image_command(
+                [
+                    "qm",
+                    "set",
+                    str(vm_id),
+                    "--scsi0",
+                    f"{storage}:0,import-from={image_path},discard=on,ssd=1",
+                    "--boot",
+                    "order=scsi0",
+                ],
+                category="provisioning failure",
+                detail="boot-disk import failed",
+                timeout_seconds=_IMAGE_FETCH_TIMEOUT_SECONDS,
+                termination_grace_seconds=30,
+            )
+            console.print("[green]ok[/green]")
+
+            console.print(f"  Resizing disk to {cfg.pool.worker_disk_size}G...", end=" ")
+            try:
+                px.resize_disk(vm_id, "scsi0", f"{cfg.pool.worker_disk_size}G")
+            except Exception as exc:
+                raise _CloudImageError("provisioning failure", "boot-disk resize failed") from exc
+            console.print("[green]ok[/green]")
+        except _CloudImageError as exc:
+            raise _OwnedTemplateVmCreationError(str(exc)) from exc
 
 
 @fleet.command("create-template")
@@ -2152,13 +2472,13 @@ def _set_vm_cloud_init(
     snippets_dir = Path("/var/lib/vz/snippets")
     snippets_dir.mkdir(parents=True, exist_ok=True)
     (snippets_dir / snippet_name).write_text(userdata)
-    result = subprocess.run(
+    _run_image_command(
         ["qm", "set", str(vm_id), "--cicustom", f"user={snippet_storage}:snippets/{snippet_name}"],
-        capture_output=True,
-        text=True,
+        category="provisioning failure",
+        detail="cloud-init attachment failed",
+        timeout_seconds=120,
+        termination_grace_seconds=30,
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"qm set --cicustom failed: {(result.stderr or result.stdout).strip()}")
 
 
 @fleet.command("pool-status")

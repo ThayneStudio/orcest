@@ -9,4 +9,7 @@ User=root
 ExecStart=/opt/orcest/rebake-template.sh
 StandardOutput=journal
 StandardError=journal
-TimeoutStartSec=1800
+# The tracked rebake, verification, cleanup, and post-success GC budgets total
+# about 110 minutes. This two-hour envelope prevents systemd from interrupting
+# Python cleanup while retaining a finite upper bound for the weekly job.
+TimeoutStartSec=7200

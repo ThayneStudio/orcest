@@ -58,6 +58,12 @@ def test_golden_vectors_are_unique() -> None:
     assert len(digests) == len(set(digests)), "golden vectors must not collide"
 
 
+def test_sha256_chunks_hex_matches_contiguous_bytes() -> None:
+    assert digest.sha256_chunks_hex([b"external ", b"artifact"]) == digest.sha256_hex(
+        b"external artifact"
+    )
+
+
 def test_media_kind_changes_workflow_blob_digest() -> None:
     vectors = {v["name"]: v for v in _load_vectors()}
     config = vectors["workflow_blob_digest_config_json"]
