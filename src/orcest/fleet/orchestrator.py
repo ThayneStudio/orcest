@@ -856,6 +856,81 @@ def set_current_template_vmid(ssh_target: str, vm_id: int) -> None:
     _require_redis_cli_success(result, "Failed to set template pointer")
 
 
+def get_current_template_revision(ssh_target: str) -> str | None:
+    """Return the active worker template's baked source revision, or ``None``.
+
+    Reads ``orcest:pool:current_template_revision`` -- set once by ``rebake``
+    from the exact revision installed into the template -- so the template's
+    revision remains visible for health reporting even while no worker VM
+    from it is currently running.
+    """
+    from orcest.revision import normalize_revision
+
+    result = _ssh(
+        ssh_target, f"{_REDIS_CLI_PREFIX} --raw GET orcest:pool:current_template_revision"
+    )
+    _require_redis_cli_success(result, "Failed to read template revision")
+    return normalize_revision(result.stdout.strip())
+
+
+def set_current_template_revision(ssh_target: str, revision: str) -> None:
+    """Persist the active worker template's baked source revision in Redis."""
+    from orcest.revision import normalize_revision
+
+    normalized = normalize_revision(revision)
+    if normalized is None or normalized.endswith("-dirty"):
+        raise ValueError(f"Refusing to persist a non-attested template revision: {revision!r}")
+    result = _ssh(
+        ssh_target,
+        f"{_REDIS_CLI_PREFIX} SET orcest:pool:current_template_revision {shlex.quote(normalized)}",
+    )
+    _require_redis_cli_success(result, "Failed to set template revision")
+
+
+def get_container_revision(ssh_target: str, compose_project: str, service: str) -> str | None:
+    """Return the source revision baked into a running compose service's image.
+
+    Reads the ``org.opencontainers.image.revision`` OCI label off the
+    container's own image (not the ``orcest:latest`` tag, which may have
+    moved since the container was created), so a coherent-but-not-yet
+    recreated container reports the revision it is actually running rather
+    than whatever was most recently built. Returns ``None`` when the service
+    has no running container or the label is missing/unattested.
+    """
+    from orcest.revision import normalize_revision
+
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", compose_project):
+        raise ValueError(f"Invalid compose project name: {compose_project!r}")
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", service):
+        raise ValueError(f"Invalid compose service name: {service!r}")
+    result = _ssh(
+        ssh_target,
+        f"cid=$(docker compose -p {shlex.quote(compose_project)} ps -q {shlex.quote(service)}) && "
+        '[ -n "$cid" ] && docker inspect "$cid" '
+        "--format '{{index .Config.Labels \"org.opencontainers.image.revision\"}}'",
+    )
+    if result.returncode != 0:
+        return None
+    return normalize_revision(result.stdout.strip())
+
+
+def get_project_orchestrator_revision(ssh_target: str, project_name: str) -> str | None:
+    """Return a project orchestrator container's baked source revision."""
+    return get_container_revision(ssh_target, f"orcest-{project_name}", "orchestrator")
+
+
+def get_pool_manager_revision(ssh_target: str) -> str | None:
+    """Return the pool manager container's baked source revision."""
+    return get_container_revision(ssh_target, "orcest-pool", "pool-manager")
+
+
+def get_draining_worker_ids(ssh_target: str) -> set[str]:
+    """Return worker IDs currently marked draining (retained for drain grace)."""
+    result = _ssh(ssh_target, f"{_REDIS_CLI_PREFIX} --raw SMEMBERS orcest:pool:draining")
+    _require_redis_cli_success(result, "Failed to read pool draining set")
+    return {line.strip() for line in result.stdout.strip().splitlines() if line.strip()}
+
+
 def clean_pool_redis(ssh_target: str, vm_ids: list[str]) -> None:
     """Remove destroyed VM generations and verify lifecycle markers are gone."""
     if not vm_ids:
