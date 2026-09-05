@@ -1014,7 +1014,6 @@ def test_pinned_claude_frames_document_post_submit_states() -> None:
     assert capture["captured_inert_footer_rows"] == [
         "horizontal separator",
         "? for shortcuts / context status",
-        "box border",
         "bypass permissions on (shift+tab to cycle) / agents / effort status",
         "paste again to expand",
     ]
@@ -1028,10 +1027,6 @@ def test_pinned_claude_frames_document_post_submit_states() -> None:
     )
     assert (
         runner._classify_post_submit_state(frames["explicitly_stuck_with_shortcuts_context_footer"])
-        is _PostSubmitState.EXPLICITLY_STUCK
-    )
-    assert (
-        runner._classify_post_submit_state(frames["explicitly_stuck_with_box_border_footer"])
         is _PostSubmitState.EXPLICITLY_STUCK
     )
     assert (
@@ -1071,6 +1066,27 @@ def test_post_submit_footer_allowlist_rejects_dialog_lookalikes() -> None:
     for trailing_row in lookalikes:
         assert (
             runner._classify_post_submit_state(placeholder + trailing_row)
+            is _PostSubmitState.AMBIGUOUS
+        )
+
+
+def test_post_submit_box_borders_do_not_make_historical_placeholder_current() -> None:
+    """A dialog border is newer unknown evidence, never inert composer chrome."""
+    runner = ClaudeInteractiveRunner()
+
+    box_borders = (
+        "╭────────────────╮",
+        "╰────────────────╯",
+        "┌────────────────┐",
+        "└────────────────┘",
+        "╭────────────────╮\n╰────────────────╯",
+    )
+
+    for box_border in box_borders:
+        assert (
+            runner._classify_post_submit_state(
+                "\x1b[2K\r│ ❯ [Pasted text #1 +12 lines]\r\n" + box_border
+            )
             is _PostSubmitState.AMBIGUOUS
         )
 
@@ -1670,6 +1686,92 @@ time.sleep(10)
 
     assert result.success is True
     assert result.summary == "newer output made the old placeholder ambiguous"
+    assert len(submit_calls) == 1
+
+
+def test_run_box_borders_after_historical_placeholder_send_no_retry(tmp_path, monkeypatch) -> None:
+    """A settled dialog border after an old placeholder cannot authorize Enter."""
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner._SUBMISSION_RETRY_SETTLE_SECONDS",
+        0.05,
+    )
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        """#!/usr/bin/env python3
+import os
+import re
+import select
+import time
+import tty
+
+tty.setraw(0)
+print("❯ ", flush=True)
+
+buf = b""
+deadline = time.time() + 5
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if not readable:
+        continue
+    chunk = os.read(0, 65536)
+    if not chunk:
+        break
+    buf += chunk
+    if b"ORCEST_WORKER_RESULT_CONTRACT" in buf and b".txt" in buf:
+        break
+
+# Keep the initial submission Enter out of the post-render observation window.
+drain_deadline = time.time() + 0.5
+while time.time() < drain_deadline:
+    readable, _, _ = select.select([0], [], [], 0.05)
+    if not readable:
+        break
+    os.read(0, 65536)
+
+# Reproduce the append-only transcript shape that triggered the regression:
+# an old pending-paste row followed by newer top and bottom dialog borders.
+print("\\x1b[2K\\r│ ❯ [Pasted text #1 +12 lines]", flush=True)
+print("\\x1b[2K\\r╭────────────────────────────────╮", flush=True)
+print("\\x1b[2K\\r╰────────────────────────────────╯", flush=True)
+
+# Stay quiet longer than the default three 0.25-second settle ticks. If box
+# borders are mistakenly allowlisted, the runner sends an unsafe bare Enter.
+unexpected = b""
+deadline = time.time() + 1.3
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if readable:
+        unexpected += os.read(0, 65536)
+if unexpected:
+    print(f"UNEXPECTED_BOX_DIALOG_INPUT={unexpected!r}", flush=True)
+    raise SystemExit(2)
+
+decoded = buf.decode("utf-8", errors="replace")
+match = re.search(r"write your final one-line summary to (\\S+?\\.txt)", decoded)
+if not match:
+    raise SystemExit(3)
+with open(match.group(1), "w", encoding="utf-8") as result:
+    result.write("box-bordered dialog left untouched\\n")
+time.sleep(10)
+""",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    submit_calls = _record_submit_keystrokes(monkeypatch)
+    result = ClaudeInteractiveRunner(max_retries=1, retry_backoff=0).run(
+        "say hello",
+        work_dir,
+        token="github-token",
+        timeout=7,
+        credential="claude-token",
+    )
+
+    assert result.success is True
+    assert result.summary == "box-bordered dialog left untouched"
     assert len(submit_calls) == 1
 
 
