@@ -65,6 +65,8 @@ from orcest.workflow_contract.v1.digest import (
     result_digest,
     review_assignment_digest,
     specification_digest,
+    storage_restoration_fact_digest,
+    storage_restoration_run_membership_digest,
     subject_refs_digest,
     terminal_duplicate_cleanup_action_digest,
     terminal_duplicate_cleanup_reservation_digest,
@@ -102,6 +104,9 @@ from orcest.workflow_contract.v1.protocol_registry import (
     SECRET_PROVISION_ACCEPTED_PROTOCOL,
     SECRET_PROVISION_REQUEST_PROTOCOL,
     SECRET_PROVISION_RESULT_PROTOCOL,
+    STORAGE_MANAGEMENT_PROTOCOL,
+    STORAGE_RESTORATION_ACCEPTED_PROTOCOL,
+    STORAGE_RESTORATION_RESULT_PROTOCOL,
     TERMINAL_DUPLICATE_CLEANUP_PROTOCOL,
     WORKER_LOSS_PROTOCOL,
     WORKER_LOSS_RESULT_PROTOCOL,
@@ -118,7 +123,8 @@ from orcest.workflow_contract.v1.verification import (
     verification_profile_from_effective_policy,
 )
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
+CONTROLLER_COMPATIBILITY_VERSION = 1
 _NEW_ATTEMPT_TERMINAL_FACT_COLUMNS = {
     "expected_deadline_ms": "INTEGER",
     "controller_now_ms": "INTEGER",
@@ -1614,6 +1620,56 @@ class HealthProbeCompletion:
     applied_run_ids: tuple[str, ...]
     recovery_evidence_ids: tuple[str, ...]
     replayed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ControllerStateRecord:
+    controller_id: str
+    schema_version: int
+    reducer_version: str
+    compatibility_version: int
+    redis_epoch: int
+    initialized_at_ms: int
+    updated_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class StorageRestorationFactRecord:
+    storage_restoration_fact_id: str
+    object_kind: str
+    object_id: str
+    source_kind: str
+    source_id: str
+    matched_digest: str | None
+    health_observation_id: str
+    affected_run_ids_digest: str
+    fact_digest: str
+    recorded_at_ms: int
+    affected_run_ids: tuple[str, ...] = ()
+    fanout_cursor_ordinal: int = 0
+    fanout_completed_at_ms: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StorageRestorationOperationRecord:
+    operation_id: str
+    protocol_version: str
+    object_kind: str
+    object_id: str
+    expected_byte_length: int
+    media_kind: str | None
+    authenticated_principal_id: str
+    authorization_context_digest: str
+    staged_object_key: str
+    request_digest: str
+    state: str
+    response_http_status: int
+    response_json: str
+    response_digest: str
+    created_at_ms: int
+    rejection_code: str | None = None
+    storage_restoration_fact_id: str | None = None
+    terminal_at_ms: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3183,6 +3239,61 @@ def _row_to_health_probe_fact(
         fanout_completed_at_ms=row["fanout_completed_at_ms"],
         recorded_at_ms=row["recorded_at_ms"],
         affected_run_ids=tuple(affected_run_ids),
+    )
+
+
+def _row_to_controller_state(row: sqlite3.Row) -> ControllerStateRecord:
+    return ControllerStateRecord(
+        controller_id=row["controller_id"],
+        schema_version=row["schema_version"],
+        reducer_version=row["reducer_version"],
+        compatibility_version=row["compatibility_version"],
+        redis_epoch=row["redis_epoch"],
+        initialized_at_ms=row["initialized_at_ms"],
+        updated_at_ms=row["updated_at_ms"],
+    )
+
+
+def _row_to_storage_restoration_fact(
+    row: sqlite3.Row, *, affected_run_ids: Sequence[str] = ()
+) -> StorageRestorationFactRecord:
+    return StorageRestorationFactRecord(
+        storage_restoration_fact_id=row["storage_restoration_fact_id"],
+        object_kind=row["object_kind"],
+        object_id=row["object_id"],
+        source_kind=row["source_kind"],
+        source_id=row["source_id"],
+        matched_digest=row["matched_digest"],
+        health_observation_id=row["health_observation_id"],
+        affected_run_ids_digest=row["affected_run_ids_digest"],
+        fact_digest=row["fact_digest"],
+        recorded_at_ms=row["recorded_at_ms"],
+        affected_run_ids=tuple(affected_run_ids),
+        fanout_cursor_ordinal=row["fanout_cursor_ordinal"],
+        fanout_completed_at_ms=row["fanout_completed_at_ms"],
+    )
+
+
+def _row_to_storage_restoration_operation(row: sqlite3.Row) -> StorageRestorationOperationRecord:
+    return StorageRestorationOperationRecord(
+        operation_id=row["operation_id"],
+        protocol_version=row["protocol_version"],
+        object_kind=row["object_kind"],
+        object_id=row["object_id"],
+        expected_byte_length=row["expected_byte_length"],
+        media_kind=row["media_kind"],
+        authenticated_principal_id=row["authenticated_principal_id"],
+        authorization_context_digest=row["authorization_context_digest"],
+        staged_object_key=row["staged_object_key"],
+        request_digest=row["request_digest"],
+        state=row["state"],
+        rejection_code=row["rejection_code"],
+        storage_restoration_fact_id=row["storage_restoration_fact_id"],
+        response_http_status=row["response_http_status"],
+        response_json=row["response_json"],
+        response_digest=row["response_digest"],
+        created_at_ms=row["created_at_ms"],
+        terminal_at_ms=row["terminal_at_ms"],
     )
 
 
@@ -6455,6 +6566,86 @@ CREATE TABLE IF NOT EXISTS management_command_denials (
 
 CREATE INDEX IF NOT EXISTS idx_management_command_denials_run
 ON management_command_denials(run_id);
+
+CREATE TABLE IF NOT EXISTS controller_state (
+  controller_id TEXT PRIMARY KEY CHECK (controller_id = '{CONTROLLER_ID}'),
+  schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+  reducer_version TEXT NOT NULL,
+  compatibility_version INTEGER NOT NULL CHECK (compatibility_version > 0),
+  redis_epoch INTEGER NOT NULL CHECK (redis_epoch >= 0),
+  initialized_at_ms INTEGER NOT NULL CHECK (initialized_at_ms > 0),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= initialized_at_ms)
+);
+
+CREATE TABLE IF NOT EXISTS storage_restoration_facts (
+  storage_restoration_fact_id TEXT PRIMARY KEY,
+  object_kind TEXT NOT NULL CHECK (
+    object_kind IN ({_sql_in(_enum_values("storage_restoration_fact.object_kind"))})
+  ),
+  object_id TEXT NOT NULL,
+  source_kind TEXT NOT NULL CHECK (
+    source_kind IN ({_sql_in(_enum_values("storage_restoration_fact.source_kind"))})
+  ),
+  source_id TEXT NOT NULL,
+  matched_digest TEXT,
+  health_observation_id TEXT NOT NULL UNIQUE,
+  affected_run_ids_digest TEXT NOT NULL,
+  fact_digest TEXT NOT NULL UNIQUE,
+  fanout_cursor_ordinal INTEGER NOT NULL DEFAULT 0 CHECK (fanout_cursor_ordinal >= 0),
+  fanout_completed_at_ms INTEGER CHECK (
+    fanout_completed_at_ms IS NULL OR fanout_completed_at_ms >= recorded_at_ms
+  ),
+  recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= 0),
+  UNIQUE (object_kind, object_id, source_kind, source_id)
+);
+
+CREATE TABLE IF NOT EXISTS storage_restoration_fact_runs (
+  storage_restoration_fact_id TEXT NOT NULL
+    REFERENCES storage_restoration_facts(storage_restoration_fact_id) ON DELETE RESTRICT,
+  member_ordinal INTEGER NOT NULL CHECK (member_ordinal >= 0),
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  transition_sequence INTEGER,
+  PRIMARY KEY (storage_restoration_fact_id, member_ordinal),
+  UNIQUE (storage_restoration_fact_id, run_id)
+);
+
+CREATE TABLE IF NOT EXISTS storage_restoration_operations (
+  operation_id TEXT PRIMARY KEY,
+  protocol_version TEXT NOT NULL,
+  object_kind TEXT NOT NULL CHECK (
+    object_kind IN ({_sql_in(_enum_values("storage_restoration_fact.object_kind"))})
+  ),
+  object_id TEXT NOT NULL,
+  expected_byte_length INTEGER NOT NULL CHECK (expected_byte_length > 0),
+  media_kind TEXT,
+  authenticated_principal_id TEXT NOT NULL,
+  authorization_context_digest TEXT NOT NULL,
+  staged_object_key TEXT NOT NULL,
+  request_digest TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (
+    state IN ({_sql_in(_enum_values("storage_restoration_operation.state"))})
+  ),
+  rejection_code TEXT CHECK (
+    rejection_code IS NULL OR rejection_code IN (
+      {_sql_in(_enum_values("storage_restoration_operation.rejection_code"))}
+    )
+  ),
+  storage_restoration_fact_id TEXT REFERENCES storage_restoration_facts(storage_restoration_fact_id)
+    ON DELETE RESTRICT,
+  response_http_status INTEGER NOT NULL CHECK (response_http_status BETWEEN 100 AND 599),
+  response_json TEXT NOT NULL,
+  response_digest TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  terminal_at_ms INTEGER CHECK (terminal_at_ms IS NULL OR terminal_at_ms >= created_at_ms),
+  CHECK (
+    (state = 'PENDING' AND rejection_code IS NULL AND storage_restoration_fact_id IS NULL
+      AND terminal_at_ms IS NULL)
+    OR (state = 'RESTORED' AND rejection_code IS NULL AND storage_restoration_fact_id IS NOT NULL
+      AND terminal_at_ms IS NOT NULL)
+    OR (state = 'REJECTED' AND rejection_code IS NOT NULL AND storage_restoration_fact_id IS NULL
+      AND terminal_at_ms IS NOT NULL)
+  )
+);
 """
 
 _V8_TO_V9 = f"""
@@ -7177,6 +7368,7 @@ _V18_TO_V19 = _SCHEMA[_SCHEMA.index("CREATE TABLE IF NOT EXISTS review_receipts"
 # that already exist in their final shape.
 _V19_TO_V20 = _SCHEMA[_SCHEMA.index("CREATE TABLE IF NOT EXISTS publications") :]
 _V20_TO_V21 = _SCHEMA[_SCHEMA.index("CREATE TABLE IF NOT EXISTS management_commands") :]
+_V21_TO_V22 = _SCHEMA[_SCHEMA.index("CREATE TABLE IF NOT EXISTS controller_state") :]
 
 # Appended after whichever script actually put forge_observation_schedules into
 # its final shape (a plain CREATE TABLE for a fresh/pre-v5 database, or the
@@ -7373,6 +7565,7 @@ class RunStore:
             18,
             19,
             20,
+            21,
         }:
             raise SchemaVersionError(
                 f"unsupported workflow.db schema version {current}; "
@@ -7851,8 +8044,7 @@ class RunStore:
                         _now_ms(),
                     ),
                 )
-            else:
-                assert current == 20
+            elif current == 20:
                 self.conn.executescript("BEGIN EXCLUSIVE;\n" + _V20_TO_V21)
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -7860,6 +8052,18 @@ class RunStore:
                     (
                         SCHEMA_VERSION,
                         "workflow-control-v1-management-commands",
+                        _now_ms(),
+                    ),
+                )
+            else:
+                assert current == 21
+                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _V21_TO_V22)
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        "workflow-control-v1-durable-restart-and-storage-recovery",
                         _now_ms(),
                     ),
                 )
@@ -7875,6 +8079,19 @@ class RunStore:
                 "(registry_id, registry_revision, current_issuance_key_id, last_operation_id) "
                 "VALUES (?, 0, NULL, NULL)",
                 (CONTROLLER_ID,),
+            )
+            self.conn.execute(
+                "INSERT OR IGNORE INTO controller_state"
+                "(controller_id, schema_version, reducer_version, compatibility_version, "
+                "redis_epoch, initialized_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, 0, ?, ?)",
+                (
+                    CONTROLLER_ID,
+                    SCHEMA_VERSION,
+                    DEFAULT_REDUCER_VERSION,
+                    CONTROLLER_COMPATIBILITY_VERSION,
+                    _now_ms(),
+                    _now_ms(),
+                ),
             )
             self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self.conn.commit()
@@ -9455,6 +9672,20 @@ class RunStore:
         if row is None:
             return None
         return self._secret_provision_operation_from_row(row, replayed=True)
+
+    def list_pending_secret_provision_operations(
+        self, *, limit: int = 100
+    ) -> list[SecretProvisionOperationResult]:
+        """``secret_provision_operation_id``s still ``PENDING`` (accepted but
+        not yet installed), oldest first -- restart/startup reconciliation
+        resumes each via
+        :func:`orcest.workflow_store.v1.secret_provision.reconcile_pending_secret_provision_operation`."""
+        rows = self.conn.execute(
+            "SELECT * FROM secret_provision_operations WHERE state = 'PENDING' "
+            "ORDER BY created_at_ms LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [self._secret_provision_operation_from_row(row, replayed=True) for row in rows]
 
     def _secret_provision_operation_from_row(
         self, row: sqlite3.Row, *, replayed: bool
@@ -21258,6 +21489,512 @@ class RunStore:
             return tuple(sorted(row["run_id"] for row in rows))
         return ()
 
+    # -- Controller State (schema/reducer compatibility, Redis epoch) -------
+
+    def get_controller_state(self) -> ControllerStateRecord:
+        row = self.conn.execute(
+            "SELECT * FROM controller_state WHERE controller_id = ?", (CONTROLLER_ID,)
+        ).fetchone()
+        if row is None:
+            raise RunStoreError("controller_state singleton is missing")
+        return _row_to_controller_state(row)
+
+    def advance_redis_epoch(self) -> int:
+        """Atomically increment ``controller_state.redis_epoch`` exactly once
+        per full Redis reconstruction (persistence-and-recovery.md "Redis
+        reconstruction"). The new value is strictly greater than the
+        committed old value; it is never reset, decremented, or allocated in
+        Redis, so a crashed or repeated rebuild obtains a later epoch and can
+        safely republish the durable offer/outbox set."""
+        with self.transaction():
+            row = self.conn.execute(
+                "SELECT redis_epoch FROM controller_state WHERE controller_id = ?",
+                (CONTROLLER_ID,),
+            ).fetchone()
+            if row is None:
+                raise RunStoreError("controller_state singleton is missing")
+            new_epoch = int(row["redis_epoch"]) + 1
+            self.conn.execute(
+                "UPDATE controller_state SET redis_epoch = ?, updated_at_ms = ? "
+                "WHERE controller_id = ?",
+                (new_epoch, _now_ms(), CONTROLLER_ID),
+            )
+            return new_epoch
+
+    # -- Storage Restoration Operations (authenticated caller-submitted) ----
+
+    def get_storage_restoration_operation(
+        self, operation_id: str
+    ) -> StorageRestorationOperationRecord | None:
+        require_lowercase_uuid(operation_id, field="operation_id")
+        row = self.conn.execute(
+            "SELECT * FROM storage_restoration_operations WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        return None if row is None else _row_to_storage_restoration_operation(row)
+
+    def begin_storage_restoration_operation(
+        self,
+        *,
+        operation_id: str,
+        object_kind: str,
+        object_id: str,
+        expected_byte_length: int,
+        media_kind: str | None,
+        authenticated_principal_id: str,
+        authorization_context_digest: str,
+        staged_object_key: str,
+        now_ms: int | None = None,
+    ) -> StorageRestorationOperationRecord:
+        """Accept one authenticated Storage Restoration Operation as ``PENDING``.
+
+        Idempotent by ``operation_id``: an identical replay (same metadata and
+        exact kind-specific verified staged identity, principal, and
+        authorization digest) returns the existing projection; different
+        content under the same id is an integrity conflict
+        (persistence-and-recovery.md "Per-object storage restoration").
+        """
+        require_lowercase_uuid(operation_id, field="operation_id")
+        enums.parse_enum("storage_restoration_fact.object_kind", object_kind)
+        if expected_byte_length < 1:
+            raise ValueError("expected_byte_length must be positive")
+        now = _now_ms() if now_ms is None else now_ms
+        preimage = {
+            "operation_id": operation_id,
+            "object_kind": object_kind,
+            "object_id": object_id,
+            "expected_byte_length": expected_byte_length,
+            "media_kind": media_kind,
+            "authenticated_principal_id": authenticated_principal_id,
+            "authorization_context_digest": authorization_context_digest,
+            "staged_object_key": staged_object_key,
+        }
+        req_digest = request_digest(preimage)
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM storage_restoration_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if existing is not None:
+                record = _row_to_storage_restoration_operation(existing)
+                if record.request_digest != req_digest:
+                    raise IdempotencyConflictError(
+                        "storage restoration operation id was reused with different content"
+                    )
+                return record
+            accepted_response = {
+                "protocol": STORAGE_RESTORATION_ACCEPTED_PROTOCOL,
+                "operation_id": operation_id,
+                "state": "PENDING",
+                "object_kind": object_kind,
+                "object_id": object_id,
+            }
+            validate_envelope(accepted_response)
+            resp_digest = response_digest(accepted_response)
+            self.conn.execute(
+                "INSERT INTO storage_restoration_operations(operation_id, protocol_version, "
+                "object_kind, object_id, expected_byte_length, media_kind, "
+                "authenticated_principal_id, authorization_context_digest, staged_object_key, "
+                "request_digest, state, response_http_status, response_json, response_digest, "
+                "created_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 202, ?, ?, ?)",
+                (
+                    operation_id,
+                    STORAGE_MANAGEMENT_PROTOCOL,
+                    object_kind,
+                    object_id,
+                    expected_byte_length,
+                    media_kind,
+                    authenticated_principal_id,
+                    authorization_context_digest,
+                    staged_object_key,
+                    req_digest,
+                    canonical_json_text(accepted_response),
+                    resp_digest,
+                    now,
+                ),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM storage_restoration_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            assert row is not None
+            return _row_to_storage_restoration_operation(row)
+
+    def complete_storage_restoration_operation(
+        self,
+        *,
+        operation_id: str,
+        storage_restoration_fact_id: str,
+        now_ms: int | None = None,
+    ) -> StorageRestorationOperationRecord:
+        """Atomically change a ``PENDING`` Operation to ``RESTORED`` after
+        durable installation and verification. Replay of the same operation
+        returns the stored terminal projection rather than a second Fact."""
+        require_lowercase_uuid(operation_id, field="operation_id")
+        require_lowercase_uuid(storage_restoration_fact_id, field="storage_restoration_fact_id")
+        now = _now_ms() if now_ms is None else now_ms
+        with self.transaction():
+            row = self.conn.execute(
+                "SELECT * FROM storage_restoration_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                raise RunStoreError(f"storage restoration operation {operation_id!r} not found")
+            record = _row_to_storage_restoration_operation(row)
+            if record.state != "PENDING":
+                if (
+                    record.state == "RESTORED"
+                    and record.storage_restoration_fact_id == storage_restoration_fact_id
+                ):
+                    return record
+                raise CasMismatchError(
+                    "storage restoration operation already terminal with a different outcome"
+                )
+            result_body = {
+                "protocol": STORAGE_RESTORATION_RESULT_PROTOCOL,
+                "operation_id": operation_id,
+                "state": "RESTORED",
+                "object_kind": record.object_kind,
+                "storage_restoration_fact_id": storage_restoration_fact_id,
+                "rejection_code": None,
+            }
+            validate_envelope(result_body)
+            resp_digest = response_digest(result_body)
+            self.conn.execute(
+                "UPDATE storage_restoration_operations SET state = 'RESTORED', "
+                "storage_restoration_fact_id = ?, response_http_status = 200, "
+                "response_json = ?, response_digest = ?, terminal_at_ms = ? "
+                "WHERE operation_id = ?",
+                (
+                    storage_restoration_fact_id,
+                    canonical_json_text(result_body),
+                    resp_digest,
+                    now,
+                    operation_id,
+                ),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM storage_restoration_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            assert row is not None
+            return _row_to_storage_restoration_operation(row)
+
+    def fail_storage_restoration_operation(
+        self,
+        *,
+        operation_id: str,
+        rejection_code: str,
+        now_ms: int | None = None,
+    ) -> StorageRestorationOperationRecord:
+        """Atomically change a ``PENDING`` Operation to ``REJECTED`` after a
+        storage-lock-protected final recheck proves one of the closed
+        deterministic rejection reasons; uncertainty or transient I/O never
+        becomes rejection."""
+        require_lowercase_uuid(operation_id, field="operation_id")
+        enums.parse_enum("storage_restoration_operation.rejection_code", rejection_code)
+        now = _now_ms() if now_ms is None else now_ms
+        with self.transaction():
+            row = self.conn.execute(
+                "SELECT * FROM storage_restoration_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                raise RunStoreError(f"storage restoration operation {operation_id!r} not found")
+            record = _row_to_storage_restoration_operation(row)
+            if record.state != "PENDING":
+                if record.state == "REJECTED" and record.rejection_code == rejection_code:
+                    return record
+                raise CasMismatchError(
+                    "storage restoration operation already terminal with a different outcome"
+                )
+            result_body = {
+                "protocol": STORAGE_RESTORATION_RESULT_PROTOCOL,
+                "operation_id": operation_id,
+                "state": "REJECTED",
+                "object_kind": record.object_kind,
+                "storage_restoration_fact_id": None,
+                "rejection_code": rejection_code,
+            }
+            validate_envelope(result_body)
+            resp_digest = response_digest(result_body)
+            self.conn.execute(
+                "UPDATE storage_restoration_operations SET state = 'REJECTED', "
+                "rejection_code = ?, response_http_status = 409, response_json = ?, "
+                "response_digest = ?, terminal_at_ms = ? WHERE operation_id = ?",
+                (
+                    rejection_code,
+                    canonical_json_text(result_body),
+                    resp_digest,
+                    now,
+                    operation_id,
+                ),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM storage_restoration_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            assert row is not None
+            return _row_to_storage_restoration_operation(row)
+
+    def list_pending_storage_restoration_operations(
+        self, *, limit: int = 100
+    ) -> list[StorageRestorationOperationRecord]:
+        rows = self.conn.execute(
+            "SELECT * FROM storage_restoration_operations WHERE state = 'PENDING' "
+            "ORDER BY created_at_ms LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [_row_to_storage_restoration_operation(row) for row in rows]
+
+    # -- Storage Restoration Facts (exact-object restore, affected-Run fanout)
+
+    def _storage_recovery_matching_run_ids(self, *, object_kind: str, object_id: str) -> list[str]:
+        from orcest.workflow_reducer.ledger import load_view
+
+        matching: list[str] = []
+        for run_id in self._waiting_run_ids(wait_reason="STORAGE_RECOVERY"):
+            view = load_view(self, run_id)
+            if view is None or view.state != "WAITING" or view.wait_condition_id is None:
+                continue
+            wait = self.get_wait_condition(view.wait_condition_id)
+            if wait is None or wait.wake_identity is None:
+                continue
+            identity = wait.wake_identity
+            if (
+                identity.get("object_kind") == object_kind
+                and identity.get("object_id") == object_id
+            ):
+                matching.append(run_id)
+        return sorted(matching)
+
+    def _secret_recovery_matching_run_ids(self, *, secret_id: str, version: int) -> list[str]:
+        from orcest.workflow_reducer.ledger import load_view
+
+        matching: list[str] = []
+        for run_id in self._waiting_run_ids(wait_reason="SECRET_RECOVERY"):
+            view = load_view(self, run_id)
+            if view is None or view.state != "WAITING" or view.wait_condition_id is None:
+                continue
+            wait = self.get_wait_condition(view.wait_condition_id)
+            if wait is None or wait.wake_identity is None:
+                continue
+            identity = wait.wake_identity
+            if identity.get("secret_id") != secret_id:
+                continue
+            if version < int(identity.get("minimum_version", 0)):
+                continue
+            matching.append(run_id)
+        return sorted(matching)
+
+    def get_storage_restoration_fact(
+        self, storage_restoration_fact_id: str
+    ) -> StorageRestorationFactRecord | None:
+        require_lowercase_uuid(storage_restoration_fact_id, field="storage_restoration_fact_id")
+        row = self.conn.execute(
+            "SELECT * FROM storage_restoration_facts WHERE storage_restoration_fact_id = ?",
+            (storage_restoration_fact_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        members = self.conn.execute(
+            "SELECT run_id FROM storage_restoration_fact_runs "
+            "WHERE storage_restoration_fact_id = ? ORDER BY member_ordinal",
+            (storage_restoration_fact_id,),
+        ).fetchall()
+        return _row_to_storage_restoration_fact(
+            row, affected_run_ids=tuple(member["run_id"] for member in members)
+        )
+
+    def create_storage_restoration_fact(
+        self,
+        *,
+        storage_restoration_fact_id: str,
+        object_kind: str,
+        object_id: str,
+        source_kind: str,
+        source_id: str,
+        matched_digest: str | None = None,
+        now_ms: int | None = None,
+    ) -> StorageRestorationFactRecord:
+        """Record one exact-object Storage Restoration Fact and its frozen
+        affected-Run fanout membership (persistence-and-recovery.md
+        "Per-object storage restoration" step 4). Idempotent by
+        ``(object_kind, object_id, source_kind, source_id)``: a replay of the
+        same exact-object/source identity returns the prior Fact instead of
+        creating a second authority source or repeating fanout.
+        """
+        require_lowercase_uuid(storage_restoration_fact_id, field="storage_restoration_fact_id")
+        enums.parse_enum("storage_restoration_fact.object_kind", object_kind)
+        enums.parse_enum("storage_restoration_fact.source_kind", source_kind)
+        now = _now_ms() if now_ms is None else now_ms
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM storage_restoration_facts WHERE object_kind = ? AND object_id = ? "
+                "AND source_kind = ? AND source_id = ?",
+                (object_kind, object_id, source_kind, source_id),
+            ).fetchone()
+            if existing is not None:
+                existing_record = _row_to_storage_restoration_fact(existing)
+                if existing_record.storage_restoration_fact_id != storage_restoration_fact_id:
+                    raise IdempotencyConflictError(
+                        "storage restoration fact identity was reused with a different fact id"
+                    )
+                if existing_record.matched_digest != matched_digest:
+                    raise IdempotencyConflictError(
+                        "storage restoration fact identity was reused with a different digest"
+                    )
+                existing_id = existing_record.storage_restoration_fact_id
+            else:
+                if object_kind == "SECRET_VERSION":
+                    secret_id, _, version_text = object_id.partition("/")
+                    members = self._secret_recovery_matching_run_ids(
+                        secret_id=secret_id, version=int(version_text)
+                    )
+                    scope_kind, scope_id = "SECRET", object_id
+                else:
+                    members = self._storage_recovery_matching_run_ids(
+                        object_kind=object_kind, object_id=object_id
+                    )
+                    scope_kind, scope_id = "STORAGE", object_id
+                membership_digest = storage_restoration_run_membership_digest(members)
+                observation = self._insert_health_observation(
+                    scope_kind=scope_kind,
+                    scope_id=scope_id,
+                    kind="RECOVERED",
+                    source_kind="STORAGE_RESTORATION",
+                    source_id=storage_restoration_fact_id,
+                    subject_bindings={
+                        "object_kind": object_kind,
+                        "object_id": object_id,
+                        "source_kind": source_kind,
+                        "source_id": source_id,
+                    },
+                    observed_revision=None,
+                    effective_at_ms=now,
+                    expires_at_ms=None,
+                )
+                fact_preimage = {
+                    "storage_restoration_fact_id": storage_restoration_fact_id,
+                    "object_kind": object_kind,
+                    "object_id": object_id,
+                    "source_kind": source_kind,
+                    "source_id": source_id,
+                    "matched_digest": matched_digest,
+                    "affected_run_ids_digest": membership_digest,
+                }
+                fact_digest = storage_restoration_fact_digest(fact_preimage)
+                self.conn.execute(
+                    "INSERT INTO storage_restoration_facts(storage_restoration_fact_id, "
+                    "object_kind, object_id, source_kind, source_id, matched_digest, "
+                    "health_observation_id, affected_run_ids_digest, fact_digest, recorded_at_ms) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        storage_restoration_fact_id,
+                        object_kind,
+                        object_id,
+                        source_kind,
+                        source_id,
+                        matched_digest,
+                        observation.health_observation_id,
+                        membership_digest,
+                        fact_digest,
+                        now,
+                    ),
+                )
+                for ordinal, run_id in enumerate(members):
+                    self.conn.execute(
+                        "INSERT INTO storage_restoration_fact_runs(storage_restoration_fact_id, "
+                        "member_ordinal, run_id) VALUES (?, ?, ?)",
+                        (storage_restoration_fact_id, ordinal, run_id),
+                    )
+                existing_id = storage_restoration_fact_id
+        self.run_storage_restoration_fact_fanout(existing_id)
+        result = self.get_storage_restoration_fact(existing_id)
+        assert result is not None
+        return result
+
+    def run_storage_restoration_fact_fanout(self, storage_restoration_fact_id: str) -> list[str]:
+        """Resume cursor-driven per-Run Storage Restoration Fact fanout."""
+        require_lowercase_uuid(storage_restoration_fact_id, field="storage_restoration_fact_id")
+        applied: list[str] = []
+        while True:
+            with self.transaction():
+                row = self.conn.execute(
+                    "SELECT * FROM storage_restoration_facts WHERE storage_restoration_fact_id = ?",
+                    (storage_restoration_fact_id,),
+                ).fetchone()
+                if row is None:
+                    raise RunStoreError(
+                        f"storage restoration fact {storage_restoration_fact_id!r} not found"
+                    )
+                fact = _row_to_storage_restoration_fact(row)
+                member = self.conn.execute(
+                    "SELECT * FROM storage_restoration_fact_runs "
+                    "WHERE storage_restoration_fact_id = ? AND member_ordinal = ?",
+                    (storage_restoration_fact_id, fact.fanout_cursor_ordinal),
+                ).fetchone()
+                if member is None:
+                    if fact.fanout_completed_at_ms is None:
+                        self.conn.execute(
+                            "UPDATE storage_restoration_facts SET fanout_completed_at_ms = ? "
+                            "WHERE storage_restoration_fact_id = ?",
+                            (_now_ms(), storage_restoration_fact_id),
+                        )
+                    return applied
+                if member["transition_sequence"] is not None:
+                    self.conn.execute(
+                        "UPDATE storage_restoration_facts SET fanout_cursor_ordinal = ? "
+                        "WHERE storage_restoration_fact_id = ?",
+                        (fact.fanout_cursor_ordinal + 1, storage_restoration_fact_id),
+                    )
+                    continue
+                run_id = str(member["run_id"])
+                transition_sequence = self._apply_storage_restoration_fact_member(fact, run_id)
+                self.conn.execute(
+                    "UPDATE storage_restoration_fact_runs SET transition_sequence = ? "
+                    "WHERE storage_restoration_fact_id = ? AND member_ordinal = ?",
+                    (transition_sequence, storage_restoration_fact_id, fact.fanout_cursor_ordinal),
+                )
+                self.conn.execute(
+                    "UPDATE storage_restoration_facts SET fanout_cursor_ordinal = ? "
+                    "WHERE storage_restoration_fact_id = ?",
+                    (fact.fanout_cursor_ordinal + 1, storage_restoration_fact_id),
+                )
+                applied.append(run_id)
+
+    def _apply_storage_restoration_fact_member(
+        self, fact: StorageRestorationFactRecord, run_id: str
+    ) -> int:
+        from orcest.workflow_reducer.ledger import apply, load_view
+        from orcest.workflow_reducer.types import Trigger
+
+        view = load_view(self, run_id)
+        if view is None:
+            raise RunStoreError(f"storage restoration fanout run {run_id!r} disappeared")
+        facts: dict[str, Any] = {
+            "object_kind": fact.object_kind,
+            "object_id": fact.object_id,
+            "wakes_wait": view.state == "WAITING",
+        }
+        applied = apply(
+            self,
+            view,
+            Trigger(
+                kind="STORAGE_RESTORATION",
+                trigger_id=fact.storage_restoration_fact_id,
+                facts=facts,
+            ),
+            run_id=run_id,
+        )
+        if (
+            not applied.replayed
+            and applied.reduction is not None
+            and applied.reduction.reason_code == "WAIT_WAKE"
+        ):
+            self._clear_run_wait_pointer(run_id)
+        return applied.transition.transition_sequence
+
     def _next_recovery_sequence(self, run_id: str) -> int:
         row = self.conn.execute(
             "SELECT COALESCE(MAX(recovery_sequence), 0) AS seq FROM recovery_evidence "
@@ -24221,6 +24958,32 @@ class RunStore:
                 return True
         return False
 
+    def list_due_attempt_claim_deadlines(self, *, now_ms: int | None = None) -> list[str]:
+        """``attempt_id``s of every still-``OFFERED`` Attempt whose
+        ``claim_deadline_ms`` is now due, oldest-due first -- the startup/
+        scheduled-sweep enumerator :meth:`expire_attempt_claim_deadline`
+        itself does not provide (it evaluates one already-identified
+        Attempt)."""
+        now = _now_ms() if now_ms is None else now_ms
+        rows = self.conn.execute(
+            "SELECT attempt_id FROM attempts WHERE state = 'OFFERED' AND claim_deadline_ms <= ? "
+            "ORDER BY claim_deadline_ms ASC, attempt_id ASC",
+            (now,),
+        ).fetchall()
+        return [row["attempt_id"] for row in rows]
+
+    def list_due_attempt_execution_deadlines(self, *, now_ms: int | None = None) -> list[str]:
+        """``attempt_id``s of every still-``CLAIMED`` Attempt whose
+        ``execution_deadline_ms`` is now due, oldest-due first."""
+        now = _now_ms() if now_ms is None else now_ms
+        rows = self.conn.execute(
+            "SELECT attempt_id FROM attempts WHERE state = 'CLAIMED' "
+            "AND execution_deadline_ms IS NOT NULL AND execution_deadline_ms <= ? "
+            "ORDER BY execution_deadline_ms ASC, attempt_id ASC",
+            (now,),
+        ).fetchall()
+        return [row["attempt_id"] for row in rows]
+
     def expire_attempt_claim_deadline(
         self,
         *,
@@ -25054,6 +25817,19 @@ class RunStore:
         rows = self.conn.execute(
             "SELECT * FROM outbox WHERE source_kind = 'ACTIVITY' AND state = 'PENDING' "
             "ORDER BY next_delivery_at_ms LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [_row_to_outbox(row) for row in rows]
+
+    def list_pending_outbox_rows(self, *, limit: int = 1000) -> list[OutboxRecord]:
+        """Every ``PENDING`` Outbox row across every ``source_kind``, oldest
+        first -- the durable set Controller restart recovery's "reconcile
+        outbox rows" step scans; each row's own kind-specific dispatcher
+        (e.g. :func:`dispatch_pending_offers`) is the one that actually
+        redelivers it. This method only enumerates for reconciliation
+        reporting/health -- it never marks a row delivered."""
+        rows = self.conn.execute(
+            "SELECT * FROM outbox WHERE state = 'PENDING' ORDER BY next_delivery_at_ms LIMIT ?",
             (limit,),
         ).fetchall()
         return [_row_to_outbox(row) for row in rows]

@@ -15,6 +15,7 @@ dependencies = [
     "textual>=0.75",
     "proxmoxer>=2.0",
     "requests>=2.31",
+    "cryptography>=41.0",  # authenticated encryption for backup Secret envelopes
 ]
 
 [project.scripts]

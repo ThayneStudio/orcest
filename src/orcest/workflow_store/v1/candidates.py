@@ -33,6 +33,7 @@ from orcest.workflow_store.v1.fs import (
     digest_hex,
     fsync_dir,
     promote_no_clobber,
+    quarantine_file,
     read_exact_file,
     trusted_join,
     write_incoming_bytes,
@@ -222,6 +223,28 @@ class CandidateObjectStore:
     def read(self, bundle_digest: str) -> bytes:
         record = self.verify(bundle_digest)
         return read_exact_file(self._dest(record), max_bytes=self._quota.max_object_bytes)
+
+    def installed_mtime_ms(self, bundle_digest: str) -> int:
+        """Filesystem modification time of an installed object, for GC's
+        age-based orphan grace period (persistence-and-recovery.md
+        "Retention and garbage collection"). Never trusted as lifecycle
+        authority -- only as a physical age floor before the reference
+        recheck that must gate every deletion."""
+        record = self.verify(bundle_digest)
+        return int(self._dest(record).stat().st_mtime * 1000)
+
+    def quarantine(self, bundle_digest: str) -> None:
+        """Move an installed object out of the live CAS into quarantine.
+
+        Callers MUST already hold ``self._lock`` (the shared storage
+        mutation lock) and MUST have just rechecked there is no live
+        database reference to ``bundle_digest`` -- this method performs no
+        reference check of its own.
+        """
+        record = self.verify(bundle_digest)
+        dest = self._dest(record)
+        quarantine_dir = trusted_join(self._root, "quarantine")
+        quarantine_file(src=dest, quarantine_dir=quarantine_dir, store_root=self._root)
 
     def iter_objects(self) -> Iterator[CandidateObjectRecord]:
         objects_sha = trusted_join(self._root, "objects", "sha256")
