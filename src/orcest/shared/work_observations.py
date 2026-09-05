@@ -12,7 +12,7 @@ import logging
 import time
 from collections.abc import Callable
 from functools import wraps
-from typing import Any
+from typing import Any, cast
 
 from orcest.shared.redis_client import RedisClient
 
@@ -188,7 +188,7 @@ def reconcile_missing(redis: RedisClient, repo: str, token: str, seen: set[str])
     from orcest.orchestrator import gh
 
     index = full_key(redis, "dashboard:tracked")
-    keys = redis.client.zrange(index, 0, -1)
+    keys = cast(list[str], redis.client.zrange(index, 0, -1))
     candidates = [key for key in keys if isinstance(key, str) and key not in seen]
     if not candidates:
         return
