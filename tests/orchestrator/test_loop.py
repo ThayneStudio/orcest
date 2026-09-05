@@ -1505,7 +1505,7 @@ def test_consume_results_completed_issue_absent_ready_label_still_acks(
 
     from orcest.shared.config import IssueDeliveryVerifierConfig
 
-    mocker.patch(
+    gh_run = mocker.patch(
         "orcest.orchestrator.gh.subprocess.run",
         side_effect=subprocess.CalledProcessError(
             returncode=1,
@@ -1515,6 +1515,7 @@ def test_consume_results_completed_issue_absent_ready_label_still_acks(
     )
 
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    xack = mocker.spy(fake_redis_client, "xack")
     repo = orchestrator_config.github.repo
     issue_number = 45
     increment_issue_attempts(fake_redis_client, repo, issue_number)
@@ -1525,7 +1526,15 @@ def test_consume_results_completed_issue_absent_ready_label_still_acks(
         branch="issue-45-work",
         snapshot_head_sha="a" * 40,
     )
-    entry_id = fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+    set_pending_task(fake_redis_client, repo, "issue", issue_number, result.task_id)
+    provider_account_key = f"{_TASK_PROVIDER_ACCOUNT_PREFIX}{result.task_id}"
+    fake_redis_client.set_ex(provider_account_key, "codex:test-account", ttl=300)
+    fake_redis_client.hset(
+        _TASK_PROVIDER_ACCOUNTS_KEY,
+        result.task_id,
+        "codex:legacy-test-account",
+    )
+    first_entry_id = fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
 
     _consume_results_for_project(
         orchestrator_config.projects[0],
@@ -1538,10 +1547,29 @@ def test_consume_results_completed_issue_absent_ready_label_still_acks(
 
     # The result was fully processed (not left pending/retried) ...
     assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
-    assert fake_redis_client.xpending_count(RESULTS_STREAM, RESULTS_GROUP, entry_id) == 0
+    assert fake_redis_client.xpending_count(RESULTS_STREAM, RESULTS_GROUP, first_entry_id) == 0
+    from orcest.orchestrator.loop import _make_result_side_effects_processed_key
 
-    # ... and replaying the same completed result is a no-op: no error, no
-    # regression of already-cleared state, nothing left pending.
+    side_effects_key = _make_result_side_effects_processed_key(result.task_id)
+    assert fake_redis_client.get(side_effects_key) == "1"
+    assert get_pending_task(fake_redis_client, repo, "issue", issue_number) is None
+    assert fake_redis_client.get(provider_account_key) is None
+    assert fake_redis_client.hget(_TASK_PROVIDER_ACCOUNTS_KEY, result.task_id) is None
+    assert gh_run.call_count == 1
+    xack.assert_called_once_with(RESULTS_STREAM, RESULTS_GROUP, first_entry_id)
+
+    # Redeliver the exact payload under a new stream ID. The durable task
+    # checkpoint must suppress a second GitHub call. Re-seed coordination that
+    # could survive a crash after checkpointing; the duplicate path must still
+    # clear it and ACK its own stream entry.
+    set_pending_task(fake_redis_client, repo, "issue", issue_number, result.task_id)
+    fake_redis_client.set_ex(provider_account_key, "codex:test-account", ttl=300)
+    fake_redis_client.hset(
+        _TASK_PROVIDER_ACCOUNTS_KEY,
+        result.task_id,
+        "codex:legacy-test-account",
+    )
+    duplicate_entry_id = fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
     _consume_results_for_project(
         orchestrator_config.projects[0],
         fake_redis_client,
@@ -1551,6 +1579,15 @@ def test_consume_results_completed_issue_absent_ready_label_still_acks(
         issue_delivery_verifier=IssueDeliveryVerifierConfig(enabled=False),
     )
     assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
+    assert fake_redis_client.xpending_count(RESULTS_STREAM, RESULTS_GROUP, duplicate_entry_id) == 0
+    assert fake_redis_client.get(side_effects_key) == "1"
+    assert get_pending_task(fake_redis_client, repo, "issue", issue_number) is None
+    assert fake_redis_client.get(provider_account_key) is None
+    assert fake_redis_client.hget(_TASK_PROVIDER_ACCOUNTS_KEY, result.task_id) is None
+    assert gh_run.call_count == 1
+    assert xack.call_count == 2
+    xack.assert_any_call(RESULTS_STREAM, RESULTS_GROUP, first_entry_id)
+    xack.assert_any_call(RESULTS_STREAM, RESULTS_GROUP, duplicate_entry_id)
 
 
 def test_consume_results_completed_does_not_clear_total_attempts(
