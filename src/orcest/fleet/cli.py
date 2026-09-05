@@ -28,6 +28,7 @@ from orcest.fleet.config import DEFAULT_CONFIG_PATH
 if TYPE_CHECKING:
     from orcest.fleet.config import FleetConfig, ProjectEntry
     from orcest.fleet.proxmox_api import ProxmoxClient
+    from orcest.fleet.source_revision import DesiredRevision
 
 _REPO_RE = re.compile(r"^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
 
@@ -37,6 +38,7 @@ _DEFAULT_CLOUD_IMAGE_URL = (
 _DRAIN_QUIESCE_SECONDS = 5.25
 _COORDINATED_BACKEND_CHANGE_META_KEY = "orcest_coordinated_backend_change"
 _DEFER_PROJECT_START_META_KEY = "orcest_defer_project_start"
+_FROZEN_DESIRED_REVISION_META_KEY = "orcest_frozen_desired_revision"
 _CANDIDATE_WORKER_WAIT_SECONDS = 900
 _FLEET_OPERATION_LOCK_PATH = "/run/lock/orcest-fleet-operation.lock"
 _fleet_operation_lock_depth = 0
@@ -574,8 +576,11 @@ def _scp_to_vm(
     )
 
 
-def _install_source_on_worker_template(host: str, user: str, console: Console) -> bool:
-    """Install the active Orcest source into the worker template venv."""
+def _install_source_on_worker_template(host: str, user: str, console: Console) -> str | None:
+    """Install the active Orcest source into the worker template venv.
+
+    Returns the exact attested revision installed, or ``None`` on failure.
+    """
     from orcest.fleet.orchestrator import create_source_tarball
 
     tarball_path = create_source_tarball()
@@ -584,7 +589,7 @@ def _install_source_on_worker_template(host: str, user: str, console: Console) -
         copy = _scp_to_vm(host, user, tarball_path, remote_tarball)
         if copy.returncode != 0:
             console.print(f"[red]failed[/red]: {copy.stderr.strip()}")
-            return False
+            return None
 
         install_cmd = (
             "set -e; "
@@ -600,17 +605,24 @@ def _install_source_on_worker_template(host: str, user: str, console: Console) -
             'case "$revision" in unknown|*-dirty) exit 42;; esac; '
             "printf '%s\\n' \"$revision\" | sudo tee /etc/orcest/source-revision >/dev/null; "
             "sudo chmod 0644 /etc/orcest/source-revision; "
-            f"sudo rm -rf {shlex.quote(remote_tarball)} /tmp/orcest-template-source"
+            f"sudo rm -rf {shlex.quote(remote_tarball)} /tmp/orcest-template-source; "
+            "printf 'orcest-template-revision=%s\\n' \"$revision\""
         )
         result = _ssh_run(host, user, install_cmd, timeout=300)
         if result.returncode != 0:
             console.print(f"[red]failed[/red]: {result.stderr.strip()}")
-            return False
+            return None
+        match = re.search(
+            r"^orcest-template-revision=([0-9a-f]{7,64})$", result.stdout, re.MULTILINE
+        )
+        if match is None:
+            console.print("[red]failed[/red]: could not determine installed revision")
+            return None
         console.print("[green]ok[/green]")
-        return True
+        return match.group(1)
     except subprocess.TimeoutExpired:
         console.print("[red]timed out[/red]")
-        return False
+        return None
     finally:
         try:
             Path(tarball_path).unlink()
@@ -1265,7 +1277,7 @@ def update(ctx: click.Context, config: str, skip_pool_manager: bool) -> None:
     ssh_target = cfg.ssh_target()
 
     _validate_provider_stream_routing(cfg, console)
-    _validate_deploy_source_revision(console)
+    _validate_deploy_source_revision(console, cfg, ctx)
 
     # Project configs and workers must change backend as one operation. The
     # authorization bit is set only by this process's coordinated deploy path;
@@ -1445,6 +1457,163 @@ def _print_worker_provider_cli_heartbeats(console: Console, ssh_target: str) -> 
     console.print(table)
 
 
+def _collect_source_revision_surfaces(cfg: FleetConfig) -> list[Any]:
+    """Best-effort, read-only collection of every runtime source-revision surface."""
+    from orcest.fleet.orchestrator import (
+        get_container_revision,
+        get_current_template_revision,
+        get_draining_worker_ids,
+        get_worker_heartbeat_details,
+    )
+    from orcest.fleet.source_revision import RuntimeRevision
+
+    surfaces: list[Any] = []
+    if not cfg.orchestrator.host:
+        return surfaces
+    ssh_target = cfg.ssh_target()
+
+    for project in cfg.projects:
+        try:
+            revision = get_container_revision(ssh_target, f"orcest-{project.name}", "orchestrator")
+        except Exception:
+            revision = None
+        surfaces.append(RuntimeRevision(surface=f"orchestrator:{project.name}", revision=revision))
+
+    try:
+        pool_manager_revision = get_container_revision(ssh_target, "orcest-pool", "pool-manager")
+    except Exception:
+        pool_manager_revision = None
+    surfaces.append(RuntimeRevision(surface="pool-manager", revision=pool_manager_revision))
+
+    try:
+        template_revision = get_current_template_revision(ssh_target)
+    except Exception:
+        template_revision = None
+    surfaces.append(RuntimeRevision(surface="template", revision=template_revision))
+
+    try:
+        draining_ids = get_draining_worker_ids(ssh_target)
+    except Exception:
+        draining_ids = set()
+    try:
+        heartbeats = get_worker_heartbeat_details(ssh_target)
+    except Exception:
+        heartbeats = {}
+    for worker_id, record in sorted(heartbeats.items()):
+        heartbeat_revision = record.get("revision")
+        surfaces.append(
+            RuntimeRevision(
+                surface=f"worker:{worker_id}",
+                revision=heartbeat_revision if isinstance(heartbeat_revision, str) else None,
+                degraded=worker_id in draining_ids,
+            )
+        )
+    return surfaces
+
+
+def _collect_source_revision_report(cfg: FleetConfig) -> Any:
+    """Resolve the desired revision and compare it to every runtime surface.
+
+    Entirely read-only: one bounded ``git ls-remote`` for the desired ref
+    (skipped entirely when an immutable ``sha`` is declared) plus best-effort
+    SSH/Redis reads of already-running state. Never fetches deployable
+    source, builds, rebakes, destroys VMs, restarts services, or exposes
+    credentials.
+    """
+    from orcest.fleet.source_revision import evaluate_source_revision, resolve_desired_revision
+
+    desired = resolve_desired_revision(cfg.desired_source)
+    surfaces = _collect_source_revision_surfaces(cfg)
+    return evaluate_source_revision(desired, surfaces)
+
+
+def _print_source_revision_report(console: Console, report: Any) -> None:
+    """Render a `SourceRevisionReport` as a table plus bounded diagnostics."""
+    desired = report.desired
+    table = Table(title="Source Revision")
+    table.add_column("Surface", style="cyan")
+    table.add_column("Revision", style="white")
+    table.add_column("Status", style="white")
+
+    if not desired.repo:
+        desired_label = "[dim]unconfigured[/dim]"
+    else:
+        desired_label = f"{desired.repo}@{desired.ref or desired.sha or '?'}"
+    if desired.resolved:
+        table.add_row(
+            "Desired", f"{desired_label} -> {desired.sha[:12]}", "[green]resolved[/green]"
+        )
+    else:
+        table.add_row("Desired", desired_label, f"[red]{desired.error}[/red]")
+
+    for surface in report.surfaces:
+        is_mismatch = any(m.startswith(f"{surface.surface}:") for m in report.mismatches)
+        if desired.resolved and not is_mismatch:
+            status_text = "[green]current[/green]"
+        elif surface.degraded:
+            status_text = "[yellow]degraded[/yellow]"
+        else:
+            status_text = "[red]mismatch[/red]"
+        table.add_row(surface.surface, (surface.revision or "none")[:12], status_text)
+
+    console.print(table)
+    if report.healthy:
+        console.print("[green]Source revision coherent and current.[/green]")
+    else:
+        console.print("[red]Source revision drift detected:[/red]")
+        for mismatch in report.mismatches:
+            console.print(f"  - {mismatch}")
+
+
+@fleet.command("source-health")
+@click.option(
+    "--config",
+    default=str(DEFAULT_CONFIG_PATH),
+    help="Fleet config path.",
+    show_default=True,
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit a machine-readable JSON report.")
+def source_health(config: str, as_json: bool) -> None:
+    """Compare every runtime surface against the declared desired source revision.
+
+    Read-only: never fetches deployable source, builds an image, rebakes a
+    template, destroys a VM, restarts a service, or exposes credentials. It
+    only inspects already-running state (SSH ``docker inspect``, Redis
+    GET/SMEMBERS/SCAN) plus a single bounded, read-only ``git ls-remote`` for
+    the desired ref. Exits non-zero unless every surface is coherently at the
+    resolved desired SHA.
+    """
+    from orcest.fleet.config import load_config
+
+    console = Console()
+    cfg = load_config(config)
+    report = _collect_source_revision_report(cfg)
+
+    if as_json:
+        import json as json_module
+
+        payload = {
+            "desired": {
+                "repo": report.desired.repo,
+                "ref": report.desired.ref,
+                "sha": report.desired.sha,
+                "error": report.desired.error,
+            },
+            "surfaces": [
+                {"surface": s.surface, "revision": s.revision, "degraded": s.degraded}
+                for s in report.surfaces
+            ],
+            "mismatches": list(report.mismatches),
+            "healthy": report.healthy,
+        }
+        click.echo(json_module.dumps(payload, sort_keys=True))
+    else:
+        _print_source_revision_report(console, report)
+
+    if not report.healthy:
+        sys.exit(1)
+
+
 @fleet.command()
 @click.option(
     "--config",
@@ -1565,6 +1734,7 @@ def status(config: str) -> None:
     console.print(pool_table)
     if cfg.orchestrator.host:
         _print_worker_provider_cli_heartbeats(console, cfg.ssh_target())
+        _print_source_revision_report(console, _collect_source_revision_report(cfg))
 
 
 def _resolve_image_checksum(image_url: str, cfg: FleetConfig, console: Console) -> str:
@@ -1939,7 +2109,7 @@ def _create_template_at_vmid(
     storage: str,
     snippet_storage: str,
     console: Console,
-) -> None:
+) -> str:
     """Bake a worker template at *vm_id*: download image, provision, convert.
 
     Shared by the original ``create-template`` command (which manages the
@@ -1949,7 +2119,8 @@ def _create_template_at_vmid(
 
     Calls :func:`sys.exit(1)` on any failure after best-effort cleanup of
     the half-built VM.  Caller is responsible for any post-success bookkeeping
-    (config save, Redis pointer swap).
+    (config save, Redis pointer swap). Returns the exact attested source
+    revision installed into the template.
     """
     from orcest.fleet.cloud_init import render_template_userdata
 
@@ -2054,7 +2225,8 @@ def _create_template_at_vmid(
     # for orchestrator deploys. Pool clones do not fetch GitHub at boot; they
     # inherit this verified template install.
     console.print("  Installing current orcest source into template...", end=" ")
-    if not _install_source_on_worker_template(vm_ip, cfg.orchestrator.user, console):
+    installed_revision = _install_source_on_worker_template(vm_ip, cfg.orchestrator.user, console)
+    if installed_revision is None:
         console.print("[red]Source install failed. Template creation aborted.[/red]")
         _cleanup_vm()
         sys.exit(1)
@@ -2129,6 +2301,8 @@ def _create_template_at_vmid(
         console.print(f"[red]failed[/red]: {exc}")
         _cleanup_vm()
         sys.exit(1)
+
+    return installed_revision
 
 
 def _set_vm_cloud_init(
@@ -2369,7 +2543,11 @@ def rebake(image_url: str, storage: str | None, config: str) -> None:
     untouched, so the active template is unchanged.
     """
     from orcest.fleet.config import load_config
-    from orcest.fleet.orchestrator import _REDIS_CLI_PREFIX, set_current_template_vmid
+    from orcest.fleet.orchestrator import (
+        _REDIS_CLI_PREFIX,
+        set_current_template_revision,
+        set_current_template_vmid,
+    )
 
     console = Console()
     cfg = load_config(config)
@@ -2395,7 +2573,7 @@ def rebake(image_url: str, storage: str | None, config: str) -> None:
     assert rng is not None  # _allocate_template_vmid would have exited
     console.print(f"\n[bold]Rebaking template at VM {new_vmid}[/bold] (range {rng[0]}-{rng[1]})\n")
 
-    _create_template_at_vmid(
+    installed_revision = _create_template_at_vmid(
         px,
         cfg,
         new_vmid,
@@ -2409,10 +2587,15 @@ def rebake(image_url: str, storage: str | None, config: str) -> None:
     console.print("\n  Swapping active template pointer...", end=" ")
     try:
         set_current_template_vmid(cfg.ssh_target(), new_vmid)
+        set_current_template_revision(cfg.ssh_target(), installed_revision)
         console.print("[green]ok[/green]")
     except Exception as exc:
         console.print(f"[red]failed[/red]: {exc}")
-        redis_set_cmd = f"{_REDIS_CLI_PREFIX} SET orcest:pool:current_template_vmid {new_vmid}"
+        redis_set_cmd = (
+            f"{_REDIS_CLI_PREFIX} SET orcest:pool:current_template_vmid {new_vmid} && "
+            f"{_REDIS_CLI_PREFIX} SET orcest:pool:current_template_revision "
+            f"{shlex.quote(installed_revision)}"
+        )
         console.print(
             "  [yellow]New template VM "
             f"{new_vmid}[/yellow] was built successfully but the pointer swap failed.\n"
@@ -3272,6 +3455,7 @@ def deploy(
     _preflight_deploy_config(
         config,
         console,
+        ctx,
         rebuild_template=rebuild_template,
         drain_active=drain_active,
     )
@@ -3346,11 +3530,18 @@ def deploy(
         ctx.invoke(start, config=config)
         from orcest.fleet.orchestrator import _resolve_deploy_revision
 
+        if cfg.desired_source.is_configured:
+            expected_revision = _resolve_frozen_desired_revision(cfg, ctx).sha
+        elif rebuild_template:
+            expected_revision = _resolve_deploy_revision()
+        else:
+            expected_revision = None
+
         try:
             _wait_for_candidate_workers(
                 cfg,
                 console,
-                expected_revision=_resolve_deploy_revision() if rebuild_template else None,
+                expected_revision=expected_revision,
             )
         except (Exception, SystemExit):
             # Attestation failed after Step 1 stopped every project publisher.
@@ -3405,6 +3596,7 @@ def deploy(
     finally:
         ctx.meta.pop(_COORDINATED_BACKEND_CHANGE_META_KEY, None)
         ctx.meta.pop(_DEFER_PROJECT_START_META_KEY, None)
+        ctx.meta.pop(_FROZEN_DESIRED_REVISION_META_KEY, None)
 
     console.print("\n[bold green]Deploy complete.[/bold green]")
 
@@ -3562,19 +3754,56 @@ def _validate_provider_stream_routing(cfg: FleetConfig, console: Console) -> Non
     raise SystemExit(1)
 
 
-def _validate_deploy_source_revision(console: Console) -> None:
-    """Reject unattested source before any remote update mutation."""
+def _resolve_frozen_desired_revision(cfg: FleetConfig, ctx: click.Context) -> "DesiredRevision":
+    """Resolve the desired source revision once per deploy and freeze it.
+
+    The desired ref may move on the remote while a multi-step deploy runs
+    (preflight -> update -> rebake -> attest). Caching the first resolution on
+    ``ctx.meta`` -- shared by ``deploy`` with every command it invokes via
+    ``ctx.invoke`` -- guarantees every check in one deploy compares against
+    the same SHA instead of silently mixing generations.
+    """
+    from orcest.fleet.source_revision import resolve_desired_revision
+
+    cached = ctx.meta.get(_FROZEN_DESIRED_REVISION_META_KEY)
+    if cached is not None:
+        return cached
+    resolved = resolve_desired_revision(cfg.desired_source)
+    ctx.meta[_FROZEN_DESIRED_REVISION_META_KEY] = resolved
+    return resolved
+
+
+def _validate_deploy_source_revision(
+    console: Console, cfg: FleetConfig, ctx: click.Context
+) -> None:
+    """Reject unattested or stale source before any remote update mutation."""
     from orcest.fleet.orchestrator import _resolve_deploy_revision
     from orcest.revision import revision_is_attested
 
     deploy_revision = _resolve_deploy_revision()
-    if revision_is_attested(deploy_revision):
+    if not revision_is_attested(deploy_revision):
+        console.print(
+            "[red]Deployment source revision is "
+            f"{deploy_revision!r}; commit every source file before updating.[/red]"
+        )
+        raise SystemExit(1)
+
+    if not cfg.desired_source.is_configured:
         return
-    console.print(
-        "[red]Deployment source revision is "
-        f"{deploy_revision!r}; commit every source file before updating.[/red]"
-    )
-    raise SystemExit(1)
+    desired = _resolve_frozen_desired_revision(cfg, ctx)
+    if not desired.resolved:
+        console.print(
+            f"[red]Could not resolve desired source revision {desired.repo}@{desired.ref}: "
+            f"{desired.error}[/red]"
+        )
+        raise SystemExit(1)
+    if deploy_revision != desired.sha:
+        console.print(
+            f"[red]Deployment source revision {deploy_revision!r} does not match the "
+            f"desired revision {desired.sha!r} ({desired.repo}@{desired.ref}); "
+            "update the checkout before deploying.[/red]"
+        )
+        raise SystemExit(1)
 
 
 def _validate_backend_transition(
@@ -3644,6 +3873,7 @@ def _validate_backend_transition(
 def _preflight_deploy_config(
     config: str,
     console: Console,
+    ctx: click.Context,
     *,
     rebuild_template: bool,
     drain_active: bool,
@@ -3680,6 +3910,21 @@ def _preflight_deploy_config(
             f"deployment source revision is {deploy_revision!r}; commit every source file "
             "before deploying"
         )
+    elif cfg.desired_source.is_configured:
+        # Freeze the desired SHA here, before any mutation, so the rest of
+        # this deploy (update/rebake/attest) compares against the exact same
+        # value even if the remote ref moves mid-deploy.
+        desired = _resolve_frozen_desired_revision(cfg, ctx)
+        if not desired.resolved:
+            problems.append(
+                f"desired source revision {desired.repo}@{desired.ref} could not be resolved: "
+                f"{desired.error}"
+            )
+        elif deploy_revision != desired.sha:
+            problems.append(
+                f"deployment source revision {deploy_revision!r} does not match the desired "
+                f"revision {desired.sha!r} ({desired.repo}@{desired.ref})"
+            )
 
     try:
         routing_mismatches = cfg.provider_stream_mismatches()

@@ -15,6 +15,7 @@ from orcest.fleet.cli import (
     fleet,
 )
 from orcest.fleet.config import (
+    DesiredSourceConfig,
     FleetConfig,
     OrchestratorConfig,
     OrgEntry,
@@ -141,6 +142,216 @@ def test_status_shows_projects(runner, cfg_path):
     assert result.exit_code == 0
     assert "alpha" in result.output
     assert "Org/alpha" in result.output
+
+
+def _mock_source_revision_surfaces(mocker, *, orchestrator=None, pool_manager=None, template=None):
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_container_revision",
+        side_effect=lambda _ssh, project, service: (
+            pool_manager if service == "pool-manager" else orchestrator
+        ),
+    )
+    mocker.patch("orcest.fleet.orchestrator.get_current_template_revision", return_value=template)
+    mocker.patch("orcest.fleet.orchestrator.get_draining_worker_ids", return_value=set())
+
+
+class TestSourceHealth:
+    """fleet source-health: read-only desired-vs-deployed source revision gate."""
+
+    def _base_cfg(self, **overrides):
+        defaults = dict(
+            orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+            projects=[ProjectEntry(name="alpha", repo="Org/alpha")],
+            desired_source=DesiredSourceConfig(repo="org/orcest", sha="a" * 40),
+        )
+        defaults.update(overrides)
+        return FleetConfig(**defaults)
+
+    def test_healthy_fleet_exits_zero(self, runner, cfg_path, mocker):
+        cfg = self._base_cfg()
+        _save(cfg, cfg_path)
+        sha = "a" * 40
+        _mock_source_revision_surfaces(mocker, orchestrator=sha, pool_manager=sha, template=sha)
+        mocker.patch(
+            "orcest.fleet.orchestrator.get_worker_heartbeat_details",
+            return_value={"orcest-worker-300": {"backend": "claude", "revision": sha}},
+        )
+
+        result = runner.invoke(fleet, ["source-health", "--config", cfg_path])
+
+        assert result.exit_code == 0, result.output
+        assert "coherent and current" in result.output
+
+    def test_coherent_stale_fleet_exits_nonzero_and_names_both_revisions(
+        self, runner, cfg_path, mocker
+    ):
+        """The pve-test incident: four workers coherently report an older SHA."""
+        cfg = self._base_cfg()
+        _save(cfg, cfg_path)
+        desired_sha = "a" * 40
+        stale_sha = "b" * 40
+        _mock_source_revision_surfaces(
+            mocker, orchestrator=stale_sha, pool_manager=stale_sha, template=stale_sha
+        )
+        mocker.patch(
+            "orcest.fleet.orchestrator.get_worker_heartbeat_details",
+            return_value={
+                f"orcest-worker-{i}": {"backend": "claude", "revision": stale_sha}
+                for i in range(300, 304)
+            },
+        )
+
+        result = runner.invoke(fleet, ["source-health", "--config", cfg_path])
+
+        assert result.exit_code != 0
+        assert desired_sha[:12] in result.output
+        assert stale_sha[:12] in result.output
+
+    def test_orchestrator_stale_worker_current_is_flagged(self, runner, cfg_path, mocker):
+        cfg = self._base_cfg()
+        _save(cfg, cfg_path)
+        sha = "a" * 40
+        stale = "b" * 40
+        _mock_source_revision_surfaces(mocker, orchestrator=stale, pool_manager=sha, template=sha)
+        mocker.patch(
+            "orcest.fleet.orchestrator.get_worker_heartbeat_details",
+            return_value={"orcest-worker-300": {"backend": "claude", "revision": sha}},
+        )
+
+        result = runner.invoke(fleet, ["source-health", "--config", cfg_path])
+
+        assert result.exit_code != 0
+        assert "orchestrator:alpha" in result.output
+
+    def test_pool_manager_stale_is_flagged(self, runner, cfg_path, mocker):
+        cfg = self._base_cfg()
+        _save(cfg, cfg_path)
+        sha = "a" * 40
+        stale = "b" * 40
+        _mock_source_revision_surfaces(mocker, orchestrator=sha, pool_manager=stale, template=sha)
+        mocker.patch("orcest.fleet.orchestrator.get_worker_heartbeat_details", return_value={})
+
+        result = runner.invoke(fleet, ["source-health", "--config", cfg_path])
+
+        assert result.exit_code != 0
+        assert "pool-manager" in result.output
+
+    def test_stale_template_with_no_live_workers_is_flagged(self, runner, cfg_path, mocker):
+        cfg = self._base_cfg()
+        _save(cfg, cfg_path)
+        sha = "a" * 40
+        stale = "b" * 40
+        _mock_source_revision_surfaces(mocker, orchestrator=sha, pool_manager=sha, template=stale)
+        mocker.patch("orcest.fleet.orchestrator.get_worker_heartbeat_details", return_value={})
+
+        result = runner.invoke(fleet, ["source-health", "--config", cfg_path])
+
+        assert result.exit_code != 0
+        assert "template" in result.output
+
+    def test_mixed_rolling_generation_flagged_but_busy_worker_visible(
+        self, runner, cfg_path, mocker
+    ):
+        cfg = self._base_cfg()
+        _save(cfg, cfg_path)
+        sha = "a" * 40
+        stale = "b" * 40
+        _mock_source_revision_surfaces(mocker, orchestrator=sha, pool_manager=sha, template=sha)
+        mocker.patch(
+            "orcest.fleet.orchestrator.get_draining_worker_ids",
+            return_value={"orcest-worker-old"},
+        )
+        mocker.patch(
+            "orcest.fleet.orchestrator.get_worker_heartbeat_details",
+            return_value={
+                "orcest-worker-new": {"backend": "claude", "revision": sha},
+                "orcest-worker-old": {"backend": "claude", "revision": stale},
+            },
+        )
+
+        result = runner.invoke(fleet, ["source-health", "--config", cfg_path])
+
+        assert result.exit_code != 0
+        assert "orcest-worker-old" in result.output  # busy old worker stays visible
+
+    def test_unconfigured_desired_revision_is_explicit_and_nonzero(self, runner, cfg_path, mocker):
+        cfg = self._base_cfg(desired_source=DesiredSourceConfig())
+        _save(cfg, cfg_path)
+        sha = "a" * 40
+        _mock_source_revision_surfaces(mocker, orchestrator=sha, pool_manager=sha, template=sha)
+        mocker.patch("orcest.fleet.orchestrator.get_worker_heartbeat_details", return_value={})
+
+        result = runner.invoke(fleet, ["source-health", "--config", cfg_path])
+
+        assert result.exit_code != 0
+        assert "unconfigured" in result.output
+
+    def test_json_output_is_machine_readable(self, runner, cfg_path, mocker):
+        cfg = self._base_cfg()
+        _save(cfg, cfg_path)
+        sha = "a" * 40
+        _mock_source_revision_surfaces(mocker, orchestrator=sha, pool_manager=sha, template=sha)
+        mocker.patch("orcest.fleet.orchestrator.get_worker_heartbeat_details", return_value={})
+
+        result = runner.invoke(fleet, ["source-health", "--config", cfg_path, "--json"])
+
+        assert result.exit_code == 0, result.output
+        import json
+
+        payload = json.loads(result.output)
+        assert payload["healthy"] is True
+        assert payload["desired"]["sha"] == sha
+
+    def test_never_calls_deployment_or_vm_mutation_methods(self, runner, cfg_path, mocker):
+        cfg = self._base_cfg()
+        _save(cfg, cfg_path)
+        sha = "a" * 40
+        _mock_source_revision_surfaces(mocker, orchestrator=sha, pool_manager=sha, template=sha)
+        mocker.patch("orcest.fleet.orchestrator.get_worker_heartbeat_details", return_value={})
+        mutating = [
+            "build_image",
+            "upload_source",
+            "stop_stack",
+            "restart_stack",
+            "stop_pool_manager",
+            "ensure_pool_manager",
+            "set_current_template_vmid",
+            "set_current_template_revision",
+            "clean_pool_redis",
+            "clean_pending_tasks",
+        ]
+        mocks = {name: mocker.patch(f"orcest.fleet.orchestrator.{name}") for name in mutating}
+
+        result = runner.invoke(fleet, ["source-health", "--config", cfg_path])
+
+        assert result.exit_code == 0, result.output
+        for name, mock in mocks.items():
+            assert not mock.called, f"source-health must never call {name}()"
+
+    def test_secrets_never_appear_in_output(self, runner, cfg_path, mocker):
+        cfg = self._base_cfg(desired_source=DesiredSourceConfig(repo="org/orcest", ref="master"))
+        _save(cfg, cfg_path)
+        mocker.patch(
+            "orcest.fleet.source_revision._run_ls_remote",
+            return_value=subprocess.CompletedProcess(
+                [],
+                128,
+                stdout="",
+                stderr=(
+                    "fatal: could not read Username for "
+                    "'https://x-access-token:s3cr3t-token@github.com/org/orcest': "
+                    "terminal prompts disabled"
+                ),
+            ),
+        )
+        _mock_source_revision_surfaces(mocker, orchestrator=None, pool_manager=None, template=None)
+        mocker.patch("orcest.fleet.orchestrator.get_worker_heartbeat_details", return_value={})
+
+        result = runner.invoke(fleet, ["source-health", "--config", cfg_path])
+
+        assert result.exit_code != 0
+        assert "s3cr3t-token" not in result.output
+        assert "x-access-token" not in result.output
 
 
 def test_onboard_creates_project(runner, cfg_path, mocker):
@@ -1022,7 +1233,7 @@ def test_create_template_success(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
-    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=True)
+    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value="a" * 40)
     mocker.patch(
         "orcest.fleet.cli._ssh_run",
         side_effect=_successful_provider_cli_probe,
@@ -1059,7 +1270,7 @@ def test_create_template_prompts_for_vm_id(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
-    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=True)
+    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value="a" * 40)
     mocker.patch(
         "orcest.fleet.cli._ssh_run",
         side_effect=_successful_provider_cli_probe,
@@ -1082,7 +1293,7 @@ def _mock_successful_template_bake(mocker):
     mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
-    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=True)
+    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value="a" * 40)
     mocker.patch("orcest.fleet.cli._ssh_run", side_effect=_successful_provider_cli_probe)
 
 
@@ -1300,7 +1511,7 @@ def test_create_template_disable_cloud_init_failure(runner, cfg_path, mocker):
     # *cloud-init clean* step (step 7) failing -- the smoke-check shares the
     # _ssh_run mock and would otherwise abort first.
     mocker.patch("orcest.fleet.cli._verify_provider_clis", return_value=True)
-    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=True)
+    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value="a" * 40)
     mocker.patch(
         "orcest.fleet.cli._ssh_run",
         return_value=mocker.MagicMock(returncode=1, stderr="permission denied"),
@@ -1326,7 +1537,7 @@ def test_create_template_stop_timeout_cleans_up(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
-    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=True)
+    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value="a" * 40)
     mocker.patch(
         "orcest.fleet.cli._ssh_run",
         side_effect=_successful_provider_cli_probe,
@@ -1439,7 +1650,7 @@ def test_create_template_fails_when_source_install_fails(runner, cfg_path, mocke
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
     mocker.patch("orcest.fleet.cli._verify_provider_clis", return_value=True)
-    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=False)
+    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=None)
 
     result = runner.invoke(
         fleet,
@@ -1465,12 +1676,17 @@ def test_install_source_on_worker_template_uses_local_tarball(mocker, tmp_path):
         "orcest.fleet.cli._scp_to_vm",
         return_value=mocker.MagicMock(returncode=0, stderr=""),
     )
+    installed_revision = "a" * 40
     ssh = mocker.patch(
         "orcest.fleet.cli._ssh_run",
-        return_value=mocker.MagicMock(returncode=0, stderr=""),
+        return_value=mocker.MagicMock(
+            returncode=0, stderr="", stdout=f"orcest-template-revision={installed_revision}\n"
+        ),
     )
 
-    assert _install_source_on_worker_template("10.20.0.50", "orcest", Console()) is True
+    assert (
+        _install_source_on_worker_template("10.20.0.50", "orcest", Console()) == installed_revision
+    )
 
     scp.assert_called_once_with(
         "10.20.0.50",
@@ -1839,7 +2055,7 @@ def _patch_template_bake(mocker):
     mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
-    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=True)
+    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value="a" * 40)
     mocker.patch(
         "orcest.fleet.cli._ssh_run",
         side_effect=_successful_provider_cli_probe,
@@ -1866,6 +2082,7 @@ def test_rebake_allocates_next_free_vmid_and_swaps_pointer(runner, cfg_path, moc
     ]
     _patch_template_bake(mocker)
     mock_set = mocker.patch("orcest.fleet.orchestrator.set_current_template_vmid")
+    mock_set_revision = mocker.patch("orcest.fleet.orchestrator.set_current_template_revision")
 
     result = runner.invoke(fleet, ["rebake", "--config", cfg_path])
 
@@ -1873,6 +2090,7 @@ def test_rebake_allocates_next_free_vmid_and_swaps_pointer(runner, cfg_path, moc
     assert "Rebake complete" in result.output
     mock_px.convert_to_template.assert_called_once_with(9001)
     mock_set.assert_called_once_with("orcest@10.20.0.1", 9001)
+    mock_set_revision.assert_called_once_with("orcest@10.20.0.1", "a" * 40)
 
 
 def test_rebake_no_range_configured_fails(runner, cfg_path, mocker):
@@ -3369,6 +3587,107 @@ def test_deploy_rejects_dirty_revision_before_stop(runner, cfg_path, mocker):
     stop_pool.assert_not_called()
 
 
+def test_deploy_rejects_stale_clean_checkout_before_stop(runner, cfg_path, mocker):
+    """A clean but stale checkout must be refused before any remote mutation."""
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300),
+        desired_source=DesiredSourceConfig(repo="org/orcest", sha="b" * 40),
+    )
+    _save(cfg, cfg_path)
+    # Clean local checkout ("a" * 40, via the autouse fixture) does not match
+    # the declared desired sha ("b" * 40).
+    stop_pool = mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    ls_remote = mocker.patch("orcest.fleet.source_revision._run_ls_remote")
+
+    result = runner.invoke(fleet, ["deploy", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "does not match the desired" in " ".join(result.output.split())
+    stop_pool.assert_not_called()
+    ls_remote.assert_not_called()  # sha-pinned: no network resolution needed
+
+
+def test_deploy_rejects_unresolvable_desired_ref_before_stop(runner, cfg_path, mocker):
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300),
+        desired_source=DesiredSourceConfig(repo="org/orcest", ref="refs/heads/master"),
+    )
+    _save(cfg, cfg_path)
+    stop_pool = mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.source_revision._run_ls_remote",
+        side_effect=subprocess.TimeoutExpired(cmd="git", timeout=10),
+    )
+
+    result = runner.invoke(fleet, ["deploy", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "could not be resolved" in " ".join(result.output.split())
+    stop_pool.assert_not_called()
+
+
+def test_deploy_freezes_desired_revision_across_ref_movement(runner, cfg_path, mocker):
+    """A ref that moves mid-deploy must not mix SHAs within one deploy run."""
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300),
+        desired_source=DesiredSourceConfig(repo="org/orcest", ref="refs/heads/master"),
+    )
+    _save(cfg, cfg_path)
+    frozen_sha = "a" * 40
+    moved_sha = "c" * 40
+    mocker.patch("orcest.fleet.orchestrator._resolve_deploy_revision", return_value=frozen_sha)
+    responses = iter(
+        [
+            subprocess.CompletedProcess([], 0, stdout=f"{frozen_sha}\trefs/heads/master\n"),
+            subprocess.CompletedProcess([], 0, stdout=f"{moved_sha}\trefs/heads/master\n"),
+        ]
+    )
+    ls_remote = mocker.patch(
+        "orcest.fleet.source_revision._run_ls_remote", side_effect=lambda *a, **kw: next(responses)
+    )
+    mocker.patch("orcest.fleet.cli._upgrade_cli")
+    _mock_proxmox_client(mocker)
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch("orcest.fleet.orchestrator.get_pool_redis_members", return_value=(set(), {}))
+    mocker.patch("orcest.fleet.orchestrator.clean_pending_tasks", return_value=0)
+    mocker.patch("orcest.fleet.orchestrator.get_deployed_pool_backend", return_value=None)
+    mocker.patch("orcest.fleet.orchestrator.upload_source")
+    mocker.patch("orcest.fleet.orchestrator.build_image")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_password", return_value="pw")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
+    mocker.patch("orcest.fleet.orchestrator.upload_fleet_config")
+    mocker.patch("orcest.fleet.orchestrator.ensure_pool_manager")
+    wait_mock = mocker.patch("orcest.fleet.cli._wait_for_candidate_workers")
+
+    result = runner.invoke(fleet, ["deploy", "--config", cfg_path])
+
+    assert result.exit_code == 0, result.output
+    # `git ls-remote` was consulted only once for the whole deploy, even
+    # though `_validate_deploy_source_revision` inside `update` and the
+    # preflight both check the desired revision.
+    assert ls_remote.call_count == 1
+    assert wait_mock.call_args.kwargs["expected_revision"] == frozen_sha
+    assert wait_mock.call_args.kwargs["expected_revision"] != moved_sha
+
+
 def test_deploy_requires_worker_range_before_stop(runner, cfg_path, mocker):
     cfg = _proxmox_cfg(
         proxmox=ProxmoxConfig(
@@ -3786,6 +4105,7 @@ def test_deploy_rebuild_template_uses_rebake_pointer_swap(runner, cfg_path, mock
         "orcest.fleet.orchestrator.set_current_template_vmid",
         side_effect=lambda *_args, **_kwargs: call_order.append("set_current_template_vmid"),
     )
+    mocker.patch("orcest.fleet.orchestrator.set_current_template_revision")
     mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
     mocker.patch(
         "orcest.fleet.orchestrator.get_pool_redis_members",

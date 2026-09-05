@@ -428,6 +428,36 @@ class PoolConfig:
 
 
 @dataclass
+class DesiredSourceConfig:
+    """Declared desired Orcest source revision -- explicit operator policy.
+
+    Either ``ref`` (a fully qualified, possibly moving ref such as
+    ``refs/heads/master``) or ``sha`` (an immutable full 40-character commit
+    hash) may be set, never both. Neither is inferred from the ambient
+    checkout branch: an unset ``repo`` means no desired revision is declared
+    at all, and fleet health reporting must say so explicitly rather than
+    treating any deployed revision as current.
+    """
+
+    repo: str = ""
+    ref: str = ""
+    sha: str = ""
+
+    def __post_init__(self) -> None:
+        if self.ref and self.sha:
+            raise ValueError("desired_source: set only one of ref or sha, not both")
+        if (self.ref or self.sha) and not self.repo.strip():
+            raise ValueError("desired_source.repo is required when ref or sha is set")
+        if self.sha and not re.fullmatch(r"[0-9a-fA-F]{40}", self.sha.strip()):
+            raise ValueError("desired_source.sha must be a full 40-character commit hash")
+
+    @property
+    def is_configured(self) -> bool:
+        """Return whether a desired repo plus ref or sha has been declared."""
+        return bool(self.repo.strip() and (self.ref.strip() or self.sha.strip()))
+
+
+@dataclass
 class FleetConfig:
     """Top-level fleet configuration."""
 
@@ -436,6 +466,7 @@ class FleetConfig:
     orgs: dict[str, OrgEntry] = field(default_factory=dict)
     projects: list[ProjectEntry] = field(default_factory=list)
     pool: PoolConfig = field(default_factory=PoolConfig)
+    desired_source: DesiredSourceConfig = field(default_factory=DesiredSourceConfig)
     # Optional absolute path on the orchestrator VM where verbatim per-task
     # traces are archived. ``None`` disables archiving (orchestrator falls back
     # to today's Redis-only output stream). When set, ``generate_env_file``
@@ -704,12 +735,22 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
     else:
         monitor_write_token = monitor_write_token_raw.strip()
 
+    ds = data.get("desired_source") or {}
+    if not isinstance(ds, dict):
+        raise ValueError("desired_source must be a mapping")
+    desired_source = DesiredSourceConfig(
+        repo=str(ds.get("repo", "") or ""),
+        ref=str(ds.get("ref", "") or ""),
+        sha=str(ds.get("sha", "") or ""),
+    )
+
     return FleetConfig(
         proxmox=proxmox,
         orchestrator=orchestrator,
         orgs=orgs,
         projects=projects,
         pool=pool,
+        desired_source=desired_source,
         trace_archive_host_path=trace_archive_host_path,
         workflow_state_host_path=workflow_state_host_path,
         monitor_ingest_url=monitor_ingest_url,
@@ -788,6 +829,12 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
         },
     }
 
+    if config.desired_source.is_configured:
+        data["desired_source"] = {
+            "repo": config.desired_source.repo,
+            "ref": config.desired_source.ref,
+            "sha": config.desired_source.sha,
+        }
     if config.trace_archive_host_path:
         data["trace_archive_host_path"] = config.trace_archive_host_path
     if config.workflow_state_host_path:
