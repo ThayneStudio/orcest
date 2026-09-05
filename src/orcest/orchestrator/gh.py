@@ -20,8 +20,8 @@ logger = logging.getLogger(__name__)
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 _LABEL_ALREADY_ABSENT_RE = re.compile(
-    r"(?:gh:\s*)?label(?:\s+(?:'[^'\r\n]+'|\"[^\"\r\n]+\"))?\s+"
-    r"(?:does not exist|not found)(?:\s+\(http\s+404\))?",
+    r"(?:gh:\s+label\s+does\s+not\s+exist\s+\(http\s+404\)"
+    r"|label\s+(?:'[^'\r\n]+'|\"[^\"\r\n]+\")\s+not\s+found)",
     re.IGNORECASE,
 )
 
@@ -62,12 +62,13 @@ class GhNotInstalledError(GhCliError):
 def _label_already_absent(stderr: str | None) -> bool:
     """True when `stderr` means a label-removal target was already gone.
 
-    Covers gh's current REST error for a missing label
-    (``gh: Label does not exist (HTTP 404)``) and narrowly anchored older
-    phrasings that name the label (``label 'x' not found``). A response with
-    an HTTP status is idempotent only when that status is 404. Additional
-    lines or context are rejected so permission, authentication, repository,
-    and server failures cannot be hidden by incidental label wording.
+    Accept exactly two response families: gh's current REST error for a
+    missing label (``gh: Label does not exist (HTTP 404)``), and the legacy
+    quoted-label form (``label 'x' not found``). Keeping these as explicit
+    alternatives avoids accidentally accepting undocumented hybrids such as
+    ``Label does not exist`` without a status. Additional lines or context are
+    rejected so permission, authentication, repository, and server failures
+    cannot be hidden by incidental label wording.
     """
     return _LABEL_ALREADY_ABSENT_RE.fullmatch((stderr or "").strip()) is not None
 
