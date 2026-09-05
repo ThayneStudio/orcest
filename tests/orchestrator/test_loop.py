@@ -2134,7 +2134,12 @@ def test_mark_usage_exhausted_queries_reset_time_for_clauder(mocker):
         logging.getLogger("test"),
     )
 
-    get_reset.assert_called_once_with("claude-oauth")
+    get_reset.assert_called_once_with("claude-oauth", observe=mocker.ANY)
+    get_reset.call_args.kwargs["observe"](
+        {"five_hour": {"utilization": 97, "resets_at": "2026-06-26T12:00:00Z"}}
+    )
+    quota = pool.dashboard_accounts()[0]["quota"]
+    assert quota["windows"][0]["used_percent"] == 97
 
 
 def test_consume_results_usage_exhausted_no_branch(

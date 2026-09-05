@@ -46,6 +46,7 @@ from orcest.orchestrator.issue_retry import (
     store_issue_retry_budget_record,
     store_issue_retry_context,
 )
+from orcest.shared import work_observations as work_view
 from orcest.shared.config import IssueDeliveryVerifierConfig, LabelConfig
 from orcest.shared.events import EventPublisher, make_event
 from orcest.shared.models import ResultStatus, TaskResult
@@ -1066,6 +1067,9 @@ def _observe_and_transition(
             SagaPhase.TERMINAL_PERSISTED,
             extra=extra,
         ):
+            work_view.link_publication(
+                redis, job.repo, job.issue_number, extra["selected_pr_number"]
+            )
             _incr_metric(redis, "verified")
             latency_ms = int(max(0.0, current - job.created_at) * 1000)
             _set_metric(redis, "last_latency_ms", latency_ms)

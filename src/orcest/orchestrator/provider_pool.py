@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 from datetime import datetime, timedelta, timezone
 
@@ -54,6 +55,54 @@ class ProviderPool:
     Legacy shims are provided so that the claude_tokens migration path in
     loop.py can swap the pool instance without changing every call site yet.
     """
+
+    def dashboard_accounts(self) -> list[dict]:
+        """Public account inventory; no credentials or authentication payloads."""
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            accounts: dict[str, dict] = {}
+            for entry in self._entries:
+                key = entry.account_key()
+                expiry = self._cooldowns.get(key)
+                account = accounts.setdefault(
+                    key,
+                    {
+                        "id": key,
+                        "provider": entry.provider,
+                        "models": [],
+                        "availability": "cooldown" if expiry and expiry > now else "available",
+                        "resets_at": expiry.timestamp() if expiry and expiry > now else None,
+                        "quota": self._usage.get(key),
+                    },
+                )
+                if entry.model and entry.model not in account["models"]:
+                    account["models"].append(entry.model)
+            return list(accounts.values())
+
+    def record_usage(self, account_key: str, data: dict[str, object]) -> None:
+        """Retain only validated public quota windows from an existing probe."""
+        windows = []
+        for key in ("five_hour", "seven_day"):
+            value = data.get(key)
+            if not isinstance(value, dict):
+                continue
+            percent = value.get("utilization")
+            reset = value.get("resets_at")
+            if not isinstance(percent, int | float) or not math.isfinite(percent):
+                continue
+            windows.append(
+                {
+                    "name": key,
+                    "used_percent": max(0, min(100, percent)),
+                    "resets_at": reset if isinstance(reset, str) else None,
+                }
+            )
+        if windows:
+            with self._lock:
+                self._usage[account_key] = {
+                    "observed_at": datetime.now(timezone.utc).timestamp(),
+                    "windows": windows,
+                }
 
     def __init__(self, entries: list[ProviderEntry]) -> None:
         if not entries:
@@ -95,6 +144,7 @@ class ProviderPool:
         # stays Redis-free per the pool boundary).
         self._credential_overrides: dict[str, tuple[str, float]] = {}
         self._lock = threading.RLock()
+        self._usage: dict[str, dict] = {}
 
     @classmethod
     def from_claude_tokens(cls, tokens: list[str]) -> "ProviderPool":
