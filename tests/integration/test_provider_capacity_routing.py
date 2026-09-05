@@ -186,3 +186,53 @@ def test_refresh_paused_past_lock_expiry_cannot_renew_reservation(
     assert rc.zscore(reservation.key, reservation.task_id) == score_before
     assert newer_owner.release()
     reservation.release()
+
+
+@pytest.mark.integration
+def test_selection_cannot_miss_reservation_to_stream_handoff(
+    real_redis_client: RedisClient,
+    make_real_redis_client,
+    monkeypatch,
+) -> None:
+    rc = real_redis_client
+    sibling = make_real_redis_client()
+    _prepare_backend(rc, "codex", ["only-worker"])
+    publishing = reserve_provider_capacity(
+        rc,
+        ["codex"],
+        "publishing-task",
+        logging.getLogger("integration.capacity"),
+    )
+    assert publishing is not None
+
+    original_stream_load = provider_capacity._stream_load
+    old_stream_state_read = threading.Event()
+    finish_snapshot = threading.Event()
+
+    def delayed_stream_load(client: RedisClient, stream: str):
+        result = original_stream_load(client, stream)
+        if threading.current_thread().name.startswith(
+            "handoff-selector"
+        ) and stream == task_stream_name("codex", issue=True):
+            old_stream_state_read.set()
+            assert finish_snapshot.wait(timeout=10)
+        return result
+
+    monkeypatch.setattr(provider_capacity, "_stream_load", delayed_stream_load)
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="handoff-selector") as executor:
+        selecting = executor.submit(
+            reserve_provider_capacity,
+            sibling,
+            ["codex"],
+            "next-task",
+            logging.getLogger("integration.capacity"),
+        )
+        assert old_stream_state_read.wait(timeout=10)
+        rc.xadd(task_stream_name("codex", issue=True), {"id": publishing.task_id})
+        publishing.release()
+        finish_snapshot.set()
+        selected = selecting.result(timeout=10)
+
+    assert selected is None
+    assert rc.zcard("providers:capacity:reservations:codex") == 0
+    assert rc.xlen(task_stream_name("codex", issue=True)) == 1

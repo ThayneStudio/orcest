@@ -309,11 +309,16 @@ def read_provider_loads(
             unknown[provider] = "worker heartbeat TTL is invalid"
             continue
         try:
+            # Read reservations before streams. Publication hands capacity off
+            # in the order reservation -> stream append -> reservation release;
+            # observing the old state before the new state prevents a selector
+            # from landing in the handoff gap. The opposite order could pair a
+            # pre-append stream snapshot with a post-release reservation count.
+            reservations = _reservation_count(redis_client, provider, now)
             pr_lag, pr_busy = _stream_load(redis_client, task_stream_name(provider, issue=False))
             issue_lag, issue_busy = _stream_load(
                 redis_client, task_stream_name(provider, issue=True)
             )
-            reservations = _reservation_count(redis_client, provider, now)
         except CapacityReadError as exc:
             unknown[provider] = str(exc)[:160] or "capacity read unavailable"
             continue
