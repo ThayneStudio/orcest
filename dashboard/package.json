@@ -24,7 +24,8 @@
     "prepreview": "npm run check:node",
     "preview": "node build/server/index.js",
     "pretest": "npm run check:node",
-    "test": "vitest run"
+    "test": "vitest run",
+    "check:fleet-e2e": "node scripts/check-fleet-e2e.mjs"
   },
   "dependencies": {
     "express": "^4.21.0",

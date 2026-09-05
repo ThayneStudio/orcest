@@ -24,6 +24,7 @@ import yaml
 
 from orcest.orchestrator import gh
 from orcest.revision import get_build_revision
+from orcest.shared import work_observations as work_view
 from orcest.shared.config import WorkerConfig
 from orcest.shared.coordination import (
     RedisLock,
@@ -2408,6 +2409,7 @@ def _execute_task(
             logger.warning("Failed to emit %s event", event_type, exc_info=True)
 
     def publish_task_end(status: ResultStatus, summary: str = "") -> None:
+        work_view.attempt_finished(event_redis, task, status.value)
         try:
             _publish_task_output(
                 redis,
@@ -2460,6 +2462,9 @@ def _execute_task(
             logger.warning("Failed to publish task_start marker to Redis", exc_info=True)
 
         _emit("net.orcest.task.started")
+        work_view.attempt_started(
+            event_redis, task, config.worker_id, worker_prefix=redis.key_prefix
+        )
 
         try:
             is_stale, stale_reason = _validate_pr_task_snapshot(task, logger)
@@ -2615,6 +2620,12 @@ def _execute_task(
         duration = int(time.monotonic() - start)
 
         if runner_result.needs_human:
+            work_view.human_reason(
+                event_redis,
+                task,
+                runner_result.needs_human_reason,
+                credential_update=runner_result.credential_update or "",
+            )
             # A worker-reported human-decision blocker is never a success: the
             # PR was not resolved. Force FAILED (even if the CLI exited 0) so
             # the orchestrator surfaces the signal instead of silently

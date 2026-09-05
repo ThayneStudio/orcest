@@ -72,7 +72,10 @@ make format
 
 ## Dashboard
 
-GitHub itself is the dashboard:
+See [product vision](../docs/vision.md) and [dashboard runbook](../docs/fleet-dashboard.md).
+The fleet dashboard projects observations without making scheduling decisions.
+Configured provider accounts, VM allocation, and running agents are separate concepts.
+GitHub remains an inspectable source of work and delivery evidence:
 - Labels: `orcest:ready`, `orcest:needs-human`
 - Comments on PRs/issues for status updates
 - `orcest status` CLI for system health

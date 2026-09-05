@@ -1,17 +1,10 @@
 import type { IncomingMessage } from "http";
-import { timingSafeEqual, createHash } from "crypto";
+import { tokenMatches } from "./token.js";
+export { tokenMatches } from "./token.js";
+
+import { sessionAuthorized } from "./signIn.js";
 
 const AUTH_COOKIE = "orcest_dashboard_token";
-
-// Read the token lazily on every check so tests can set/clear
-// process.env.DASHBOARD_TOKEN per case without module-reset hacks.
-export function tokenMatches(candidate: string): boolean {
-  const token = process.env.DASHBOARD_TOKEN;
-  if (!token) return false;
-  const a = createHash("sha256").update(candidate).digest();
-  const b = createHash("sha256").update(token).digest();
-  return timingSafeEqual(a, b);
-}
 
 function tokenFromQuery(req: IncomingMessage): string | null {
   let url: URL;
@@ -59,6 +52,7 @@ export function isAuthorized(req: IncomingMessage): boolean {
   // Fail CLOSED: with no configured token there is no way to authenticate,
   // so deny every request rather than authorize them all.
   if (!token) return false;
+  if (sessionAuthorized(req)) return true;
   const auth = (req as { headers: Record<string, string | string[] | undefined> }).headers
     .authorization;
   if (typeof auth === "string" && auth.startsWith("Bearer ") && tokenMatches(auth.slice(7)))

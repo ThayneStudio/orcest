@@ -1185,7 +1185,7 @@ def get_issue(repo: str, number: int, token: str) -> dict:
             "--repo",
             repo,
             "--json",
-            "number,title,body,labels,assignees",
+            "number,title,body,labels,assignees,state",
         ],
         token,
     )
