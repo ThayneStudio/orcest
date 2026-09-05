@@ -896,6 +896,9 @@ StorageRestorationFactSourceKind = _register_enum(
 ManagementCommandKind = _register_enum(
     "management_command.kind", "ManagementCommandKind", ["CANCEL", "RESOLVE_HUMAN_BOUNDARY"]
 )
+ManagementCommandOutcome = _register_enum(
+    "management_command.outcome", "ManagementCommandOutcome", ["ACCEPTED"]
+)
 HumanBoundaryReason = _register_enum(
     "human_boundary.reason",
     "HumanBoundaryReason",
