@@ -19,15 +19,15 @@ its store tests do not prove recovery of the currently deployed legacy queue.
 
 | Gate | Evidence required | Current state |
 | --- | --- | --- |
-| Review findings | Every comment fixed or explicitly explained; review of final candidate | Original PR fixes implemented and dispositions recorded; candidate review pending |
+| Review findings | Every comment fixed or explicitly explained; review of final candidate | PR #817 approved with no blocking findings and merged; post-merge CI passed |
 | Supported runtime | Supported LTS Node, consistent build/deploy pins, type checks and image smoke | Node 24.20.0 passes local checks; candidate container authentication/assets/bundle smoke passed |
 | Dependency security | Audit locked dependencies; no unexplained high/critical findings | Updated lockfile reports zero npm advisories on 2026-09-05 |
-| Data correctness | Expiration, partial discovery, stale observations, completion evidence, account/worker distinction | Dashboard regression suite passes; live candidate validation pending |
+| Data correctness | Expiration, partial discovery, stale observations, completion evidence, account/worker distinction | Dashboard regression suite passes; local candidate reads live scoped data successfully |
 | Session/output behavior | Expiry, logout, token rotation, reconnect, bounded connections and output queues | Existing tests cover these boundaries; local process rehearsal passed |
 | Queue recovery | Crash before ACK, durable pending state, replay, ownership safety under concurrency | Existing unit and real-Redis tests identified; local process rehearsal passed; managed Redis integration/concurrency: 12 passed |
 | External outages | GitHub/Redis failures pause safely and recover without lost outcomes or repeated effects | Unit result-replay coverage passes; local process rehearsal passed |
 | Restore and rollback | Restore data into an isolated instance; verify candidate rollback with exact artifacts | Local restore and real-script rollback rehearsals passed; deployment-specific validation remains |
-| Sustained operation | 24 hours of timestamped measurements with representative work and no unexplained failure | Not started |
+| Sustained operation | 24 hours of timestamped measurements with representative work and no unexplained failure | Started 2026-09-06T02:06:47Z; qualification pending |
 
 ## PR 814 comment dispositions
 
@@ -121,3 +121,44 @@ a sentinel value, and the synthetic queued task. The candidate configuration
 file was restored for correction after rollback. The test project and its
 resources were then removed. This is executable rollback evidence for this
 runtime transition; it is not a claim that a live rollback or deployment occurred.
+
+
+## Reviewed candidate observation
+
+[PR #817](https://github.com/ThayneStudio/orcest/pull/817) received an approving
+review with no blocking findings. Orcest merged it as
+`306ed138089e5ba7a2b131c63840c13fad617549`. The
+[post-merge CI run](https://github.com/ThayneStudio/orcest/actions/runs/34001255401)
+passed lint, typecheck, unit, integration, dashboard, Docker image and Compose
+smoke checks.
+
+The merged candidate runs locally on loopback port 4319 under Node 24.20.0,
+reading the existing fleet through an SSH tunnel. Production service images and
+Cloudflare routes remain unchanged. Runtime source matches the previously
+validated `bbcb9b4` build; the later changes affect qualification tooling and
+this record. A local SHA-256 manifest pins the running build and browser assets.
+
+Candidate readiness reports the merged revision. Browser sign-in renders all
+four projects, four worker heartbeats and three configured provider accounts.
+Issue #815 resolves to its verified PR #816, and its completed execution output
+renders through the authenticated output transport. HTTP checks verified sign-out
+revocation. This retained execution predates the observation window and does not
+count as new work during the window.
+
+The observation started at **2026-09-06T02:06:47Z**, with an earliest full-interval
+end of **2026-09-07T02:06:47Z**. It samples the local process identity/memory,
+readiness, request latency, scoped work transitions, provider availability,
+worker liveness, queue depth/age and pending delivery state every minute. Every
+five minutes it reads production service identities, start times, restart counts
+and health. Hourly disposable sessions verify logout revocation; the long-lived
+measurement session must expire normally and reauthenticate after twelve hours.
+Sampling gaps remain failures, never backfilled healthy samples. A passing
+observation requires new execution and verified completion evidence; naturally
+idle fleet time alone cannot qualify it.
+
+The protected local evidence directory is `/private/tmp/orcest-observation-306ed13`.
+It contains the observation script, artifact manifest, timestamped samples,
+process metadata and eventual result. Its credential file is excluded from all
+reports and source control. A half-hourly task follow-up checks the actual
+process and evidence, reporting meaningful failures or the final qualification
+result. The 24-hour gate remains incomplete until the evidence is audited.
