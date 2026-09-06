@@ -7,9 +7,9 @@ network_name="${DASHBOARD_SMOKE_NETWORK:-${project}-network}"
 smoke_image="${DASHBOARD_SMOKE_IMAGE:-orcest-dashboard-smoke:${project}}"
 token="${DASHBOARD_SMOKE_TOKEN:-dashboard-smoke-token}"
 redis_password="${DASHBOARD_SMOKE_REDIS_PASSWORD:-dashboard-smoke-redis-password}"
-DASHBOARD_NODE_VERSION=${DASHBOARD_NODE_VERSION:-20.18.3}
+DASHBOARD_NODE_VERSION=${DASHBOARD_NODE_VERSION:-24.20.0}
 node_version="$DASHBOARD_NODE_VERSION"
-node_image="${DASHBOARD_SMOKE_NODE_IMAGE:-node:${DASHBOARD_NODE_VERSION:-20.18.3}-slim}"
+node_image="${DASHBOARD_SMOKE_NODE_IMAGE:-node:${DASHBOARD_NODE_VERSION:-24.20.0}-slim}"
 repo_root="$(pwd -P)"
 host_port="${DASHBOARD_SMOKE_HOST_PORT:-$(python3 - <<'PY'
 import socket
