@@ -6,6 +6,11 @@ import FleetDashboard from "./FleetDashboard";
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    {new URLSearchParams(window.location.search).get("view") === "diagnostics" ? <App /> : <FleetDashboard />}
-  </StrictMode>
+    {new URLSearchParams(window.location.search).get("view") ===
+    "diagnostics" ? (
+      <App />
+    ) : (
+      <FleetDashboard />
+    )}
+  </StrictMode>,
 );

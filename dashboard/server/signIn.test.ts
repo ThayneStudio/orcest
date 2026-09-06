@@ -1,4 +1,4 @@
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { WebSocket } from "ws";
@@ -9,9 +9,16 @@ import {
 import { sessionAuthorized } from "./signIn.js";
 import type { IncomingMessage } from "node:http";
 let instance: DashboardServerInstance | undefined;
+let testNow = Date.now();
+beforeEach(() => {
+  // Let the process-wide rate limiter expire between independent server tests.
+  vi.spyOn(Date, "now").mockImplementation(() => testNow);
+  testNow += 61000;
+});
 afterEach(async () => {
   if (instance) await instance.close();
   vi.unstubAllEnvs();
+  vi.restoreAllMocks();
 });
 it("signs in without leaking the token, protects HTTP and sockets, and revokes both on sign-out", async () => {
   vi.stubEnv("DASHBOARD_TOKEN", "private-login-test-token");
@@ -81,7 +88,7 @@ it("signs in without leaking the token, protects HTTP and sockets, and revokes b
   const fresh = await login("private-login-test-token", {
     "X-Forwarded-Proto": "https",
   });
-  expect(fresh.headers.get("set-cookie")).toContain("Secure");
+  expect(fresh.headers.get("set-cookie")).not.toContain("Secure");
   const freshCookie = fresh.headers.get("set-cookie")!.split(";")[0];
   vi.stubEnv("DASHBOARD_TOKEN", "rotated-token");
   expect(
@@ -99,6 +106,51 @@ it("signs in without leaking the token, protects HTTP and sockets, and revokes b
       .status,
   ).toBe(429);
 });
+it.each([
+  ["", "https", false],
+  ["192.0.2.1", "https", false],
+  ["127.0.0.1", "https", true],
+  ["127.0.0.1", "https,http", true],
+  ["127.0.0.1", "http", false],
+])(
+  "sets both cookie types using trusted transport: proxy=%s proto=%s",
+  async (proxy, proto, secure) => {
+    vi.stubEnv("DASHBOARD_TOKEN", "transport-test-token");
+    vi.stubEnv("DASHBOARD_TRUSTED_PROXIES", proxy);
+    instance = createDashboardServer({
+      port: 0,
+      deps: {
+        redisQuit: async () => {},
+        logInfo: () => {},
+        logError: () => {},
+      },
+    });
+    instance.server.listen(0, "127.0.0.1");
+    await once(instance.server, "listening");
+    const base = `http://127.0.0.1:${(instance.server.address() as AddressInfo).port}`;
+    const headers = { "X-Forwarded-Proto": proto };
+    const login = await fetch(base + "/api/auth/login", {
+      method: "POST",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify({ token: "transport-test-token" }),
+    });
+    expect(login.status).toBe(200);
+    const legacy = await fetch(base + "/?token=transport-test-token", {
+      headers,
+    });
+    for (const response of [login, legacy]) {
+      const cookie = response.headers.get("set-cookie");
+      expect(cookie).toBeTruthy();
+      expect(cookie!.includes("; Secure")).toBe(secure);
+    }
+    const cli = await fetch(base + "/", {
+      headers: { Accept: "*/*" },
+      redirect: "manual",
+    });
+    expect(cli.status).toBe(401);
+    expect(await cli.json()).toEqual({ error: "Unauthorized" });
+  },
+);
 it("isolates client limits behind an explicitly trusted proxy and ignores spoofed earlier hops", async () => {
   vi.stubEnv("DASHBOARD_TOKEN", "proxy-test-token");
   vi.stubEnv("DASHBOARD_TRUSTED_PROXIES", "127.0.0.1");

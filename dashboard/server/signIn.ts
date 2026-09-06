@@ -2,6 +2,7 @@ import { randomBytes, createHash } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import express, { type Express } from "express";
 import { tokenMatches } from "./token.js";
+import { requestIsSecure } from "./transport.js";
 
 const COOKIE = "orcest_session";
 const sessions = new Map<string, { expires: number; generation: string }>();
@@ -54,11 +55,7 @@ export function bindSessionSocket(
   });
 }
 function cookie(req: IncomingMessage, value: string, maxAge: number): string {
-  const secure =
-    Boolean((req.socket as { encrypted?: boolean })?.encrypted) ||
-    String(req.headers["x-forwarded-proto"] || "")
-      .split(",")[0]
-      .trim() === "https";
+  const secure = requestIsSecure(req);
   return `${COOKIE}=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${secure ? "; Secure" : ""}`;
 }
 function sameOrigin(req: IncomingMessage): boolean {

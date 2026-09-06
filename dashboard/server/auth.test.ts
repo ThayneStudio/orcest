@@ -52,8 +52,9 @@ describe("isAuthorized", () => {
     process.env.DASHBOARD_TOKEN = "s3cret";
 
     expect(isAuthorized(req({}, "/ws/snapshot?token=%20s3cret%20"))).toBe(true);
-    expect(authCookieHeader(req({}, "/?token=%20s3cret%20")))
-      .toContain("orcest_dashboard_token=s3cret");
+    expect(authCookieHeader(req({}, "/?token=%20s3cret%20"))).toContain(
+      "orcest_dashboard_token=s3cret",
+    );
   });
 
   it("treats malformed query-token URLs as unauthenticated", () => {
@@ -65,10 +66,16 @@ describe("isAuthorized", () => {
 
   it("authorizes browser follow-up requests via the dashboard auth cookie", () => {
     process.env.DASHBOARD_TOKEN = "s3cret";
-    expect(isAuthorized(req({ cookie: "orcest_dashboard_token=s3cret" }, "/assets/app.js")))
-      .toBe(true);
-    expect(isAuthorized(req({ cookie: "orcest_dashboard_token=wrong" }, "/assets/app.js")))
-      .toBe(false);
+    expect(
+      isAuthorized(
+        req({ cookie: "orcest_dashboard_token=s3cret" }, "/assets/app.js"),
+      ),
+    ).toBe(true);
+    expect(
+      isAuthorized(
+        req({ cookie: "orcest_dashboard_token=wrong" }, "/assets/app.js"),
+      ),
+    ).toBe(false);
   });
 
   it("sets a scoped auth cookie when a valid query token is used", () => {
@@ -81,15 +88,26 @@ describe("isAuthorized", () => {
     expect(authCookieHeader(req({}, "/?token=wrong"))).toBeNull();
   });
 
-  it("marks cookies Secure through common forwarded-proto proxy forms", () => {
+  it("ignores raw forwarded-proto headers without a trusted Express transport", () => {
     process.env.DASHBOARD_TOKEN = "s3cret";
 
-    expect(authCookieHeader(
-      req({ "x-forwarded-proto": "https,http" }, "/?token=s3cret"),
-    )).toContain("Secure");
-    expect(authCookieHeader(
-      req({ "x-forwarded-proto": ["https"] }, "/?token=s3cret"),
-    )).toContain("Secure");
+    expect(
+      authCookieHeader(
+        req({ "x-forwarded-proto": "https,http" }, "/?token=s3cret"),
+      ),
+    ).not.toContain("Secure");
+    expect(
+      authCookieHeader(
+        req({ "x-forwarded-proto": ["https"] }, "/?token=s3cret"),
+      ),
+    ).not.toContain("Secure");
+  });
+
+  it("marks cookies Secure on a direct TLS connection", () => {
+    process.env.DASHBOARD_TOKEN = "s3cret";
+    const request = req({}, "/?token=s3cret");
+    Object.assign(request, { socket: { encrypted: true } });
+    expect(authCookieHeader(request)).toContain("Secure");
   });
 
   it("tokenMatches stays closed when no token configured", () => {

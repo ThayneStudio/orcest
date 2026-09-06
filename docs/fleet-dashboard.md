@@ -108,7 +108,7 @@ identity. Missing VM state does not become a fabricated capacity denominator.
 
 ## Local validation
 
-Use the supported Node 20 runtime and the project's Python development environment:
+Use Node 24 LTS (the exact minimum is in `dashboard/.node-version`) and the project's Python development environment:
 
 ```sh
 cd dashboard

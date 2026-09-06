@@ -83,6 +83,33 @@ const run: WorkAttempt = {
   outputPrefix: "project-a",
 };
 describe("work lifecycle projection", () => {
+  it("omits hashes that disappear after discovery without shifting another card's attempt", async () => {
+    store.clear();
+    const now = String(Date.now() / 1000);
+    store.set("project-a:dashboard:project", {
+      repo: "org/repo",
+      observed_at: now,
+      accounts: "[]",
+    });
+    store.set("project-a:dashboard:work:issue:org/repo:11", {});
+    const key = "project-a:dashboard:work:issue:org/repo:12";
+    store.set(key, fields({ observed_at: now }));
+    store.set(key + ":attempts", ["attempt-12"]);
+    store.set("project-a:dashboard:attempt:attempt-12", {
+      task_id: "attempt-12",
+      worker_id: "worker-12",
+      provider: "codex",
+      status: "completed",
+    });
+    store.set("project-a:dashboard:work:issue:org/repo:13", {});
+    const result = await fetchWorkView(message);
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]).toMatchObject({
+      number: 12,
+      latestAttempt: { taskId: "attempt-12", workerId: "worker-12" },
+    });
+    expect(result.coverage).toBe("complete");
+  });
   it("keeps dependency waiting before execution in Upcoming and CI waiting after execution In progress", () => {
     expect(projectWork(fields(), null, message, 1000)).toMatchObject({
       stage: "upcoming",

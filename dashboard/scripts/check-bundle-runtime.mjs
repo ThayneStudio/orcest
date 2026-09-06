@@ -90,10 +90,15 @@ class SmokeWebSocket {
   }
 }
 
+// Node 24 exposes navigator through a getter. Install the browser fixture as
+// an own property rather than assigning through that read-only accessor.
+Object.defineProperty(globalThis, "navigator", {
+  value: window.navigator,
+  configurable: true,
+});
 Object.assign(globalThis, {
   window,
   document: window.document,
-  navigator: window.navigator,
   location: window.location,
   history: window.history,
   localStorage: window.localStorage,
