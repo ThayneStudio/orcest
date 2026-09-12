@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from orcest.workflow_store import DEFAULT_REDUCER_VERSION, RunStore
+from orcest.workflow_store.v1 import observability as observability_mod
 from orcest.workflow_store.v1.observability import collect_observability
 
 pytestmark = pytest.mark.unit
@@ -67,7 +68,28 @@ def test_packets_are_bounded_and_do_not_echo_arbitrary_project_text(tmp_path: Pa
 
     rendered = snapshot.packet.to_json()
     assert len(rendered.encode()) <= 32_768
+    assert snapshot.packet.truncated is False
+    assert '"truncated":false' in rendered
     assert secret not in rendered
     assert secret not in repr(snapshot.metrics)
     assert secret not in repr(snapshot.events)
     assert {gate.stage for gate in snapshot.packet.gates} == set(range(6))
+
+
+def test_packet_sets_truncated_when_alerts_or_facts_exceed_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(observability_mod, "_MAX_DIAGNOSTICS", 1)
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        _seed_transition(store)
+        snapshot = collect_observability(
+            store.conn,
+            now_ms=2_000_000_000_000,
+            redis_rebuild_ok=False,
+            audit_write_ok=False,
+        )
+
+    assert snapshot.packet.truncated is True
+    assert len(snapshot.packet.alerts) == 1
+    assert len(snapshot.packet.facts) == 1
+    assert '"truncated":true' in snapshot.packet.to_json()

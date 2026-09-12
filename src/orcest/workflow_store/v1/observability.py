@@ -391,7 +391,6 @@ def collect_observability(
     gates = _gates(
         integrity_ok=integrity and foreign_key_errors == 0,
         redis_rebuild_ok=redis_rebuild_ok,
-        pending_outbox=pending_outbox + pending_projection,
         oldest_outbox=max(oldest_outbox, oldest_projection),
         receipt_total=receipt_total,
         consensus_total=consensus_total,
@@ -402,16 +401,18 @@ def collect_observability(
         restore_drill_age_ms=restore_drill_age_ms,
         thresholds=thresholds,
     )
-    active = tuple(a for a in alerts if a.active)[:_MAX_DIAGNOSTICS]
-    facts = tuple(sorted({m.name: m.value for m in metrics if not m.labels}.items()))[
-        :_MAX_DIAGNOSTICS
-    ]
+    active = tuple(a for a in alerts if a.active)
+    facts_all = tuple(sorted({m.name: m.value for m in metrics if not m.labels}.items()))
+    truncated = len(active) > _MAX_DIAGNOSTICS or len(facts_all) > _MAX_DIAGNOSTICS
+    active = active[:_MAX_DIAGNOSTICS]
+    facts = facts_all[:_MAX_DIAGNOSTICS]
     packet = DiagnosticPacket(
         now_ms,
         "FAIL" if active or any(not g.passed for g in gates) else "PASS",
         active,
         gates,
         facts,
+        truncated=truncated,
     )
     packet.to_json()  # enforce the byte bound before returning the packet
     return ObservabilitySnapshot(now_ms, tuple(metrics), events, packet)
