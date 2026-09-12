@@ -269,11 +269,14 @@ def collect_observability(
     latest_capacity = conn.execute(
         "SELECT MAX(accepted_at_ms), MAX(report_sequence) FROM capacity_reports"
     ).fetchone()
-    capacity_age = _age(now_ms, latest_capacity[0]) if latest_capacity[0] is not None else now_ms
+    # No report ever received is a distinct signal from a report received a
+    # long time ago; like oldest_outbox/oldest_projection above, default to 0
+    # (healthy) rather than treating "never" as the worst possible age.
+    capacity_age = _age(now_ms, latest_capacity[0]) if latest_capacity[0] is not None else 0
     latest_budget = conn.execute(
         "SELECT MAX(accepted_at_ms), MAX(source_sequence) FROM budget_reports"
     ).fetchone()
-    budget_age = _age(now_ms, latest_budget[0]) if latest_budget[0] is not None else now_ms
+    budget_age = _age(now_ms, latest_budget[0]) if latest_budget[0] is not None else 0
     metrics.extend(
         [
             MetricSample("workflow_capacity_report_age_ms", capacity_age),
@@ -361,12 +364,14 @@ def collect_observability(
     )
     # The typed Health Observation is authority for object availability.  Do
     # not inspect its subject bindings (which may include storage identifiers)
-    # merely to split this safe aggregate by object kind.
-    missing_candidates = 0
+    # merely to split this safe aggregate by object kind.  This stub metric is
+    # independent of the missing_candidates alert input passed to _alerts()
+    # below, which reuses unavailable_storage.
+    missing_candidates_metric = 0
     metrics.extend(
         [
             MetricSample("workflow_missing_live_objects", unavailable_storage),
-            MetricSample("workflow_missing_live_candidates", missing_candidates),
+            MetricSample("workflow_missing_live_candidates", missing_candidates_metric),
         ]
     )
 
