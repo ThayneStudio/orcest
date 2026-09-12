@@ -653,7 +653,7 @@ def _plan_operation(
             return "STAGE_ORDER", None, None
         checklist = evaluate_rollout_checklist(store, stage=0, gate="ENTRY", now_ms=now_ms)
         if not checklist.passed:
-            return "CHECKLIST_FAILED", checklist, None
+            return _rejection_for_checklist(checklist), checklist, None
         return (
             None,
             checklist,
@@ -671,8 +671,6 @@ def _plan_operation(
                 historical_readonly_retained=False,
             ),
         )
-    if operation_kind == "RECORD_EVIDENCE":
-        return "STAGE_ORDER", None, None
     if operation_kind == "FREEZE_LEGACY":
         if projection.stage < 4:
             return "STAGE_ORDER", None, None
@@ -744,8 +742,7 @@ def _plan_advance(
         observation_period_ms=observation_period_ms,
     )
     if not exit_checklist.passed:
-        rejection = _stage3_rejection(exit_checklist) if exit_stage == 3 else "CHECKLIST_FAILED"
-        return rejection, exit_checklist, None
+        return _rejection_for_checklist(exit_checklist), exit_checklist, None
     if completing:
         updated = _replace(
             projection, stage_revision=projection.stage_revision + 1, status="RETIRED"
@@ -759,7 +756,7 @@ def _plan_advance(
         observation_period_ms=observation_period_ms,
     )
     if not entry_checklist.passed:
-        return "CHECKLIST_FAILED", entry_checklist, None
+        return _rejection_for_checklist(entry_checklist), entry_checklist, None
     publication_enabled = projection.publication_enabled or requested_stage >= 3
     frozen = projection.legacy_admissions_frozen or requested_stage >= 5
     observation = now_ms if requested_stage == 5 else projection.observation_started_at_ms
@@ -804,10 +801,7 @@ def _plan_rollback(
         observation_period_ms=observation_period_ms,
     )
     if not checklist.passed:
-        has_pub = any(item.item_id == "v1_keeps_publications" for item in checklist.items)
-        if has_pub and requested_stage < 3 and _has_v1_publication(store):
-            return "PUBLICATION_EXISTS", checklist, None
-        return "CHECKLIST_FAILED", checklist, None
+        return _rejection_for_checklist(checklist), checklist, None
     if _has_v1_publication(store) and requested_stage < 3:
         return "PUBLICATION_EXISTS", checklist, None
     updated = RolloutProjection(
@@ -826,12 +820,41 @@ def _plan_rollback(
     return None, checklist, updated
 
 
-def _stage3_rejection(checklist: RolloutChecklist) -> str:
-    failed = {item.item_id for item in checklist.items if not item.passed}
-    if "no_duplicate_publication" in failed:
-        return "DUPLICATE_PUBLICATION"
-    if "no_stale_overwrite" in failed:
-        return "STALE_OVERWRITE"
+_CHECKLIST_ITEM_REJECTION_CODES: dict[str, str] = {
+    "controller_maintenance": "CONTROLLER_NOT_MAINTENANCE",
+    "issuance_key_selected": "ISSUANCE_KEY_MISSING",
+    "no_ordinary_forge_io": "FORGE_IO_WHILE_MAINTENANCE",
+    "no_owned_work": "OWNED_WORK_PRESENT",
+    "backup_restore_evidence": "BACKUP_EVIDENCE_MISSING",
+    "pel_reaper_isolated": "REAPER_AUTHORITY_MISMATCH",
+    "clone_credential_attested": "CLONE_CREDENTIAL_REMOVAL_UNATTESTED",
+    "disjoint_pool_inventory": "POOL_INVENTORY_INCOMPLETE",
+    "single_pilot_project": "PILOT_NOT_SINGLE_PROJECT",
+    "pilot_publication_disabled": "PUBLICATION_NOT_DISABLED",
+    "no_duplicate_publication": "DUPLICATE_PUBLICATION",
+    "no_stale_overwrite": "STALE_OVERWRITE",
+    "one_engine_per_project": "DUAL_ENGINE_OWNERSHIP",
+    "legacy_drained": "LEGACY_DRAIN_INCOMPLETE",
+    "legacy_archived": "ARCHIVE_INCOMPLETE",
+    "historical_readonly_retained": "HISTORICAL_READONLY_MISSING",
+    "raw_credentials_removed": "CREDENTIALS_STILL_PRESENT",
+    "observation_period_elapsed": "OBSERVATION_PERIOD_OPEN",
+    "representative_runs_evidence": "REPRESENTATIVE_RUNS_MISSING",
+    "no_v1_publication": "PUBLICATION_EXISTS",
+}
+
+
+def _rejection_for_checklist(checklist: RolloutChecklist) -> str:
+    """Map the first failed item with a dedicated code to that code.
+
+    Falls back to the generic ``CHECKLIST_FAILED`` for items without one
+    (e.g. nested ``stage_N_exit`` gates), so operators can distinguish an
+    expected, named wait condition (like ``OBSERVATION_PERIOD_OPEN``) from an
+    unexpected checklist failure that should page someone.
+    """
+    for item in checklist.items:
+        if not item.passed and item.item_id in _CHECKLIST_ITEM_REJECTION_CODES:
+            return _CHECKLIST_ITEM_REJECTION_CODES[item.item_id]
     return "CHECKLIST_FAILED"
 
 

@@ -442,7 +442,7 @@ def test_stage5_drain_archive_credentials_and_observation(tmp_path: Path) -> Non
             observation_period_ms=10_000,
         )
         assert too_soon.status == "REJECTED"
-        assert too_soon.rejection_code in {"CHECKLIST_FAILED", "OBSERVATION_PERIOD_OPEN"}
+        assert too_soon.rejection_code == "OBSERVATION_PERIOD_OPEN"
         complete = _op(
             store,
             kind="ADVANCE",
