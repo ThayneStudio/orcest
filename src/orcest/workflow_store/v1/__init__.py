@@ -11,6 +11,16 @@ from orcest.workflow_store.v1.errors import (
     StorageLockError,
 )
 from orcest.workflow_store.v1.fs import ControlLayout, QuotaConfig, StorageLock
+from orcest.workflow_store.v1.observability import (
+    Alert,
+    DiagnosticPacket,
+    MetricSample,
+    ObservabilitySnapshot,
+    ObservabilityThresholds,
+    ReleaseGate,
+    StructuredEvent,
+    collect_observability,
+)
 from orcest.workflow_store.v1.offer_projection import (
     activity_offer_protocol,
     dispatch_pending_offers,
@@ -68,4 +78,12 @@ __all__ = [
     "dispatch_pending_offers",
     "offer_stream_key",
     "reconstruct_open_offers",
+    "Alert",
+    "DiagnosticPacket",
+    "MetricSample",
+    "ObservabilitySnapshot",
+    "ObservabilityThresholds",
+    "ReleaseGate",
+    "StructuredEvent",
+    "collect_observability",
 ]
