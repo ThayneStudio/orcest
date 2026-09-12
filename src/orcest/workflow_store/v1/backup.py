@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import time
 import uuid
@@ -172,6 +173,7 @@ def create_backup(
     *,
     destination_root: Path,
     encryption_key: bytes,
+    encryption_key_id: str | None = None,
     backup_barrier_max_ms: int = 30_000,
 ) -> BackupResult:
     """Create one complete backup unit under the exclusive backup barrier.
@@ -181,82 +183,89 @@ def create_backup(
     restore"). ``encryption_key`` is a 32-byte AES-256-GCM key used only to
     seal Secret version bytes into authenticated encrypted envelopes; neither
     plaintext secret bytes nor an unkeyed plaintext digest ever enters the
-    manifest.
+    manifest. ``encryption_key_id`` should identify the key in the operator's
+    keyring; when omitted, a SHA-256 fingerprint of the AES key is recorded.
     """
     if len(encryption_key) != 32:
         raise ValueError("encryption_key must be 32 bytes (AES-256-GCM)")
     backup_id = str(uuid.uuid4())
     staging = destination_root / f"{backup_id}.staging"
-    staging.mkdir(mode=DIR_MODE, parents=True)
-
-    branch = _select_barrier_branch(run_store)
-    pause_operation_id: str | None = None
-    pause_result_mode_revision: int | None = None
-    if branch == "TEMPORARY_PAUSE":
-        pause_operation_id = _pause_for_backup(
-            run_store,
-            authorization_context_digest=content_digest(backup_id.encode()),
-        )
-        pause_row = run_store.conn.execute(
-            "SELECT result_mode_revision FROM controller_mode_operations "
-            "WHERE controller_mode_operation_id = ?",
-            (pause_operation_id,),
-        ).fetchone()
-        pause_result_mode_revision = int(pause_row["result_mode_revision"])
+    completed = destination_root / backup_id
     try:
-        _wait_for_zero_claimed(run_store, barrier_max_ms=backup_barrier_max_ms)
-        with run_store.storage_mutation_lock():
-            if _claimed_attempt_count(run_store) != 0:
-                raise BackupBarrierTimeoutError(
-                    "a CLAIMED Attempt raced the storage-lock-held barrier recheck"
-                )
-            mode = run_store.get_controller_mode()
-            if branch == "TEMPORARY_PAUSE":
-                if mode.mode_revision != pause_result_mode_revision:
+        staging.mkdir(mode=DIR_MODE, parents=True)
+
+        branch = _select_barrier_branch(run_store)
+        pause_operation_id: str | None = None
+        pause_result_mode_revision: int | None = None
+        if branch == "TEMPORARY_PAUSE":
+            pause_operation_id = _pause_for_backup(
+                run_store,
+                authorization_context_digest=content_digest(backup_id.encode()),
+            )
+            pause_row = run_store.conn.execute(
+                "SELECT result_mode_revision FROM controller_mode_operations "
+                "WHERE controller_mode_operation_id = ?",
+                (pause_operation_id,),
+            ).fetchone()
+            pause_result_mode_revision = int(pause_row["result_mode_revision"])
+        try:
+            _wait_for_zero_claimed(run_store, barrier_max_ms=backup_barrier_max_ms)
+            with run_store.storage_mutation_lock():
+                if _claimed_attempt_count(run_store) != 0:
+                    raise BackupBarrierTimeoutError(
+                        "a CLAIMED Attempt raced the storage-lock-held barrier recheck"
+                    )
+                mode = run_store.get_controller_mode()
+                if branch == "TEMPORARY_PAUSE" and mode.mode_revision != pause_result_mode_revision:
                     raise BackupModeTransitionError(
                         "controller mode changed after the committed pause revision"
                     )
-            elif _select_barrier_branch(run_store) != branch:
-                raise BackupModeTransitionError(
-                    "controller mode branch changed under the storage-lock barrier"
+                if branch != "TEMPORARY_PAUSE" and _select_barrier_branch(run_store) != branch:
+                    raise BackupModeTransitionError(
+                        "controller mode branch changed under the storage-lock barrier"
+                    )
+                entries, created_at_ms = _capture_backup_unit(
+                    run_store,
+                    candidate_store,
+                    blob_store,
+                    secret_store,
+                    staging=staging,
+                    encryption_key=encryption_key,
                 )
-            entries, created_at_ms = _capture_backup_unit(
-                run_store,
-                candidate_store,
-                blob_store,
-                secret_store,
-                staging=staging,
-                encryption_key=encryption_key,
-            )
-    finally:
-        if pause_operation_id is not None:
-            _restore_prior_mode(run_store, pause_operation_id=pause_operation_id)
+        finally:
+            if pause_operation_id is not None:
+                _restore_prior_mode(run_store, pause_operation_id=pause_operation_id)
 
-    manifest_body = {
-        "backup_id": backup_id,
-        "schema_version": run_store.get_controller_state().schema_version,
-        "reducer_version": run_store.get_controller_state().reducer_version,
-        "created_at_ms": created_at_ms,
-        "entries": [
-            {
-                "relative_path": entry.relative_path,
-                "kind": entry.kind,
-                "size": entry.size,
-                "mode": entry.mode,
-                "sha256": entry.sha256,
-            }
-            for entry in entries
-        ],
-    }
-    manifest_json = canonical_json_text(manifest_body)
-    _write_backup_file(staging / MANIFEST_NAME, manifest_json.encode("utf-8"))
-    manifest_digest = sha256_hex(manifest_json.encode("utf-8"))
+        manifest_body = {
+            "backup_id": backup_id,
+            "schema_version": run_store.get_controller_state().schema_version,
+            "reducer_version": run_store.get_controller_state().reducer_version,
+            "encryption_key_id": encryption_key_id or f"sha256:{sha256_hex(encryption_key)}",
+            "created_at_ms": created_at_ms,
+            "entries": [
+                {
+                    "relative_path": entry.relative_path,
+                    "kind": entry.kind,
+                    "size": entry.size,
+                    "mode": entry.mode,
+                    "sha256": entry.sha256,
+                }
+                for entry in entries
+            ],
+        }
+        manifest_json = canonical_json_text(manifest_body)
+        _write_backup_file(staging / MANIFEST_NAME, manifest_json.encode("utf-8"))
+        manifest_digest = sha256_hex(manifest_json.encode("utf-8"))
 
-    completed = destination_root / backup_id
-    os.rename(staging, completed)
-    fsync_dir(destination_root)
-    _write_backup_file(completed / COMPLETE_MARKER_NAME, manifest_digest.encode("utf-8"))
-    fsync_dir(completed)
+        os.rename(staging, completed)
+        fsync_dir(destination_root)
+        _write_backup_file(completed / COMPLETE_MARKER_NAME, manifest_digest.encode("utf-8"))
+        fsync_dir(completed)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        if not (completed / COMPLETE_MARKER_NAME).is_file():
+            shutil.rmtree(completed, ignore_errors=True)
+        raise
 
     return BackupResult(
         backup_id=backup_id,

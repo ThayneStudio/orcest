@@ -93,6 +93,8 @@ def run_startup_recovery(
     secret_store: SecretStore,
     *,
     now_ms: int | None = None,
+    secret_provision_resume_limit: int = 1000,
+    storage_restoration_report_limit: int = 1000,
     outbox_report_limit: int = 1000,
 ) -> StartupRecoveryReport:
     """Run the full controller-restart recovery sequence and return a report.
@@ -116,14 +118,19 @@ def run_startup_recovery(
     dispatched = dispatch_pending_offers(run_store, redis, redis_epoch=redis_epoch)
 
     resumed_secret_provisions: list[str] = []
-    for op in run_store.list_pending_secret_provision_operations():
+    for op in run_store.list_pending_secret_provision_operations(
+        limit=secret_provision_resume_limit
+    ):
         reconcile_pending_secret_provision_operation(
             run_store, secret_store, op.secret_provision_operation_id
         )
         resumed_secret_provisions.append(op.secret_provision_operation_id)
 
     pending_storage_restoration = [
-        op.operation_id for op in run_store.list_pending_storage_restoration_operations()
+        op.operation_id
+        for op in run_store.list_pending_storage_restoration_operations(
+            limit=storage_restoration_report_limit
+        )
     ]
 
     pending_outbox_by_kind: dict[str, list[str]] = {}

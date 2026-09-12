@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import uuid
 from pathlib import Path
@@ -108,18 +110,21 @@ def test_backup_captures_sqlite_and_object_stores_and_writes_verified_manifest(
 
     destination = tmp_path / "backups"
     destination.mkdir()
+    encryption_key = os.urandom(32)
     result = create_backup(
         run_store,
         candidate_store,
         blob_store,
         secret_store,
         destination_root=destination,
-        encryption_key=os.urandom(32),
+        encryption_key=encryption_key,
     )
 
     assert result.branch in {"MAINTENANCE_IN_PLACE", "ALREADY_PAUSED_IN_PLACE", "TEMPORARY_PAUSE"}
     assert (result.destination / MANIFEST_NAME).is_file()
     assert (result.destination / COMPLETE_MARKER_NAME).is_file()
+    manifest = json.loads((result.destination / MANIFEST_NAME).read_text())
+    assert manifest["encryption_key_id"] == "sha256:" + hashlib.sha256(encryption_key).hexdigest()
     kinds = {entry.kind for entry in result.manifest}
     assert kinds == {
         "SQLITE_SNAPSHOT",
@@ -220,3 +225,4 @@ def test_backup_barrier_times_out_with_claimed_attempts(
             encryption_key=os.urandom(32),
             backup_barrier_max_ms=50,
         )
+    assert list(destination.iterdir()) == []

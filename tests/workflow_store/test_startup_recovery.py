@@ -381,3 +381,32 @@ def test_run_startup_recovery_reports_pending_storage_restoration_and_outbox(
     # ACTIVITY-sourced rows are drained by this same pass, so they never
     # linger in the reconciliation report.
     assert "ACTIVITY" not in report.pending_outbox_ids_by_source_kind
+
+
+def test_run_startup_recovery_passes_subsystem_scan_limits(
+    run_store: RunStore, secret_store: SecretStore, fake_redis_client, monkeypatch
+) -> None:
+    secret_limits: list[int] = []
+    restoration_limits: list[int] = []
+
+    monkeypatch.setattr(
+        run_store,
+        "list_pending_secret_provision_operations",
+        lambda *, limit: secret_limits.append(limit) or [],
+    )
+    monkeypatch.setattr(
+        run_store,
+        "list_pending_storage_restoration_operations",
+        lambda *, limit: restoration_limits.append(limit) or [],
+    )
+
+    run_startup_recovery(
+        run_store,
+        fake_redis_client,
+        secret_store,
+        secret_provision_resume_limit=321,
+        storage_restoration_report_limit=654,
+    )
+
+    assert secret_limits == [321]
+    assert restoration_limits == [654]
