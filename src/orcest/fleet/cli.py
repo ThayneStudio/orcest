@@ -1502,9 +1502,9 @@ def _print_worker_provider_cli_heartbeats(console: Console, ssh_target: str) -> 
         provider_cli = record.get("provider_cli")
         cli_payload: dict[str, Any] = provider_cli if isinstance(provider_cli, dict) else {}
         table.add_row(
-            worker_id,
-            backend,
-            revision[:12],
+            Text(worker_id),
+            Text(backend),
+            Text(revision[:12]),
             _safe_cli_version(cli_payload.get("desired_version")),
             _safe_cli_version(cli_payload.get("template_version")),
             _safe_cli_version(cli_payload.get("observed_version")),
@@ -1613,7 +1613,7 @@ def _print_source_revision_report(console: Console, report: Any) -> None:
             status_text = "[yellow]degraded[/yellow]"
         else:
             status_text = "[red]mismatch[/red]"
-        table.add_row(surface.surface, (surface.revision or "none")[:12], status_text)
+        table.add_row(Text(surface.surface), Text((surface.revision or "none")[:12]), status_text)
 
     console.print(table)
     if report.healthy:

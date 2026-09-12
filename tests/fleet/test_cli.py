@@ -82,6 +82,42 @@ def test_provider_cli_heartbeat_table_does_not_render_untrusted_status_markup(mo
     assert "forged" not in rendered
 
 
+def test_provider_cli_heartbeat_table_does_not_render_untrusted_column_markup(mocker):
+    from rich.console import Console
+
+    from orcest.fleet.cli import _print_worker_provider_cli_heartbeats
+
+    malicious = "[red]A[/red]"
+    assert len(malicious) == 12
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_worker_heartbeat_details",
+        return_value={
+            malicious: {
+                "backend": malicious,
+                "revision": malicious,
+                "provider_cli": {
+                    "desired_version": "0.149.1",
+                    "template_version": "0.149.1",
+                    "observed_version": "0.149.1",
+                    "status": "ok",
+                },
+            }
+        },
+    )
+    output = StringIO()
+
+    _print_worker_provider_cli_heartbeats(
+        Console(file=output, force_terminal=False, color_system=None, width=200),
+        "orcest@example.test",
+    )
+
+    rendered = output.getvalue()
+    # If worker_id/backend/revision were rendered as plain str, Rich would
+    # interpret the brackets as markup and the literal tag text would not
+    # survive intact in the output.
+    assert rendered.count(malicious) == 3
+
+
 @pytest.fixture
 def runner():
     try:
@@ -274,6 +310,25 @@ class TestSourceHealth:
 
         assert result.exit_code != 0
         assert "orchestrator:alpha" in result.output
+
+    def test_worker_surface_does_not_render_untrusted_heartbeat_markup(
+        self, runner, cfg_path, mocker
+    ):
+        cfg = self._base_cfg()
+        _save(cfg, cfg_path)
+        sha = "a" * 40
+        malicious = "[red]A[/red]"
+        assert len(malicious) == 12
+        _mock_source_revision_surfaces(mocker, orchestrator=sha, pool_manager=sha, template=sha)
+        mocker.patch(
+            "orcest.fleet.orchestrator.get_worker_heartbeat_details",
+            return_value={malicious: {"backend": "claude", "revision": malicious}},
+        )
+
+        result = runner.invoke(fleet, ["source-health", "--config", cfg_path])
+
+        assert f"worker:{malicious}" in result.output
+        assert malicious in result.output
 
     def test_pool_manager_stale_is_flagged(self, runner, cfg_path, mocker):
         cfg = self._base_cfg()
