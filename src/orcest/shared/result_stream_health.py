@@ -134,6 +134,12 @@ def inspect_result_stream_raw(redis: RedisClient, stream: str) -> ResultStreamHe
             named_groups.append((name, group))
         matching = [group for name, group in named_groups if name == RESULTS_GROUP]
         if not matching:
+            if retained_entries == 0:
+                return _result(
+                    stream,
+                    stream_exists=True,
+                    retained_entries=retained_entries,
+                )
             return _result(
                 stream,
                 stream_exists=True,
@@ -404,6 +410,23 @@ def _inspect_pending_entries(
                 f"{stream}: pending result metadata is malformed",
             )
         if not rows:
+            current_pending, recheck_error = _recheck_pending(redis, stream)
+            if recheck_error is not None:
+                return (
+                    sampled_pending,
+                    oldest_idle_ms // 1000 if sampled_pending else None,
+                    max_delivery_count,
+                    False,
+                    recheck_error,
+                )
+            if current_pending is not None and current_pending <= sampled_pending:
+                return (
+                    sampled_pending,
+                    oldest_idle_ms // 1000 if sampled_pending else None,
+                    max_delivery_count,
+                    True,
+                    None,
+                )
             return (
                 sampled_pending,
                 oldest_idle_ms // 1000 if sampled_pending else None,
@@ -458,6 +481,25 @@ def _inspect_pending_entries(
             f"{sampled_pending} of {pending} entries"
         )
     return sampled_pending, oldest_idle_seconds, max_delivery_count, complete, error
+
+
+def _recheck_pending(redis: RedisClient, stream: str) -> tuple[int | None, str | None]:
+    """Re-read the group count after a scan ends early due to concurrent ACKs."""
+    try:
+        raw_groups = cast(Any, redis.client.xinfo_groups(stream))
+    except (redis_lib.RedisError, AttributeError, TypeError, ValueError) as exc:
+        return None, f"{stream}: pending result recheck {type(exc).__name__}"
+
+    groups = _mapping_rows(raw_groups)
+    if groups is None:
+        return None, f"{stream}: pending result recheck is malformed"
+    matching = [group for group in groups if _text_or_none(group.get("name")) == RESULTS_GROUP]
+    if len(matching) != 1:
+        return None, f"{stream}: pending result recheck is malformed"
+    pending = _non_negative_int(matching[0].get("pending"))
+    if pending is None:
+        return None, f"{stream}: pending result recheck is malformed"
+    return pending, None
 
 
 def _non_negative_int(value: Any) -> int | None:

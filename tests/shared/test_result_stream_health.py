@@ -188,6 +188,66 @@ def test_pending_page_error_preserves_secret_free_partial_coverage(fake_redis_cl
     assert "secret endpoint detail" not in str(health)
 
 
+def test_pending_inspection_accepts_backlog_shrinking_during_scan(fake_redis_client, mocker):
+    stream = fake_redis_client._prefixed(RESULTS_STREAM)
+    fake_redis_client.client.xadd(stream, {"task_id": "retained"})
+    _mock_group(mocker, fake_redis_client, pending=101, lag=0)
+    fake_redis_client.client.xinfo_groups.side_effect = [
+        [{"name": RESULTS_GROUP, "consumers": 1, "pending": 101, "lag": 0}],
+        [{"name": RESULTS_GROUP, "consumers": 1, "pending": 0, "lag": 0}],
+    ]
+    mocker.patch.object(
+        fake_redis_client.client,
+        "xpending_range",
+        side_effect=[
+            [_pending_row(i) for i in range(1, RESULT_PENDING_PAGE_SIZE + 1)],
+            [],
+        ],
+    )
+
+    health = inspect_result_stream_raw(fake_redis_client, stream)
+
+    assert health.sampled_pending == RESULT_PENDING_PAGE_SIZE
+    assert health.pending_inspection_complete is True
+    assert health.inspection_error is None
+    assert format_result_stream_warning(health) is None
+
+
+def test_pending_inspection_stays_incomplete_when_shrink_does_not_explain_shortfall(
+    fake_redis_client, mocker
+):
+    stream = fake_redis_client._prefixed(RESULTS_STREAM)
+    fake_redis_client.client.xadd(stream, {"task_id": "retained"})
+    _mock_group(mocker, fake_redis_client, pending=101, lag=0)
+    fake_redis_client.client.xinfo_groups.side_effect = [
+        [{"name": RESULTS_GROUP, "consumers": 1, "pending": 101, "lag": 0}],
+        [{"name": RESULTS_GROUP, "consumers": 1, "pending": 100, "lag": 0}],
+    ]
+    mocker.patch.object(fake_redis_client.client, "xpending_range", return_value=[])
+
+    health = inspect_result_stream_raw(fake_redis_client, stream)
+
+    assert health.sampled_pending == 0
+    assert health.pending_inspection_complete is False
+    assert health.inspection_error == (
+        f"{stream}: pending result inspection ended after 0 of 101 entries"
+    )
+
+
+def test_empty_result_stream_without_consumer_group_is_healthy(fake_redis_client, mocker):
+    stream = fake_redis_client._prefixed(RESULTS_STREAM)
+    entry_id = fake_redis_client.client.xadd(stream, {"task_id": "retained"})
+    fake_redis_client.client.xdel(stream, entry_id)
+    mocker.patch.object(fake_redis_client.client, "xinfo_groups", return_value=[])
+
+    health = inspect_result_stream_raw(fake_redis_client, stream)
+
+    assert health.stream_exists is True
+    assert health.retained_entries == 0
+    assert health.inspection_error is None
+    assert format_result_stream_warning(health) is None
+
+
 def test_registered_result_consumer_without_heartbeat_does_not_count_as_live(
     fake_redis_client, mocker
 ):
