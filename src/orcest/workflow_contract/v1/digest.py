@@ -54,6 +54,7 @@ __all__ = [
     "is_valid_content_digest",
     "require_valid_content_digest",
     "sha256_hex",
+    "sha256_chunks_hex",
     "content_digest",
     "domain_digest",
     "generic_domain_digest",
@@ -142,6 +143,19 @@ def require_valid_content_digest(value: object, *, field: str = "digest") -> str
 
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def sha256_chunks_hex(chunks: Iterable[bytes]) -> str:
+    """Return the raw SHA-256 hex digest of a bounded byte stream.
+
+    This is intentionally the streaming counterpart to :func:`sha256_hex`.
+    Callers that must reproduce an external checksum can keep the raw digest
+    centralized here without materializing a potentially large artifact.
+    """
+    digest = hashlib.sha256()
+    for chunk in chunks:
+        digest.update(chunk)
+    return digest.hexdigest()
 
 
 def content_digest(data: bytes) -> str:

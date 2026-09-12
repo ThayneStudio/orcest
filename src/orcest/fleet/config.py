@@ -251,8 +251,8 @@ class PoolConfig:
     # Image-integrity verification for the template cloud image (M5-infra).
     # By default the bake fetches the image's published ``SHA256SUMS`` +
     # ``SHA256SUMS.gpg``, GPG-verifies them against ``expected_image_gpg_key``,
-    # extracts the sha256 for the pinned image filename, and passes it to the
-    # Proxmox download so the node verifies the bytes. Set
+    # extracts the sha256 for the pinned image filename, then downloads and
+    # verifies one local byte stream before importing that exact path. Set
     # ``expected_image_sha256`` to a 64-hex digest to PIN it instead (offline /
     # air-gapped bakes) -- the digest is then used directly with no network
     # GPG fetch. Either way verification is fail-closed: an unresolvable /
