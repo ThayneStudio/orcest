@@ -6,8 +6,11 @@ import redis as redis_lib
 from orcest.rollout_health import collect_rollout_health
 from orcest.shared.provider_versions import desired_provider_cli_version
 from orcest.shared.result_stream_health import (
+    RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS,
+    RESULT_CONSUMER_LIVE_IDLE_SECONDS,
     RESULT_PENDING_STALE_DELIVERIES,
     RESULT_PENDING_STALE_IDLE_SECONDS,
+    result_consumer_heartbeat_key,
 )
 
 pytestmark = pytest.mark.unit
@@ -25,6 +28,14 @@ def _provider_cli(provider: str, **overrides):
     }
     payload.update(overrides)
     return payload
+
+
+def _record_result_consumer_heartbeat(redis, *, age_seconds: int = 0) -> None:
+    redis.set_ex(
+        result_consumer_heartbeat_key(),
+        "1",
+        ttl=RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS - age_seconds,
+    )
 
 
 def test_rollout_health_passes_clean_quiescent_snapshot(fake_redis_client, mocker):
@@ -108,6 +119,7 @@ def test_rollout_health_allows_fresh_pending_result(fake_redis_client, mocker):
     fake_redis_client.ensure_consumer_group("results", "orchestrator")
     fake_redis_client.xadd("results", {"task_id": "task-1", "summary": "secret body"})
     fake_redis_client.xreadgroup("orchestrator", "orchestrator-main", "results", block_ms=None)
+    _record_result_consumer_heartbeat(fake_redis_client)
 
     report = collect_rollout_health(fake_redis_client, expected_revision=revision)
 
@@ -281,6 +293,88 @@ def test_rollout_health_fails_when_result_group_has_work_but_no_consumers(
     consumer_groups = next(c for c in report["checks"] if c["name"] == "consumer_groups")
     assert consumer_groups["passed"] is False
     assert report["ok"] is False
+
+
+def test_rollout_health_rejects_lag_with_only_stale_registered_result_consumer(
+    fake_redis_client, mocker
+):
+    revision = "7" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    fake_redis_client.ensure_consumer_group("results", "orchestrator")
+    mocker.patch.object(
+        fake_redis_client.client,
+        "xinfo_groups",
+        return_value=[
+            {
+                "name": "orchestrator",
+                "consumers": 1,
+                "pending": 0,
+                "lag": 1,
+            }
+        ],
+    )
+    _record_result_consumer_heartbeat(
+        fake_redis_client,
+        age_seconds=RESULT_CONSUMER_LIVE_IDLE_SECONDS,
+    )
+    mocker.patch.object(
+        fake_redis_client.client,
+        "xinfo_consumers",
+        return_value=[
+            {
+                "name": "orchestrator-main",
+                "pending": 0,
+                "idle": RESULT_CONSUMER_LIVE_IDLE_SECONDS * 1000,
+            }
+        ],
+    )
+
+    report = collect_rollout_health(fake_redis_client, expected_revision=revision)
+
+    assert report["metrics"]["result_consumers"] == 1
+    assert report["metrics"]["result_live_consumers"] == 0
+    assert report["metrics"]["unconsumed_results"] is True
+    consumer_groups = next(c for c in report["checks"] if c["name"] == "consumer_groups")
+    assert consumer_groups["passed"] is False
+    assert report["ok"] is False
+
+
+def test_rollout_health_allows_fresh_lag_with_live_result_consumer(fake_redis_client, mocker):
+    revision = "7" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    fake_redis_client.ensure_consumer_group("results", "orchestrator")
+    mocker.patch.object(
+        fake_redis_client.client,
+        "xinfo_groups",
+        return_value=[
+            {
+                "name": "orchestrator",
+                "consumers": 1,
+                "pending": 0,
+                "lag": 1,
+            }
+        ],
+    )
+    _record_result_consumer_heartbeat(fake_redis_client)
+    mocker.patch.object(
+        fake_redis_client.client,
+        "xinfo_consumers",
+        return_value=[
+            {
+                "name": "orchestrator-main",
+                "pending": 0,
+                "idle": (RESULT_CONSUMER_LIVE_IDLE_SECONDS - 1) * 1000,
+            }
+        ],
+    )
+
+    report = collect_rollout_health(fake_redis_client, expected_revision=revision)
+
+    assert report["metrics"]["result_live_consumers"] == 1
+    assert report["metrics"]["unconsumed_results"] is False
+    consumer_groups = next(c for c in report["checks"] if c["name"] == "consumer_groups")
+    assert consumer_groups["passed"] is True
+    assert report["ok"] is True
 
 
 def test_rollout_health_requires_each_expected_backend_consumer(fake_redis_client, mocker):

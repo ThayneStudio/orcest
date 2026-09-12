@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import redis as redis_lib
 
-from orcest.shared.models import require_valid_provider_name
+from orcest.shared.models import RESULTS_STREAM, require_valid_provider_name
 from orcest.shared.redis_client import RedisClient
 
 _CANARY_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -40,7 +40,7 @@ def collect_canary_evidence(
         if not _CANARY_ID_RE.fullmatch(task_id):
             raise CanaryEvidenceError(f"invalid canary task ID for provider {provider}")
 
-    result_stream = redis._prefixed("results")
+    result_stream = redis._prefixed(RESULTS_STREAM)
     try:
         result_entries = list(cast(Any, redis.client.xrange(result_stream)))
     except redis_lib.RedisError as exc:

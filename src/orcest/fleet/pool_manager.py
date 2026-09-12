@@ -43,6 +43,7 @@ from orcest.shared.events import EventPublisher, make_event
 from orcest.shared.models import (
     CONSUMER_GROUP,
     DEAD_LETTER_STREAM,
+    RESULTS_STREAM,
     TRANSIENT_SUMMARY_PREFIX,
     ResultStatus,
     Task,
@@ -79,9 +80,7 @@ _DRAIN_QUIESCE_SECONDS = 5.25
 # branch.
 _POST_STOP_PENDING_CHECK_ATTEMPTS = 3
 _POST_STOP_PENDING_CHECK_RETRY_SECONDS = 1.0
-# Results stream + cap, mirroring worker/loop.py so the reaper writes a
-# transient-FAILED result to the same place the orchestrator reads.
-_RESULTS_STREAM = "results"
+# Results stream cap used when the reaper publishes a transient failure.
 _RESULT_MAXLEN = 20000
 # Fixed worker_id stamped on reaper-published results (operator-facing).
 _REAPER_WORKER_ID = "pool-manager-reaper"
@@ -2352,9 +2351,9 @@ class PoolManager:
                             )
                     continue
                 result_stream = (
-                    f"{task.key_prefix}:{_RESULTS_STREAM}"
+                    f"{task.key_prefix}:{RESULTS_STREAM}"
                     if task.key_prefix
-                    else self._fq_task_stream(_RESULTS_STREAM)
+                    else self._fq_task_stream(RESULTS_STREAM)
                 )
                 credential_recovery = recover_credential_checkpoint(
                     self._redis,
@@ -2574,13 +2573,13 @@ class PoolManager:
     def _task_result_already_published(self, task: Task) -> bool | None:
         try:
             if task.key_prefix:
-                fq_results = f"{task.key_prefix}:{_RESULTS_STREAM}"
+                fq_results = f"{task.key_prefix}:{RESULTS_STREAM}"
                 entries = cast(
                     Any,
                     self._redis.client.xrevrange(fq_results, count=_RESULT_MAXLEN),
                 )
             else:
-                entries = self._redis.xrevrange(_RESULTS_STREAM, count=_RESULT_MAXLEN)
+                entries = self._redis.xrevrange(RESULTS_STREAM, count=_RESULT_MAXLEN)
         except Exception:
             logger.warning(
                 "Reaped task %s: failed to inspect results stream before recovery",
@@ -2646,10 +2645,10 @@ class PoolManager:
         )
         try:
             if task.key_prefix:
-                fq_results = f"{task.key_prefix}:{_RESULTS_STREAM}"
+                fq_results = f"{task.key_prefix}:{RESULTS_STREAM}"
                 self._redis.xadd_capped_raw(fq_results, result.to_dict(), maxlen=_RESULT_MAXLEN)
             else:
-                self._redis.xadd_capped(_RESULTS_STREAM, result.to_dict(), maxlen=_RESULT_MAXLEN)
+                self._redis.xadd_capped(RESULTS_STREAM, result.to_dict(), maxlen=_RESULT_MAXLEN)
         except Exception:
             logger.warning(
                 "Reaped task %s: failed to publish transient-FAILED result",
