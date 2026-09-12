@@ -1,0 +1,747 @@
+[
+  {
+    "case_id": "fim.controller_dies_admit_capture_first_snapshot_installation",
+    "injection": "controller dies after ADMIT capture or after first Snapshot installation",
+    "expected": "ADMIT consumes the eligible Work Item observation plus the greatest eligible pre-transaction Work-Item-target BASE_HEAD sequence as its immutable anchor, and leaves generation-0 ADMITTED with a pending Snapshot and no worker work; only `SPEC_SUPERSEDE` installs generation 1, then only its INTERNAL continuation creates PLAN. Restart resumes the missing unique step without reselecting the anchor, installing, or planning twice"
+  },
+  {
+    "case_id": "fim.entering_transition_has_cancellation_pending_snapshot_unsatisfied",
+    "injection": "one entering Transition has cancellation, a pending Snapshot, an unsatisfied dependency, panel-staffing work, and state-local work simultaneously eligible",
+    "expected": "its single INTERNAL continuation applies the closed precedence cancellation, then Snapshot, then dependency, then the latest coalesced panel pointer, then state-local work; recovery is never INTERNAL. It writes one Transition, and any chained step uses that new entering sequence, so crash/replay cannot combine or reorder branches"
+  },
+  {
+    "case_id": "fim.differing_snapshot_capture_races_current_claimed_result",
+    "injection": "a differing Snapshot capture races a current claimed Result or fenced controller Activity",
+    "expected": "capture stores/replaces pending_snapshot_id plus true supersede_requested and its exact capture Transition. The current work may complete/fence, but emits no next semantic work; the global continuation installs only the latest pending Snapshot and clears flag/sequence, while coalescing back, cancellation, or terminalization clears the pair without a stale install"
+  },
+  {
+    "case_id": "fim.base_spec_policy_capture_reaches_safe_boundary",
+    "injection": "base/spec/policy capture reaches a safe boundary",
+    "expected": "the source Transition only captures/sets pending; exactly one separate `SPEC_SUPERSEDE` Transition installs it. ADMIT, FORGE_OBSERVATION, POLICY_UPDATE, and INTERNAL never install a Snapshot"
+  },
+  {
+    "case_id": "fim.controller_dies_activity_outbox_commit",
+    "injection": "controller dies after Activity/outbox commit",
+    "expected": "restart publishes the committed outbox row; no Activity is lost"
+  },
+  {
+    "case_id": "fim.controller_dies_redis_publish_but_dispatch_acknowledgement",
+    "injection": "controller dies after Redis publish but before dispatch acknowledgement",
+    "expected": "republish may duplicate delivery; one claim generation wins"
+  },
+  {
+    "case_id": "fim.controller_dies_attempt_attemptclaim_reciprocal_claim_transaction",
+    "injection": "controller dies before or after the Attempt/AttemptClaim reciprocal claim transaction, including response loss",
+    "expected": "before commit the offer remains claimable with no partial Claim; after commit the exact Claim ID, source descriptor, deadlines/auth expiry, capability/launch JTIs and claims digests survive. Same session/Claim ID/body returns the stable contract and only currently valid sensitive fields from the exact frozen identities; another key/session cannot claim"
+  },
+  {
+    "case_id": "fim.response_timeout_injected_claim_launch_upload_create",
+    "injection": "response timeout is injected for claim, launch, upload create/content, Result, rotation, capacity, loss, and liveness",
+    "expected": "every durable endpoint retries its exact declared identity/body within its authority window and converges to one outcome; content PUT switches to the closed expiry response once due; liveness alone sends the next higher sequence and creates no replay ledger"
+  },
+  {
+    "case_id": "fim.result_request_uuid_reused_across_accepted_upload",
+    "injection": "Result request UUID is reused across accepted, upload-expired, stale, and deadline branches",
+    "expected": "one global Result Request primary-key lookup wins; exact same Attempt/session/signer/body bindings replay its stored response, and cross-disposition or cross-Attempt reuse is `IDEMPOTENCY_CONFLICT` without a second Result/Fact/Transition"
+  },
+  {
+    "case_id": "fim.authenticated_old_generation_claim_run_result_arrives",
+    "injection": "authenticated old-generation/claim/Run Result arrives strictly before its own deadline",
+    "expected": "one `STALE_ATTEMPT` Result Request stores the exact 409/current-generation response and closed stale reason; no Result, Terminal Fact, recovery input, or Transition is created, and exact replay is stable"
+  },
+  {
+    "case_id": "fim.capability_signing_key_retired_revoked_absent_restore",
+    "injection": "capability-signing key is retired, revoked, absent after restore, or presented with another algorithm",
+    "expected": "retired verifier authenticates only otherwise-valid previously issued capabilities through exact expiry and issues none; revoked/unknown/mismatched keys deny immediately; restore keeps capability endpoints disabled until registry/public-key/private-pair/reference audits pass"
+  },
+  {
+    "case_id": "fim.selected_capability_key_emergency_revoked_without_replacement",
+    "injection": "selected capability key is emergency-revoked without a replacement",
+    "expected": "one authenticated Capability Key Operation clears the durable issuance pointer and pauses new-offer planning, delivery, and claims atomically without rewriting Controller Mode; existing deadline recovery remains durable, and only a later CAS-valid SELECT resumes issuance"
+  },
+  {
+    "case_id": "fim.new_store_bootstraps_capability_signing_keys_crashes",
+    "injection": "a new store bootstraps Capability Signing Keys, or crashes between bootstrap operations",
+    "expected": "revision 0 has no key or last Operation; the authenticated REGISTER alone commits revision 1 plus one ACTIVE verifier and still leaves issuance null, so dispatch stays closed; only a separate CAS-valid SELECT advances the Registry and opens issuance. Replay returns either committed operation exactly and never combines REGISTER+SELECT or skips a revision"
+  },
+  {
+    "case_id": "fim.bootstrap_capability_signing_secret_provisioning_adoption_crashes",
+    "injection": "bootstrap capability-signing Secret provisioning/adoption crashes before key REGISTER",
+    "expected": "bootstrap MAINTENANCE permits only the narrow protected Secret Operation; REGISTER remains impossible until the real creation Receipt, exact Secret Version/current reference, private/public match, and durable provenance commit. Retry resumes that Operation, never synthesizes a signing Secret or combines provision/REGISTER/SELECT"
+  },
+  {
+    "case_id": "fim.retry_panel_staffing_startup_recovery_ordinary_planning",
+    "injection": "retry, panel staffing, startup recovery, or ordinary planning becomes eligible while mode is DISPATCH_PAUSED, DRAINING, or MAINTENANCE, or while the Capability Registry has no selected existing ACTIVE issuance key",
+    "expected": "the Activity remains PLANNED and no OFFERED Attempt/outbox is created or delivered; when both gates later permit issuance, the offer reconciler creates only the one fenced pair (or all-or-none panel set) rather than backdating claim-deadline time"
+  },
+  {
+    "case_id": "fim.capability_key_operation_response_lost_expected_registry",
+    "injection": "capability key operation response is lost or its expected registry revision races",
+    "expected": "exact operation ID/body replays the stored terminal result; a CAS loser changes neither key state nor issuance selection and cannot double-increment registry revision"
+  },
+  {
+    "case_id": "fim.controller_mode_operation_response_lost_races_another",
+    "injection": "Controller Mode operation response is lost, races another mode change, or controller restarts while drained/paused",
+    "expected": "same principal/operation/body replays the stored terminal result; CAS loser changes no projection, and startup enforces the durable mode before endpoints open"
+  },
+  {
+    "case_id": "fim.new_store_opens_initialize_retried_ordinary_mode",
+    "injection": "a new store opens, INITIALIZE is retried, or an ordinary mode operation arrives before initialization",
+    "expected": "only the registered bootstrap service may commit revision 0/null to revision 1/MAINTENANCE; exact replay is stable, a second initializer is ALREADY_INITIALIZED, and pre-initialization SET_MODE/RESTORE_BACKUP is NOT_INITIALIZED with no workflow endpoint opened"
+  },
+  {
+    "case_id": "fim.verified_backup_restored_initialized_mode_including_maintenance",
+    "injection": "a verified backup is restored from any initialized mode, including MAINTENANCE",
+    "expected": "registered storage reconciliation commits RESTORE_BACKUP against the restored revision: MAINTENANCE stays in place with its prior ancestry, exact DISPATCH_PAUSED/PAUSE_ADMISSION stays in place, and every other mode is atomically installed as DISPATCH_PAUSED/PAUSE_ADMISSION before endpoints open; no branch resumes operational work automatically"
+  },
+  {
+    "case_id": "fim.backup_begins_controller_already_maintenance",
+    "injection": "backup begins while the controller is already MAINTENANCE",
+    "expected": "it takes the bounded storage snapshot in place, preserves the exact nullable maintenance-prior projection and any bootstrap-null ancestry, and performs no pause/resume SET_MODE round trip; repeated in-place backup/restore therefore never invents a nested prior mode"
+  },
+  {
+    "case_id": "fim.backup_begins_controller_already_exactly_dispatch_paused",
+    "injection": "backup begins while the controller is already exactly DISPATCH_PAUSED/PAUSE_ADMISSION",
+    "expected": "it drains/rechecks claims and takes the bounded snapshot in place; it writes no NO_CHANGE mode Operation, does not increment the mode revision, and remains intentionally paused afterward"
+  },
+  {
+    "case_id": "fim.third_branch_backup_succeeds_fails_crashes_newly",
+    "injection": "third-branch backup succeeds/fails or crashes after its newly committed dispatch pause",
+    "expected": "cleanup restores the exact prior mode only with a CAS against the pause revision; an intervening operator mode wins, while a crash remains safely paused until the idempotent restore is retried from the pause Operation; either in-place branch has no restore round trip"
+  },
+  {
+    "case_id": "fim.model_backed_claim_launch_attestation_boundary_injected",
+    "injection": "model-backed claim/Launch Attestation boundary is injected",
+    "expected": "claim contains no provider material and exposes the domain-separated launch claims digest; equivalent launch-bearer remint preserves that digest. Only a signed fresh/no-parent Attestation from the Snapshot-pinned runner principal/image/key/pool consumes the one-shot nonce and releases pinned provider material; nonce or workspace/context/invocation reuse and unattested Results fail closed"
+  },
+  {
+    "case_id": "fim.accepted_launch_attestation_replayed_deadline_deadline_attempt",
+    "injection": "accepted Launch Attestation is replayed before deadline, after deadline, and after Attempt terminalization",
+    "expected": "exact replay always returns the accepted identities; only current/strictly-before returns `AVAILABLE` with rematerialized provider bytes and flat non-secret `provider.secret_id`/`provider.version`. Under the same runner/session, an ACTIVE or RETIRED retained verifier may use consumed/time-expired launch claims only as signature-equality proof\u2014not authentication\u2014for exact retained-Attestation lookup and `EXPIRED`/provider-null; REVOKED denies, and lookup cannot insert, rematerialize, or mutate"
+  },
+  {
+    "case_id": "fim.controller_dies_during_artifact_upload_admission",
+    "injection": "controller dies during artifact upload before admission",
+    "expected": "partial staging data is unreferenced and collectible; worker retries upload"
+  },
+  {
+    "case_id": "fim.controller_dies_artifact_fsync_candidate_row",
+    "injection": "controller dies after artifact fsync before Candidate row",
+    "expected": "orphan artifact is discovered; retry may adopt the same digest"
+  },
+  {
+    "case_id": "fim.controller_dies_candidate_commit",
+    "injection": "controller dies after Candidate commit",
+    "expected": "the live artifact verifies and one reducer transition consumes the accepted result"
+  },
+  {
+    "case_id": "fim.redis_flushed_queued_work",
+    "injection": "Redis is flushed with queued work",
+    "expected": "queues rebuild from Activities/outbox; no completion is invented"
+  },
+  {
+    "case_id": "fim.redis_flushed_running_work",
+    "injection": "Redis is flushed with running work",
+    "expected": "claim generation/deadline survive; disposable liveness is re-established or loss is fenced after grace"
+  },
+  {
+    "case_id": "fim.controller_process_crashes_unexpired_claimed_attempt_restarts",
+    "injection": "controller process crashes with an unexpired `CLAIMED` Attempt, then restarts on the same live state root",
+    "expected": "the exact Claim/session/deadline/signer survive and a still-valid Result is accepted normally; this is a crash/restart fixture, never a backup-restore fixture"
+  },
+  {
+    "case_id": "fim.redis_flushed_wait_condition_health_observation_budget",
+    "injection": "Redis is flushed while a Wait Condition, Health Observation, Budget Report, Attempt, or Recovery Evidence deadline becomes due",
+    "expected": "startup scans the durable deadline and inserts exactly one scope/deadline-unique Timer Fact; reducer replay wakes/expires at most once without Redis, while Budget expiry has no Run Transition and only closes its future offer authority"
+  },
+  {
+    "case_id": "fim.envelope_reaches_two_workers",
+    "injection": "one envelope reaches two workers",
+    "expected": "claim protocol selects one current Attempt; rejected worker stops and cannot submit"
+  },
+  {
+    "case_id": "fim.old_generation_result_arrives",
+    "injection": "old-generation result arrives",
+    "expected": "API records a fenced rejection and does not alter Activity/Candidate state"
+  },
+  {
+    "case_id": "fim.first_result_arrives_execution_deadline_but_capability",
+    "injection": "first result arrives at/after execution deadline but before capability-auth expiry",
+    "expected": "API durably ledgers it and returns `410 EXECUTION_DEADLINE_EXCEEDED` when it expires the current claim or `409 ATTEMPT_STALE` when an earlier cause already terminalized it; the latter stores `RESULT_AFTER_TERMINAL` and appends one same-state audit Transition with no counters/evidence/work, while an identical replay of a result accepted before the deadline remains idempotent during the same auth grace"
+  },
+  {
+    "case_id": "fim.first_unseen_result_arrives_maintenance_including_semantic",
+    "injection": "first unseen Result arrives in MAINTENANCE, including a semantic replay under another unused key",
+    "expected": "return exact HTTP 503 body `{\"protocol\":\"orcest.error/1\",\"code\":\"CONTROLLER_MAINTENANCE\",\"retryable\":true,\"message\":\"controller is in maintenance mode\",\"retry_after_seconds\": 60}` and create no Result Request or workflow row; only the same exact already-ledgered global key remains read-only replay, and the unseen same key/body may be retried normally after maintenance only while its capability is still authentic"
+  },
+  {
+    "case_id": "fim.attempt_capability_request_arrives_fixed_authentication_expiry",
+    "injection": "any Attempt-capability request arrives at/after its fixed authentication expiry",
+    "expected": "authentication fails and no request/replay/terminal/workflow ledger is inserted; durable Timer Fact reconciliation remains the timeout authority"
+  },
+  {
+    "case_id": "fim.non_result_attempt_endpoint_called_during_post",
+    "injection": "non-Result Attempt endpoint is called during post-deadline auth grace",
+    "expected": "launch, liveness, source, Candidate/upload, and rotation calls deny and insert no authority; only Result late-rejection/exact accepted replay paths authenticate. Exact accepted Launch replay uses only its separate consumed launch-capability lookup and returns null material"
+  },
+  {
+    "case_id": "fim.result_payload_union_fuzzed_across_activity_outcome",
+    "injection": "Result payload union is fuzzed across Activity/outcome kinds",
+    "expected": "only the exact Candidate, receipt, structured plan/diagnosis, or failure variant is accepted; accepted failures persist the closed normalized class/code/retry/evidence mapping and required result digest; malformed/mixed fields and any credential-rotation binding get 4xx with the claim unchanged and no Result/Transition"
+  },
+  {
+    "case_id": "fim.liveness_responses_lost_reordered_duplicated_redis_flushed",
+    "injection": "liveness responses are lost, reordered, duplicated, or Redis is flushed",
+    "expected": "no durable request/idempotency ledger exists; a higher exact-session sequence establishes current disposable control, lower/duplicate updates never rewind it, and each response is freshly derived rather than replayed"
+  },
+  {
+    "case_id": "fim.unclaimed_offer_reaches_claim_deadline_capacity_provider",
+    "injection": "an unclaimed offer reaches its claim deadline while capacity, provider rotation, mode, or issuance-key changes race",
+    "expected": "the one writer terminal transaction freezes highest-applicable unexpired Health rows, the exact current logical-provider Secret version, capacity disposition, Controller Mode revision/mode, Capability Registry revision/selected ACTIVE key, replacement-offer disposition, Timer/Terminal Facts, Attempt expiry, and the sole terminal Transition; it returns the Activity to `PLANNED` and appends zero-counter Recovery Evidence. Only a later Evidence Transition may create the higher-generation replacement or bound capacity Wait, and only compatible capacity plus permitted mode plus ACTIVE issuance creates that replacement. Later input cannot alter replay and no branch increments recovery counters"
+  },
+  {
+    "case_id": "fim.accepted_worker_result_reports_infrastructure_authenticated_pool",
+    "injection": "an accepted worker Result reports `INFRASTRUCTURE`, versus an authenticated pool manager reporting exact worker-session loss",
+    "expected": "the worker Result path terminalizes the Attempt as ordinary Result `FAILED` and appends `WORKER_LOST` Recovery Evidence sourced by the exact Attempt Result, with no `WORKER_LOST` Terminal Fact or pool-loss `terminal_reason`; the disjoint pool-manager path creates the `WORKER_LOST` Terminal Fact, sets `FAILED/WORKER_LOST`, and appends TerminalFact-sourced Recovery Evidence. Only the latter TerminalFact/`terminal_reason` path is controller-only"
+  },
+  {
+    "case_id": "fim.no_capacity_claim_deadline_occurs_review_adjudication",
+    "injection": "a no-capacity claim deadline occurs in a review/adjudication panel",
+    "expected": "after the terminal transaction proves no peer claim remains, it appends panel-scoped `STAFF_PANEL` Evidence; the later Evidence Transition atomically offers all still-current unfilled slots or creates one bound Wait. If another unfilled slot still has a `CLAIMED` peer, it expires only the due Attempt, leaves its Activity `PLANNED`, updates the coalesced staffing pointer, and creates no Recovery Evidence, `RECOVERING` state, Wait, or offer for that slot"
+  },
+  {
+    "case_id": "fim.worker_destroyed_uncommitted_edits",
+    "injection": "worker is destroyed with uncommitted edits",
+    "expected": "authenticated exact-session loss sets the Attempt to `FAILED/WORKER_LOST`; retry starts from the last admitted Candidate"
+  },
+  {
+    "case_id": "fim.old_new_workers_coexist",
+    "injection": "old and new workers coexist",
+    "expected": "disjoint Capacity Pools/templates, principals, ACLs, streams, and groups prevent an old worker consuming a v1 envelope"
+  },
+  {
+    "case_id": "fim.legacy_worker_pel_reaper_injected_against_v1",
+    "injection": "legacy worker/PEL reaper is injected against a v1 offer and pending entry",
+    "expected": "Redis read/claim/ACK/delete/republish is denied, synthetic Result submission is unauthorized, and no v1 workflow row changes; only the authenticated v1 exact-session loss endpoint may produce `FAILED/WORKER_LOST`"
+  },
+  {
+    "case_id": "fim.review_receipts_arrive_all_permutations",
+    "injection": "review receipts arrive in all permutations",
+    "expected": "the same receipt set produces the same Consensus Decision digest"
+  },
+  {
+    "case_id": "fim.remediation_produces_new_candidate_more_review_adjudication",
+    "injection": "remediation produces a new Candidate after one or more review/adjudication rounds",
+    "expected": "panel_round restarts at 1 for that Candidate; a new round for the same Candidate is exactly prior maximum plus one, and no Activity/Wait/receipt may mix Candidate-local rounds"
+  },
+  {
+    "case_id": "fim.reviewer_provider_capacity_disappears",
+    "injection": "reviewer/provider capacity disappears",
+    "expected": "configured substitutes are tried or Run waits; quorum is unchanged"
+  },
+  {
+    "case_id": "fim.multiple_panel_results_terminal_facts_race_peer",
+    "injection": "multiple panel Results/Terminal Facts race while peer slots remain claimed",
+    "expected": "each accepted safe boundary atomically replaces the Run's one Candidate/round/kind/staffing-sequence pointer and discharges the older INTERNAL obligation; only the latest pointer evaluates after no peer remains claimed, creating all offers or one all-slot Wait, while a stale/filled panel clears it without work. This pointer or that Wait is the sole NO_CAP exception permitting unfilled PLANNED panel slots with no live offer"
+  },
+  {
+    "case_id": "fim.all_compatible_capacity_disappears_later_authenticated_pool",
+    "injection": "all compatible capacity disappears and later an authenticated pool report proves a compatible Worker Profile available",
+    "expected": "ordered Health Observation satisfies only matching current capacity waits; stale/duplicate report identity cannot wake twice or lower a gate"
+  },
+  {
+    "case_id": "fim.review_adjudication_panel_planned_no_complete_legal",
+    "injection": "review/adjudication panel is planned with no complete legal staffing selection",
+    "expected": "all frozen slot Activities/assignments/subjects remain `PLANNED` with no offers; the actual planning Transition creates one durable CAPACITY Wait, and a later matching report offers slots only after complete staffing is possible"
+  },
+  {
+    "case_id": "fim.provider_rate_limit_result_supplies_past_excessively",
+    "injection": "provider rate-limit Result supplies a past or excessively distant absolute retry time",
+    "expected": "acceptance remains fenced by the Attempt deadline; persisted recovery eligibility clamps deterministically to controller acceptance time through that time plus the Snapshot-pinned server maximum, and restart selects the same wake"
+  },
+  {
+    "case_id": "fim.evidence_wait_selection_races_accepted_target_observation",
+    "injection": "EVIDENCE Wait selection races an accepted target Observation at, below, or above its minimum sequence",
+    "expected": "the writer re-reads the exact `orcest.evidence-wake/1` target, allowed kinds, minimum sequence, and Candidate/panel/dispute/generation/policy/head predicate before insert. Below-minimum or mismatched input is audit-only; an already-satisfying current Observation creates no Wait and instead appends the source-linked next Recovery Evidence selecting deterministic retry/replacement; otherwise the timer-plus-event Wait commits and later wake repeats the same predicate check"
+  },
+  {
+    "case_id": "fim.provider_credential_rotates_availability_was_observed_prior",
+    "injection": "provider credential rotates after availability was observed for the prior version",
+    "expected": "old provider Health evidence cannot authorize a Claim/Launch for the new version; a new durable Health Probe Request/Fact/Observation binds the exact provider/account/Secret version before use"
+  },
+  {
+    "case_id": "fim.capacity_report_worker_loss_report_response_lost",
+    "injection": "Capacity Report or Worker Loss Report response is lost",
+    "expected": "exact report replay returns identical object IDs/outcome with only transport `replayed` changed from false to true; response digest excludes exactly that field and no Observation/Terminal Fact/Transition is duplicated"
+  },
+  {
+    "case_id": "fim.forge_provider_integrity_probe_crashes_i_o",
+    "injection": "forge/provider/integrity probe crashes before I/O, after I/O, or before response commit; response is duplicated/reordered/malformed or injected as a raw adapter callback",
+    "expected": "only a durable pre-I/O Health Probe Request/outbox may run; restart reuses that identity, and only its reciprocal schema-valid Fact may atomically complete it with one matrix-valid Observation. Exact replay returns it, conflicting content fails, and raw callbacks/free-form diagnostics create no health authority"
+  },
+  {
+    "case_id": "fim.forge_polling_search_crashes_i_o_transient",
+    "injection": "forge polling/search crashes before I/O, after transient transport failure, after an ambiguous adapter response, during result commit, or success races FORGE_UNAVAILABLE Wait insertion",
+    "expected": "an ACTIVE Schedule and at most one PENDING `ForgeObservationRequest` with reciprocal source-tagged Outbox survive; every outbound attempt has a pre-I/O ordinal. TIMEOUT/RATE_LIMIT/UNAVAILABLE commits or replays one `ForgeRequestFailureFact`, retry boundary, and Run-bound FORGE_TRANSIENT reduction or direct pre-admission/cleanup retry; it fabricates no Observation. Restart reuses Request/idempotency/ordinal state. Under-lock Wait creation detects already-current success/connectivity and creates successor Evidence, not a stale Wait. Completion atomically stores only request-kind-allowed ordered Observations and marks both projections; ACTIVE or PAUSED may complete when immutable scope/last-request/prior fences match, while a response that loses a close/replacement/real stale fence atomically marks Request SUPERSEDED plus Outbox DELIVERED"
+  },
+  {
+    "case_id": "fim.ordinary_forge_schedule_becomes_due_pending_response",
+    "injection": "an ordinary Forge Schedule becomes due or a PENDING response arrives in MAINTENANCE",
+    "expected": "due Schedule, Request, and Outbox projections remain unchanged and no I/O/completion/Observation occurs; the same identity resumes only after an authenticated non-maintenance mode permits it, while named recovery reads cannot advance the ordinary Schedule"
+  },
+  {
+    "case_id": "fim.successful_initial_project_register_response_lost_controller",
+    "injection": "successful initial Project REGISTER response is lost or controller crashes",
+    "expected": "the one writer transaction contains the terminal registration Operation/response, Project revision 1/pointer, and its ACTIVE revision-0 WORK_ITEM_DISCOVERY Schedule, or none of them | exact replay returns the stored registration result; no startup repair invents a missing schedule, and ordinary discovery waits for the current Controller Mode gate"
+  },
+  {
+    "case_id": "fim.work_item_discovery_returns_empty_repeats_unchanged",
+    "injection": "Work Item discovery returns empty, repeats unchanged items, changes a set, or reuses one adapter revision with conflicting content",
+    "expected": "the completed Request freezes the domain-separated bytewise stable-ID set digest, including empty; unchanged immediately preceding Observations may be membership-coalesced without a new sequence/Transition, changed members allocate sequences in membership order, and same revision/different set fails integrity rather than mutating the Schedule projection"
+  },
+  {
+    "case_id": "fim.discovery_adds_removes_work_item_completes_project",
+    "injection": "discovery adds/removes a Work Item, completes while its Project/Schedule is paused, or ADMIT races its pre-Run polls",
+    "expected": "completion creates/reuses Run-null Work-Item/base schedules before reads and closes absent-item schedules only without an active Run; a paused parent creates/retains paused children and only Project reactivation may activate them. ADMIT closes/supersedes the selected pre-Run schedules/Requests/outboxes and creates Run-bound revision-0 replacements atomically, so both identities are never active together"
+  },
+  {
+    "case_id": "fim.initial_publication_complete_marker_search_returns_live",
+    "injection": "initial publication complete-marker search returns live and terminal members in any mix, or its response is lost",
+    "expected": "the PUBLICATION-purpose effect-readback Request and INITIAL Effect checkpoint atomically freeze the exact PUBLISH Activity/operation fence, complete revision, independently ordered LIVE and TERMINAL memberships, every member's create/effect/creator/ref/marker/desired-commit/head/body ownership proof and reliance digest, and one full-set digest; ZERO/ONE/MULTIPLE counts LIVE only. The bytewise-lowest `TERMINAL/MERGED/POSITIVE` member wins at every live count and terminalizes with a durable cleanup Reservation for all LIVE members. Without that stronger fact, `INCOMPATIBLE` routes ownership conflict and `INCOMPLETE` routes autonomous evidence/backoff. Only an all-`POSITIVE`, no-merged set reaches ZERO/no-terminal absence/create plus a fresh search, ONE plus fresh exact-object read, MULTIPLE one-at-a-time cleanup plus fresh search, or ZERO with lowest positive CLOSED selection. Exact Request/checkpoint replay never chooses from a partial set or arrival order"
+  },
+  {
+    "case_id": "fim.probe_completion_commits_fanout_crashes_affected_run",
+    "injection": "probe completion commits and fanout crashes after any affected-Run prefix",
+    "expected": "the Fact retains its bytewise ordered `HealthProbeFactRun` membership/digest and cursor; restart resumes the next ordinal only, advances with that Run's unique Transition, records same-state audit for a superseded/unrelated member, and never recomputes membership"
+  },
+  {
+    "case_id": "fim.logical_forge_credential_rotates_connectivity_probe_adapter",
+    "injection": "the logical Forge credential rotates while a connectivity probe or adapter operation is pending",
+    "expected": "Forge Instance registration provenance remains immutable; each request freezes the exact verified current Secret version under the Secret lock, and its Request/Fact/Observation/scope/digests copy that version. Evidence for the prior version cannot authorize the later operation or be silently rebound"
+  },
+  {
+    "case_id": "fim.two_health_probe_requests_freeze_same_prior",
+    "injection": "two Health Probe Requests freeze the same prior sequence for one scope and complete out of order",
+    "expected": "the first committed completion assigns prior-plus-one and atomically creates its Fact/Observation; the other CAS fails to `SUPERSEDED` with no Fact and may be replanned from the new highest sequence"
+  },
+  {
+    "case_id": "fim.capacity_report_expiry_set_equal_just_beyond",
+    "injection": "capacity-report expiry is set before, equal to, just after, and beyond the acceptance-time TTL bounds",
+    "expected": "after auth/body validation one controller `accepted_at_ms` and positive configured maximum are frozen; only `accepted_at_ms < expires_at_ms <= accepted_at_ms + configured_max_ttl_ms` commits, regardless of caller `observed_at_ms`"
+  },
+  {
+    "case_id": "fim.budget_report_missing_stale_reports_exact_limit",
+    "injection": "Budget Report is missing/stale, reports exact-limit exhaustion, response is lost, AVAILABLE races WAIT_BUDGET insertion or fanout crashes/expires after any prefix, or reset Timer fires first",
+    "expected": "missing/stale/exhausted evidence creates no offer; exact-limit derives EXHAUSTED. Exact ID/body replay returns the stored response, conflicting reuse fails, and AVAILABLE membership/cursor resumes from the first missing generation-independent Transition without recomputation; an expired/current-mismatched member gets only its same-state audit. Under-lock Wait insertion observes a newer Report and creates successor Evidence instead of a stale Wait. A Timer only triggers report reconciliation or expiry and cannot wake/offer by itself"
+  },
+  {
+    "case_id": "fim.candidate_edits_orcest",
+    "injection": "Candidate edits `.orcest`",
+    "expected": "active normalized policy/hash and reducer plan remain unchanged"
+  },
+  {
+    "case_id": "fim.work_item_spec_changes",
+    "injection": "Work Item spec changes",
+    "expected": "current work is superseded at a safe boundary; a new specification generation invalidates old approvals"
+  },
+  {
+    "case_id": "fim.pending_work_item_change_b_trusted_base",
+    "injection": "pending Work Item change B and trusted base observation C exist when server Policy Update P starts, then controller crashes during per-Run fan-out",
+    "expected": "immutable Policy Update Composition freezes B, C, and P for every then-active Run; restart creates only missing B+C+P captures and never substitutes installed A or a later observation"
+  },
+  {
+    "case_id": "fim.policy_only_snapshot_supersedes_run_retained_candidate",
+    "injection": "policy-only Snapshot supersedes a Run with a retained Candidate",
+    "expected": "the new generation always enters `REPLANNING` with one Snapshot/Candidate-bound `REPLAN`, never directly `VERIFYING`; only a valid new Plan may reuse the Candidate without `BUILD`, and all Verification/review gates plus frozen review subjects derive from that new Plan/policy"
+  },
+  {
+    "case_id": "fim.active_work_item_closes_loses_labels",
+    "injection": "active Work Item closes or loses both labels",
+    "expected": "stable-ID active-Run polling still records the mutation and applies cancellation/specification rules"
+  },
+  {
+    "case_id": "fim.dependency_becomes_unknown_open_attempt_claimed_controller",
+    "injection": "dependency becomes unknown/open while an Attempt is claimed, then controller/Redis restarts",
+    "expected": "ordered same-state Transition and pending-dependency observation/set/Transition triple survive without hot-fencing the claim; the first safe boundary revalidates and enters the exact external-dependency recovery/wait path, while a newer satisfied observation may clear it"
+  },
+  {
+    "case_id": "fim.target_observed_b",
+    "injection": "one target is observed `A -> B -> A`",
+    "expected": "three ordered observations exist; only consecutive identical polls may coalesce"
+  },
+  {
+    "case_id": "fim.base_advances",
+    "injection": "base advances",
+    "expected": "configured rebase-before-publication, pin, or supersede-at-boundary policy runs against the observed immutable SHAs"
+  },
+  {
+    "case_id": "fim.trusted_base_alone_advances_under_supersede_boundary",
+    "injection": "trusted base alone advances under `SUPERSEDE_AT_BOUNDARY` after Publication is `ACTIVE`",
+    "expected": "accept and order the audit input, but create no Snapshot/pending pointer/SPEC_SUPERSEDE for that base-only change; later conflict/head feedback uses ordinary post-publication remediation under the installed Snapshot"
+  },
+  {
+    "case_id": "fim.specification_text_workflow_configuration_effective_policy_changes",
+    "injection": "specification text, workflow configuration, or effective policy changes after Publication is `ACTIVE`",
+    "expected": "capture/coalesce the normalized Snapshot and install it only at the ordinary safe boundary; the base-only cutoff cannot discard or defer these authority changes merely because their capture also freezes the latest trusted base"
+  },
+  {
+    "case_id": "fim.controller_dies_publication_ref_creation",
+    "injection": "controller dies after publication ref creation",
+    "expected": "restart finds the deterministic ref and does not create another"
+  },
+  {
+    "case_id": "fim.controller_dies_change_request_creation",
+    "injection": "controller dies after Change Request creation",
+    "expected": "restart reconciles the stable create identity, records no direct link from the create/search response, and completes a fresh `COMPLETE_MARKER_SEARCH`; only an all-positive/no-merged ONE-LIVE branch plus a fresh exact-object read may link, while a positive MERGED terminal wins at any live count and positive CLOSED terminal authority is selectable only with ZERO live, so neither terminal branch creates again"
+  },
+  {
+    "case_id": "fim.controller_dies_publication_row_update",
+    "injection": "controller dies after Publication row update",
+    "expected": "reconciliation observes the same external identity and continues monitoring"
+  },
+  {
+    "case_id": "fim.pr_head_advances_during_remediation",
+    "injection": "PR head advances during remediation",
+    "expected": "stale CAS fails; external commit is not overwritten and all gates bind to the new Candidate"
+  },
+  {
+    "case_id": "fim.external_actor_advances_owned_pr_head_during",
+    "injection": "external actor advances the owned PR head during monitoring, gating, remediation, approval, publication, waiting, recovery, or a Human Boundary",
+    "expected": "merge/close/cancellation precedence is checked first; otherwise every old-head Activity/Attempt/gate/Wait/Boundary/effect is superseded, controller IMPORT provenance admits the exact observed commit, and the full gate reruns before any later update"
+  },
+  {
+    "case_id": "fim.base_advances_initial_ref_mutation",
+    "injection": "base advances before the initial ref mutation",
+    "expected": "current initial effect is superseded before any write; default policy plans `REBASE`, reruns all gates, and a later approval creates a higher-generation `INITIAL` effect on the same Publication"
+  },
+  {
+    "case_id": "fim.base_advances_provisional_change_request_observation_but",
+    "injection": "base advances after provisional Change Request observation but before initial effect completion",
+    "expected": "the controller retains ownership of the same provisional ref/Change Request, supersedes the stale effect, rebases and reruns all gates, then uses a higher-generation `INITIAL` effect; the Publication is not marked `ACTIVE` under stale approval"
+  },
+  {
+    "case_id": "fim.publishing_supersede_boundary_base_mismatch_commits_pending",
+    "injection": "a `PUBLISHING` SUPERSEDE_AT_BOUNDARY base mismatch commits its pending Snapshot and the controller restarts",
+    "expected": "the stale Activity/effect stays non-dispatchable and the Run remains in its durable pending-specification subphase; only `T(SPEC_SUPERSEDE,pending_snapshot_id)` may install/enter REPLANNING, so no higher Effect or resumed mutation can bypass the generation boundary"
+  },
+  {
+    "case_id": "fim.base_advances_again_higher_initial_effect_s",
+    "injection": "base advances again before that higher `INITIAL` effect's pre-read",
+    "expected": "the higher effect is superseded before any ref mutation while preserving the same provisional object/head; policy repeats exact rebase or Snapshot supersession/full gate, never bypassing the pre-read because a Change Request already exists"
+  },
+  {
+    "case_id": "fim.deterministic_publication_ref_contains_foreign_sha_linkage",
+    "injection": "deterministic publication ref contains a foreign SHA before linkage",
+    "expected": "stale effect is superseded; ownership reconciliation either proves an earlier effect, safely imports and fully gates the exact commit, selects one evidence-bound base-rooted reconstruction when admission fails without incompatible ownership, or reaches the typed ownership boundary; a later higher-generation CAS never overwrites unverified state and no `PUBLISHING` deadlock occurs"
+  },
+  {
+    "case_id": "fim.pre_link_foreign_sha_valid_git_but",
+    "injection": "pre-link foreign SHA is valid Git but fails the pinned-base relationship without incompatible ownership evidence",
+    "expected": "reconciliation never retries `IMPORT`; one evidence-bound `REMEDIATE` reconstruction produces an ordinary base-rooted Candidate and full gate, or its typed failure advances normal recovery"
+  },
+  {
+    "case_id": "fim.pre_link_foreign_sha_carries_positive_incompatible",
+    "injection": "pre-link foreign SHA carries positive incompatible ownership evidence",
+    "expected": "reconciliation reaches only `PUBLICATION_OWNERSHIP_CONFLICT`; it never reconstructs or overwrites the ref"
+  },
+  {
+    "case_id": "fim.changed_typed_complete_change_request_search_result",
+    "injection": "a changed typed complete `CHANGE_REQUEST_SEARCH_RESULT` contains no positive merged terminal, proves every member `POSITIVE`, and finds multiple LIVE open/unmerged Change Requests carrying the same valid Orcest Run/Publication marker",
+    "expected": "after the applicable controller-Activity exclusions, its Transition first supersedes/fences any current `RECONCILE`; one new duplicate `RECONCILE` may produce `REDUNDANT_PUBLICATIONS_PROVEN`, which copies the complete-search revision/full-set digest, freezes the bytewise-ID-ordered LIVE cleanup membership/digest, retains ordinal zero/the lowest LIVE stable ID, and plans at most the first CLOSE member as one `CLOSE_REDUNDANT_PUBLICATION`; no Publication Effect is inserted or incremented. Before linkage the PUBLISH remains suspended at MULTIPLE and the retained ID is not installed as the Publication association. A positive merged terminal takes the terminal-Reservation branch first; incompatible or incomplete ownership never reaches this Fact"
+  },
+  {
+    "case_id": "fim.changed_post_link_typed_complete_change_request",
+    "injection": "a changed post-link typed complete `CHANGE_REQUEST_SEARCH_RESULT` finds zero or one actionable same-marker object",
+    "expected": "after the applicable controller-Activity exclusions, its Transition first supersedes/fences any current `RECONCILE`; one new duplicate `RECONCILE` may produce `NO_ACTIONABLE_DUPLICATE`, which copies the exact complete-search revision and canonical ordered-result digest (including empty), updates the Publication's last-duplicate proof projection, changes no retained association, and creates no cleanup Activity or Publication Effect; replay of the same pair cannot schedule another RECONCILE, while a later changed revision or digest may. This outcome is invalid for pre-link MULTIPLE"
+  },
+  {
+    "case_id": "fim.individual_discovery_head_feedback_merge_close_observation",
+    "injection": "an individual discovery/head/feedback/merge/close observation other than `CHANGE_REQUEST_MARKER` arrives while duplicate reconciliation is in flight and no close/marker-repair controller Activity is current",
+    "expected": "it may supersede stale duplicate evidence and request a new complete read, but cannot assert a set digest or authorize either duplicate Fact kind; Marker observations use the marker-specific path, and only the next typed complete search result can prove the set"
+  },
+  {
+    "case_id": "fim.associated_owned_change_request_has_missing_byte",
+    "injection": "the associated owned Change Request has a missing or byte-identical duplicated Orcest marker",
+    "expected": "the marker-specific Transition first supersedes any current `RECONCILE`; only an exact ownership proof may then plan effect-fenced `REPAIR_RUN_MARKER`. Its `orcest.run-marker-repair/1` input/outbox commits before `repair_change_request_marker_if_exact_owned`, binds the exact head/body revision/current marker-set digest, and can normalize to one canonical marker without transferring ownership or incrementing the Effect"
+  },
+  {
+    "case_id": "fim.run_marker_repair_response_lost_body_head",
+    "injection": "run-marker repair response is lost, the body/head changes, a complete search changes, or controller restarts",
+    "expected": "ambiguity/restart retains the same ACTIVE Activity/operation. Cancellation, retained-head advance, merge, and closure take precedence. After excluding them, a mismatch first persists the exact current observation and its marker-repair-specific Transition supersedes the repair; a changed typed complete search may then plan duplicate `RECONCILE`, while individual mutable evidence schedules a fresh complete search or ownership reconciliation. The generic changed-search row cannot plan while repair is current. Only an exact controller-bound marker observation proving one desired marker completes it; conflicting v1/legacy ownership can never be repaired away"
+  },
+  {
+    "case_id": "fim.linked_live_v1_change_request_loses_duplicates",
+    "injection": "a linked live-v1 Change Request loses, duplicates, or corrupts its body marker while the legacy selector runs",
+    "expected": "the legacy selector excludes every nonterminal Publication's stable Change Request ID and deterministic ref unconditionally, independent of marker parsing; after positive-merged terminalization it also excludes the selected ID/ref and every unresolved terminal-cleanup member until its outcome, with a surviving valid marker independently excluded afterward. V1 schedules marker proof/repair or terminal cleanup, and no legacy worker, reviewer, or closer acquires authority"
+  },
+  {
+    "case_id": "fim.duplicate_head_marker_ref_equivalence_complete_set",
+    "injection": "a duplicate head, marker/ref equivalence, complete-set search revision, retained object, or unreviewed proof changes after cleanup planning",
+    "expected": "pre-call or adapter mismatch first persists the exact current Forge Observation evidence; its `FORGE_OBSERVATION` Transition supersedes the immutable cleanup Activity/outbox. A changed typed complete search may plan fresh `RECONCILE`; individual close/head/marker/review evidence only schedules a fresh complete search. A definitive evidence-less failure uses a failed Controller Operation Fact; ambiguity/restart leaves cleanup `ACTIVE` on the same operation, and `close_change_request_if_exact_unreviewed_duplicate` is never called from stale proof"
+  },
+  {
+    "case_id": "fim.redundant_close_response_lost_ambiguous",
+    "injection": "redundant-close response is lost or ambiguous",
+    "expected": "the same durable Activity/operation identity is reconciled; the controller does not issue a blind new close, and only an exact authenticated `CHANGE_REQUEST_CLOSED` Observation bound to the Activity, operation digest, current Publication/effect, duplicate ID, and head may complete it"
+  },
+  {
+    "case_id": "fim.exact_redundant_close_observation_commits_controller_crashes",
+    "injection": "exact redundant-close Observation commits and the controller crashes before acknowledging it",
+    "expected": "the cleanup Activity is complete, the lowest-ID canonical Publication and Run remain nonterminal, no Publication Effect generation changed, and a fresh authenticated complete marker search is scheduled; replay neither closes the Run nor schedules another member from the stale Fact, and only a later changed typed search result may plan `RECONCILE` from a newly frozen complete set"
+  },
+  {
+    "case_id": "fim.complete_search_proves_positive_merged_terminal_live",
+    "injection": "a complete search proves a positive merged terminal while LIVE duplicates still exist",
+    "expected": "the same terminalizing transaction freezes the lowest positive merged ID/proof, completes/fences PUBLISH, sets Run `MERGED`, and creates one reciprocal Terminal Duplicate Cleanup Reservation containing every LIVE row in bytewise stable-ID order | semantic Run work stays terminal; cleanup survives restart and processes only the Reservation cursor. No LIVE row is installed as the Publication association and no new Publication Effect is created"
+  },
+  {
+    "case_id": "fim.terminal_duplicate_cleanup_classifies_member_as_positive",
+    "injection": "terminal duplicate cleanup classifies a member as positive and reliance-free, positive with external reliance, or unsafe/incompatible/incomplete",
+    "expected": "immutable Member planning selects respectively `CLOSE`, CAS-safe `DETACH_MARKER`, or `RECORD_ONLY` with its bounded reason | CLOSE uses only the exact-owned close primitive; DETACH removes only this Run marker and preserves all other body/external work; RECORD_ONLY performs no forge mutation. Every selected/member ID/ref remains legacy-excluded until its terminal action outcome, with a surviving valid marker independently excluded afterward"
+  },
+  {
+    "case_id": "fim.terminal_duplicate_close_detach_response_lost_cas",
+    "injection": "terminal duplicate CLOSE/DETACH response is lost or its CAS evidence changes",
+    "expected": "the one current Action generation, existing Effect fence, stable operation identity/outbox, Reservation-bound polling/search Schedule/Request, and exact preimage survive; ambiguity leaves it `ACTIVE`, while a typed mismatch persists an exact Action-bound Observation | reconcile the same operation without a blind retry. Success completes only from the exact Action-bound close/marker Observation. Mismatch supersedes through its one Forge Transition, performs a fresh exact read/search, then creates a higher generation or `RETAINED_AUDIT`"
+  },
+  {
+    "case_id": "fim.controller_crashes_terminal_cleanup_outcome_but_selecting",
+    "injection": "controller crashes after one terminal cleanup outcome but before selecting the next member",
+    "expected": "terminal Action result and same-state `MERGED` Transition survive with the Reservation cursor | exactly one INTERNAL continuation advances the cursor and commits the next Action/outbox or Reservation completion. Backup/restore validates and resumes that graph; terminal-history GC cannot delete it while ACTIVE"
+  },
+  {
+    "case_id": "fim.stale_publication_effect_returns_newer_intent",
+    "injection": "stale Publication effect returns after a newer intent",
+    "expected": "effect-generation guard records it as stale and cannot advance Publication state"
+  },
+  {
+    "case_id": "fim.attempt_credential_rotation_dies_applied_transaction",
+    "injection": "Attempt credential rotation dies before its APPLIED transaction",
+    "expected": "no Request/Receipt/Version authority exists; the old live version remains usable and exact protected keyed body proof permits only a strict-before-deadline retry or locked orphan cleanup"
+  },
+  {
+    "case_id": "fim.attempt_credential_rotation_loses_prior_version_cas",
+    "injection": "Attempt credential rotation loses the prior-version CAS",
+    "expected": "one `CAS_LOST` Request and exact stored 409 commit without Receipt/Version/ref/fanout; same key/body proof replays before deadline and conflicting bytes or binding cannot overwrite current material"
+  },
+  {
+    "case_id": "fim.attempt_credential_rotation_dies_applied_reference_update",
+    "injection": "Attempt credential rotation dies after APPLIED reference update or response loss",
+    "expected": "reciprocal Request/Receipt/Version/ref/fanout coexist; exact replay before deadline returns stored 200 without a second version, while at/after deadline the endpoint denies and autonomous fanout still resumes"
+  },
+  {
+    "case_id": "fim.each_needs_human_reason_injected",
+    "injection": "each `needs-human` reason is injected",
+    "expected": "only the matching allowlisted boundary enters resumable waiting with a decision packet"
+  },
+  {
+    "case_id": "fim.wait_wake_human_resolution_commits_controller_crashes",
+    "injection": "Wait wake or Human Resolution commits, then controller crashes before recovery work is planned",
+    "expected": "the entry transaction already retained the exact recovery origin, trigger, exclusive Wait or Boundary/Resolution resume pointers, and one typed Recovery Evidence while planning no work; restart reduces only that Evidence and never guesses the prior state or invents a RECOVERING INTERNAL shortcut"
+  },
+  {
+    "case_id": "fim.panel_planning_cannot_staff_every_frozen_review",
+    "injection": "panel planning cannot staff every frozen REVIEW slot or the sole ADJUDICATE slot",
+    "expected": "the planning Transition commits all Activities/Assignments/subjects plus one CAPACITY Wait and complete ordered Health/slot memberships, with no Attempt/outbox. A wake appends STAFF_PANEL Evidence whose resume pointer inherits that immutable Wait slot set and whose own membership freezes the new Health evidence; its separate transaction either offers every still-current slot atomically or none and creates a replacement Wait, so crash/replay cannot expose a partial panel"
+  },
+  {
+    "case_id": "fim.wait_has_durable_timer_typed_wake_evidence",
+    "injection": "a Wait has both a durable timer and typed wake, or an EVIDENCE wait receives neither promptly",
+    "expected": "either branch may satisfy it after all bindings revalidate; the other replay becomes stale. EVIDENCE always has a bounded timer, so startup Timer Fact reconciliation cannot leave an indefinite event-only wait"
+  },
+  {
+    "case_id": "fim.secret_rotation_reaches_wait_s_minimum_version",
+    "injection": "Secret rotation reaches a wait's minimum version before the wait-creation transaction acquires the Secret lock",
+    "expected": "the reducer re-reads the verified current reference, creates no stale SECRET wait, and applies the permitted retry or next Recovery Evidence against that exact version"
+  },
+  {
+    "case_id": "fim.integrity_probe_proves_candidate_workflow_blob_secret",
+    "injection": "integrity probe proves a Candidate/Workflow Blob or Secret Version failure, then the controller crashes between lifecycle reductions",
+    "expected": "the HEALTH_OBSERVATION Transition enters RECOVERING and appends STORAGE or CREDENTIAL Recovery Evidence respectively; only the separate RECOVERY_EVIDENCE Transition creates the bound recovery Wait. Restart resumes the missing trigger without direct HEALTH-to-WAIT collapse or duplicate evidence"
+  },
+  {
+    "case_id": "fim.integrity_probe_instead_proves_exact_object_available",
+    "injection": "integrity probe instead proves the exact object available",
+    "expected": "the Health Observation keeps the Run RECOVERING and appends one exact-source Evidence selecting the ordinary origin-valid retry/resume tactic; it creates no storage/secret Wait and cannot be interpreted as a negative probe after restart"
+  },
+  {
+    "case_id": "fim.authorized_forge_specification_amendment_observed_specification_conflict",
+    "injection": "authorized forge specification amendment is observed while a specification-conflict Human Boundary is current, then controller crashes before the safe boundary",
+    "expected": "observation and pending Snapshot remain durable; no Human Resolution is claimed until the safe-boundary transaction can install that exact Snapshot"
+  },
+  {
+    "case_id": "fim.controller_dies_compound_specification_amendment_safe_boundary",
+    "injection": "controller dies after compound specification-amendment safe-boundary commit but before response/projection",
+    "expected": "one `SPEC_SUPERSEDE` Transition keyed by Snapshot, one Forge-authenticated Human Resolution, one installed generation, and one `REPLAN` plan replay idempotently; the cleared Boundary is not resolved twice"
+  },
+  {
+    "case_id": "fim.routine_timeout_capacity_test_review_failures_repeat",
+    "injection": "routine timeout/capacity/test/review failures repeat",
+    "expected": "recovery ladder continues to wait, replace, diagnose, replan, or adjudicate; no human reason is manufactured"
+  },
+  {
+    "case_id": "fim.same_verification_failure_reaches_maxrepaircyclesbeforediagnosis",
+    "injection": "the same verification failure reaches `maxRepairCyclesBeforeDiagnosis`",
+    "expected": "the accepted FAIL Receipt and one source-bound `VERIFICATION_FAILURE` Recovery Evidence commit with the post-application counters and `DIAGNOSE`; no new remediation is planned, and restart reduces only that Evidence"
+  },
+  {
+    "case_id": "fim.same_consensus_blocker_sustained_new_adjudication_blocker",
+    "injection": "the same consensus blocker or sustained/new adjudication blocker reaches `maxRepairCyclesBeforeDiagnosis`",
+    "expected": "the Decision or Receipt and one source-bound `REVIEW_DISAGREEMENT` Recovery Evidence commit with `DIAGNOSE`; no remediation Activity is created before the separate Evidence Transition"
+  },
+  {
+    "case_id": "fim.gc_races_admission_backup",
+    "injection": "GC races admission or backup",
+    "expected": "the shared storage-mutation lock and backup manifest references preserve every live or manifest-listed object"
+  },
+  {
+    "case_id": "fim.live_candidate_secret_version_workflow_blob_becomes",
+    "injection": "live Candidate, Secret Version, or Workflow Blob becomes missing or corrupt",
+    "expected": "affected Runs suspend; verified kind-specific exact-object backup restoration\u2014including SQLite-row repair for a Workflow Blob\u2014is attempted before exceptional integrity escalation"
+  },
+  {
+    "case_id": "fim.startup_foreign_key_check_finds_only_missing",
+    "injection": "startup `foreign_key_check` finds only missing Snapshot-referenced WorkflowBlob parents while `quick_check` passes",
+    "expected": "all workflow mutation remains disabled; inject a verified exact-row repair under the exclusive writer/storage barrier, require clean repeated database/blob audits plus normal restoration Fact/fanout before enabling; any additional violation stays global fail-closed"
+  },
+  {
+    "case_id": "fim.all_configured_backups_lack_live_object_authorized",
+    "injection": "all configured backups lack a live object, then an authorized operator supplies the exact bytes through the restoration operation",
+    "expected": "staged bytes are verified against the live object and its kind-specific integrity proof\u2014SHA-256 for Candidate/Workflow Blob or the Secret Store's controller-only keyed attestation; one Storage Restoration Fact and matching Human Resolution wake the affected Run without exposing a secret or substituting another object"
+  },
+  {
+    "case_id": "fim.provisional_change_request_cancellation_races_merge",
+    "injection": "provisional Change Request cancellation races a merge",
+    "expected": "durable cancellation intent fences new work; exact owned-close observation yields `CANCELLED`, merge observation yields `MERGED`; terminal outcome is never rewritten and the live-v1 Publication object never enters legacy ownership, regardless of marker state"
+  },
+  {
+    "case_id": "fim.cancellation_arrives_change_request_authority_exists",
+    "injection": "cancellation arrives before any Change Request authority exists",
+    "expected": "immediate terminal cancellation is allowed only when no Publication/create workflow exists at all, or when a current exact CHANGE_REQUEST_SEARCH/OBSERVED_ABSENT proof exists and no CREATE REQUEST_READY/AMBIGUOUS checkpoint makes an object possible; every other branch persists cancellation and reconciles the stable create/search identity without orphaning an object"
+  },
+  {
+    "case_id": "fim.cancellation_completes_current_reconciliation_proves_no_open",
+    "injection": "cancellation completes after current reconciliation proves no open owned Change Request",
+    "expected": "the deterministic publication ref remains a reserved terminal audit artifact bound to the cancelled Publication; v1 neither deletes it nor permits a later Run to adopt or publish through it"
+  },
+  {
+    "case_id": "fim.change_request_creation_succeeds_externally_response_lost",
+    "injection": "Change Request creation succeeds externally, its response is lost, and cancellation arrives before `CHANGE_REQUEST_OBSERVED` commits",
+    "expected": "durable `CHANGE_REQUEST_CREATE/REQUEST_READY` or `AMBIGUOUS` evidence prevents immediate terminal cancellation; reconciliation finds and safely closes the exact owned object or requires an exact `CHANGE_REQUEST_ABSENT` observation binding repository/ref/Run-marker/search revision/nonexistence token before `CANCELLED`, so no open Change Request is orphaned"
+  },
+  {
+    "case_id": "fim.cancellation_search_discovers_change_request_head_moves",
+    "injection": "cancellation search discovers a Change Request, then its head moves before close",
+    "expected": "the search-only cleanup is superseded by an exact head-bound cleanup; head movement supersedes that Activity and plans one replacement, so no Activity input mutates and only the current head fence may close"
+  },
+  {
+    "case_id": "fim.current_head_feedback_contains_merge_conflict_failing",
+    "injection": "current-head feedback contains both merge conflict and failing checks/review threads, then facts arrive in another order",
+    "expected": "conflict always selects one exact-head-fenced `REBASE`; without conflict the canonical failing-check/review/thread set selects one `PR_REMEDIATE`; arrival order and prose never select an Activity kind"
+  },
+  {
+    "case_id": "fim.validated_candidate_upload_expires_result_finalization",
+    "injection": "`VALIDATED` Candidate upload expires before Result finalization",
+    "expected": "upload becomes `EXPIRED`; incoming bytes are removed under the shared storage lock after the declared grace and cannot become a Candidate"
+  },
+  {
+    "case_id": "fim.upload_expiry_races_validation_promotion_first_candidate",
+    "injection": "upload expiry races validation, promotion, or first Candidate Result finalization",
+    "expected": "inject controller time immediately before, equal to, and after `expires_at_ms`; only strictly-before transactions advance, equality/later atomically leave the unused upload `EXPIRED`, a promoted live reference is cleared under the storage lock, and no Candidate/Result is created"
+  },
+  {
+    "case_id": "fim.content_put_first_candidate_result_independently_hit",
+    "injection": "content PUT and first Candidate Result independently hit the same upload expiry",
+    "expected": "both return byte-equivalent HTTP 410 `orcest.candidate-upload-expired/1` containing exact upload ID/state/code/expiry; PUT derives it from the upload row, while Result durably replays it through one `UPLOAD_EXPIRED` Result Request"
+  },
+  {
+    "case_id": "fim.backup_requested_claimed_attempt_submitting_near_execution",
+    "injection": "backup is requested while a claimed Attempt is submitting near its execution deadline",
+    "expected": "controller remains in pre-barrier `DISPATCH_PAUSED`, accepts the valid Result normally, and acquires the bounded backup barrier only after durable claimed count is zero; backup never causes `EXECUTION_DEADLINE_EXCEEDED`"
+  },
+  {
+    "case_id": "fim.backup_barrier_exceeds_backup_barrier_max_ms",
+    "injection": "backup barrier exceeds `backup_barrier_max_ms`",
+    "expected": "incomplete staging remains unmarked and collectible; barrier releases and workflow service resumes without changing an Attempt deadline or result"
+  },
+  {
+    "case_id": "fim.backup_restore_run_storagerestorationoperation_pending",
+    "injection": "backup and restore run while a `StorageRestorationOperation` is `PENDING`",
+    "expected": "the exact staged object and, for a Secret, its operation-bound keyed metadata are present only in the authenticated encrypted backup unit; restore recreates the same pending operation and deterministic restoration/rejection replay without inventing a second Fact"
+  },
+  {
+    "case_id": "fim.backup_restore_runs_retained_terminal_secret_restoration",
+    "injection": "backup/restore runs with retained terminal Secret restoration/provision Operations whose staging was collected",
+    "expected": "no terminal stage bytes are copied, but every operation-bound keyed replay record is present in its authenticated encrypted envelope and restored before replay acceptance; exact terminal replay remains decidable"
+  },
+  {
+    "case_id": "fim.backup_restore_runs_retained_applied_cas_lost",
+    "injection": "backup/restore runs with retained APPLIED or CAS_LOST Credential Rotation Requests",
+    "expected": "no rotation body/stage is copied, but each request-bound keyed replay record is encrypted, manifest-listed, restored, and verified before endpoint replay; retained Request replay remains decidable without exposing bytes"
+  },
+  {
+    "case_id": "fim.terminal_secret_operation_replay_metadata_cleanup_races",
+    "injection": "terminal Secret operation replay metadata cleanup races backup or Operation retention",
+    "expected": "ordinary GC cannot remove it; only the authorized transaction that purges the durable Operation may remove the metadata, so no retained Operation loses conflict/replay evidence"
+  },
+  {
+    "case_id": "fim.controller_secret_store_fails_each_secret_provision",
+    "injection": "controller or Secret Store fails at each Secret Provision checkpoint, including after durable staging and after version install but before SQLite completion",
+    "expected": "the accepted `PENDING` Operation, exact protected stage/opaque metadata, checkpoint chain, and source-tagged generic Outbox survive; restart verifies and resumes the same Operation without client resubmission, duplicate version, or fabricated Receipt"
+  },
+  {
+    "case_id": "fim.controller_crashes_secret_version_commit_prefix_affected",
+    "injection": "controller crashes after a Secret Version commit or after any prefix of its affected-Run fanout",
+    "expected": "Receipt, Version/current-reference CAS, frozen ordered membership/digest, and durable fanout cursor survive; restart resumes the first missing ordinal in independent idempotent transactions, including a same-state Transition for a member whose Wait/Boundary became stale"
+  },
+  {
+    "case_id": "fim.secret_provision_202_response_lost_asynchronous_completion",
+    "injection": "Secret Provision 202 response is lost while asynchronous completion or rejection races retry",
+    "expected": "while pending, replay returns byte-identical `orcest.secret-provision-accepted/1` with only Operation ID, `PENDING`, Secret ID, and target version; otherwise it returns the stored closed `COMPLETED` or `REJECTED` result body/status. No variant adds `replayed`, prior/current/mode/retry, or fields from another variant"
+  },
+  {
+    "case_id": "fim.secret_provision_retry_discovers_lost_cas_revoked",
+    "injection": "Secret Provision retry discovers lost CAS, revoked authority, invalid staging, or an integrity conflict",
+    "expected": "one closed `FAILED_TERMINAL` checkpoint atomically yields stored `REJECTED` response and completes the same source-tagged generic Outbox; it creates no Version/fanout, exact replay remains stable, and locked grace GC may later collect only the rejected stage"
+  },
+  {
+    "case_id": "fim.corrected_secret_provision_follows_terminally_rejected_operation",
+    "injection": "a corrected Secret Provision follows a terminally rejected Operation for the same prior version",
+    "expected": "the rejected Operation remains audit/replay evidence but no longer reserves its target; only after locked proof of no Version, no live target reservation, no installed target, and safe quarantine of old staging may the corrected Operation reserve and install the same prior-plus-one version"
+  },
+  {
+    "case_id": "fim.backup_restore_run_secretprovisionoperation_pending",
+    "injection": "backup and restore run while a `SecretProvisionOperation` is `PENDING`",
+    "expected": "secret bytes and keyed operation metadata occur only in the authenticated encrypted envelope; restore proves the exact stage/checkpoints/source-tagged Outbox, rebuilds only disposable delivery, and completes or retries the same Operation ID"
+  },
+  {
+    "case_id": "fim.orphan_secret_provision_staging_races_acceptance_gc",
+    "injection": "orphan Secret Provision staging races acceptance or GC",
+    "expected": "the shared storage lock and registration idempotency/backup window prevent deletion of accepted staging; only a repeated exclusive no-Operation/outbox/checkpoint/Receipt/Version/manifest proof permits quarantine and later deletion"
+  },
+  {
+    "case_id": "fim.backup_restored_empty_redis",
+    "injection": "backup is restored with empty Redis",
+    "expected": "integrity checks pass, queues rebuild, and forge effects remain disabled until reconciliation"
+  },
+  {
+    "case_id": "fim.accepted_management_command_response_lost",
+    "injection": "accepted Management Command response is lost",
+    "expected": "exact Command, Transition/Resolution, HTTP 200, and `orcest.management-result/1` body/digest coexist; replay changes only the non-digested `replayed` projection and never applies the command twice"
+  },
+  {
+    "case_id": "fim.storage_restoration_202_lost_reconciliation_reaches_restored",
+    "injection": "Storage Restoration 202 is lost while reconciliation reaches RESTORED or REJECTED",
+    "expected": "retry returns either the deterministic closed pending 202 projection or the stored closed terminal body/status; rejection-code mappings are exact and no GET, second stage, or second Fact is required"
+  },
+  {
+    "case_id": "fim.project_registration_accepted_business_rejection_response_lost",
+    "injection": "Project registration accepted business rejection response is lost",
+    "expected": "same principal/key/body returns the exact stored `orcest.project-registration-result/1` status/body with only transport `replayed` changed; its public response digest excludes replayed and every internal Secret/forge resolution, while the separate resolution digest binds those internals; ownership conflict is 409 and the other closed business rejections are 422, with no partial Project"
+  },
+  {
+    "case_id": "fim.controller_endpoint_attempted_over_plaintext_http_including",
+    "injection": "any controller endpoint is attempted over plaintext HTTP, including onboarding or a raw-secret multipart call",
+    "expected": "transport is rejected before authentication/body acceptance and no ledger or staging authority is created; HTTPS certificate validation and secret no-log streaming are exercised end to end"
+  }
+]
