@@ -48,7 +48,7 @@ from orcest.shared.coordination import (
     set_pending_task,
 )
 from orcest.shared.events import EventPublisher, make_event
-from orcest.shared.models import Task, TaskType, task_stream_name
+from orcest.shared.models import REDACTED_FIELDS, Task, TaskType, task_stream_name
 from orcest.shared.redis_client import RedisClient
 
 _RUN_ID_RE = re.compile(r"https://github\.com/[^/]+/[^/]+/actions/runs/(\d+)")
@@ -474,6 +474,15 @@ def _emit_enqueued(redis: RedisClient, task: Task) -> None:
     )
 
 
+def _task_stream_payload(task: Task, *, omit_raw_credentials: bool) -> dict[str, str]:
+    payload = task.to_dict()
+    if omit_raw_credentials:
+        for field in REDACTED_FIELDS:
+            if field in payload:
+                payload[field] = ""
+    return payload
+
+
 def _publish_and_notify(
     task: Task,
     pr_state: PRState,
@@ -486,6 +495,7 @@ def _publish_and_notify(
     proactive: bool = False,
     task_redis: RedisClient | None = None,
     capacity_reservation: PublicationCapacityReservation | None = None,
+    omit_raw_credentials: bool = False,
 ) -> bool:
     """Publish a task to Redis and update GitHub visibility.
 
@@ -572,7 +582,10 @@ def _publish_and_notify(
     stream_redis = task_redis or redis
     try:
         tasks_stream = task_stream_name(task.provider or default_runner)
-        stream_redis.xadd(tasks_stream, task.to_dict())
+        stream_redis.xadd(
+            tasks_stream,
+            _task_stream_payload(task, omit_raw_credentials=omit_raw_credentials),
+        )
     except Exception:
         _log.error(
             f"Failed to publish task {task.id} for PR #{pr_state.number} to Redis",
@@ -615,6 +628,7 @@ def publish_fix_task(
     task_id: str | None = None,
     provider_account: str = "",
     capacity_reservation: PublicationCapacityReservation | None = None,
+    omit_raw_credentials: bool = False,
 ) -> Task | None:
     """Create and publish a fix task for a PR.
 
@@ -725,6 +739,7 @@ def publish_fix_task(
         logger=logger,
         task_redis=task_redis,
         capacity_reservation=capacity_reservation,
+        omit_raw_credentials=omit_raw_credentials,
     )
 
     return task if published else None
@@ -749,6 +764,7 @@ def publish_followup_task(
     task_id: str | None = None,
     provider_account: str = "",
     capacity_reservation: PublicationCapacityReservation | None = None,
+    omit_raw_credentials: bool = False,
 ) -> Task | None:
     """Create and publish a triage-followups task for a PR.
 
@@ -815,6 +831,7 @@ def publish_followup_task(
         logger=logger,
         task_redis=task_redis,
         capacity_reservation=capacity_reservation,
+        omit_raw_credentials=omit_raw_credentials,
     )
 
     return task if published else None
@@ -841,6 +858,7 @@ def publish_rebase_task(
     task_id: str | None = None,
     provider_account: str = "",
     capacity_reservation: PublicationCapacityReservation | None = None,
+    omit_raw_credentials: bool = False,
 ) -> Task | None:
     """Create and publish a rebase task for a PR.
 
@@ -896,6 +914,7 @@ def publish_rebase_task(
         proactive=proactive,
         task_redis=task_redis,
         capacity_reservation=capacity_reservation,
+        omit_raw_credentials=omit_raw_credentials,
     )
 
     return task if published else None
@@ -920,6 +939,7 @@ def publish_issue_task(
     task_id: str | None = None,
     provider_account: str = "",
     capacity_reservation: PublicationCapacityReservation | None = None,
+    omit_raw_credentials: bool = False,
 ) -> Task | None:
     """Create and publish an implementation task for a GitHub issue.
 
@@ -991,6 +1011,7 @@ def publish_issue_task(
         expected_head_owner=head_owner,
         expected_branch=expected_branch,
         capacity_reservation=capacity_reservation,
+        omit_raw_credentials=omit_raw_credentials,
     )
 
     return task if published else None
@@ -1010,6 +1031,7 @@ def _publish_issue_and_notify(
     expected_head_owner: str = "",
     expected_branch: str = "",
     capacity_reservation: PublicationCapacityReservation | None = None,
+    omit_raw_credentials: bool = False,
 ) -> bool:
     """Publish a task to Redis and update GitHub visibility on the issue.
 
@@ -1063,7 +1085,12 @@ def _publish_issue_and_notify(
     stream_redis = task_redis or redis
     tasks_stream = task_stream_name(task.provider or default_runner, issue=True)
     try:
-        stream_id = xadd_task_idempotent(stream_redis, tasks_stream, task.to_dict(), task.id)
+        stream_id = xadd_task_idempotent(
+            stream_redis,
+            tasks_stream,
+            _task_stream_payload(task, omit_raw_credentials=omit_raw_credentials),
+            task.id,
+        )
     except AmbiguousTaskPublishError:
         _log.error(
             f"Ambiguous publication outcome for task {task.id} "

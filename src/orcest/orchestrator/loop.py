@@ -104,7 +104,10 @@ from orcest.shared.models import (
 from orcest.shared.providers import ProviderEntry
 from orcest.shared.redis_client import RedisClient, is_redis_oom_error
 from orcest.shared.result_stream_health import record_result_consumer_heartbeat
-from orcest.workflow_store import load_legacy_change_request_exclusion_snapshot
+from orcest.workflow_store import (
+    load_legacy_change_request_exclusion_snapshot,
+    load_legacy_rollout_controls,
+)
 
 # Observability counters (Task 8 hygiene).
 # Per-provider under providers:{provider}: namespace, project-scoped via key_prefix.
@@ -2204,17 +2207,23 @@ def _poll_project(
             capacity_kwargs: dict[str, object] = {}
             if selection.capacity_reservation is not None:
                 capacity_kwargs["capacity_reservation"] = selection.capacity_reservation
+            publish_credential = "" if omit_raw_task_credentials else cred
             res = publish_fn(
                 **publish_kwargs,
                 **capacity_kwargs,
-                claude_token=cred if is_claude_provider(published_provider) else "",
+                claude_token=(
+                    ""
+                    if omit_raw_task_credentials
+                    else (cred if is_claude_provider(published_provider) else "")
+                ),
                 key_prefix=key_prefix,
                 task_redis=task_redis,
                 provider=published_provider,
-                credential=cred,
+                credential=publish_credential,
                 model=entry.model,
                 task_id=task_id,
                 provider_account=entry.account_key(),
+                omit_raw_credentials=omit_raw_task_credentials,
             )
             if res is None and token_pool is not None:
                 token_pool.task_completed(task_id)
@@ -2241,6 +2250,10 @@ def _poll_project(
 
     legacy_exclusion_predicate: Callable[..., bool] | None = None
     legacy_exclusion_unavailable = False
+    v1_owned_project = False
+    legacy_admissions_frozen = False
+    omit_raw_task_credentials = False
+    issue_lookup_unavailable = False
     workflow_state_root = config.workflow_state_root
     if workflow_state_root is not None:
         try:
@@ -2258,6 +2271,23 @@ def _poll_project(
             )
         else:
             legacy_exclusion_predicate = legacy_exclusion_snapshot.excludes
+        try:
+            rollout_controls = load_legacy_rollout_controls(
+                workflow_state_root,
+                repository_locator=repo,
+            )
+        except Exception:
+            issue_lookup_unavailable = True
+            logger.error(
+                "workflow-control v1 rollout controls for %s are unavailable; "
+                "excluding issue intake for this poll",
+                repo,
+                exc_info=True,
+            )
+        else:
+            v1_owned_project = rollout_controls.issue_intake_engine == "V1"
+            legacy_admissions_frozen = rollout_controls.legacy_admissions_frozen
+            omit_raw_task_credentials = rollout_controls.omit_raw_task_credentials
 
     # Discover PRs needing action
     pr_states = discover_actionable_prs(
@@ -2270,6 +2300,7 @@ def _poll_project(
         stale_pending_timeout_seconds=config.stale_pending_timeout_seconds,
         legacy_exclusion_predicate=legacy_exclusion_predicate,
         legacy_exclusion_unavailable=legacy_exclusion_unavailable,
+        legacy_admissions_frozen=legacy_admissions_frozen,
     )
 
     for observed_pr in pr_states:
@@ -2957,6 +2988,8 @@ def _poll_project(
             logger.info("PR #%d: in backoff cooldown, skipping", pr_state.number)
         elif pr_state.action == PRAction.SKIP_V1_OWNED:
             logger.debug("PR #%d: reserved for workflow-control v1, skipping", pr_state.number)
+        elif pr_state.action == PRAction.SKIP_LEGACY_FROZEN:
+            logger.debug("PR #%d: legacy admissions frozen, skipping", pr_state.number)
         elif pr_state.action == PRAction.SKIP_V1_LOOKUP_UNAVAILABLE:
             logger.debug(
                 "PR #%d: workflow-control v1 ownership lookup unavailable; fail-closed skip",
@@ -3015,6 +3048,11 @@ def _poll_project(
                 label_config=labels,
                 max_attempts=config.max_attempts,
                 issue_delivery_verifier=config.issue_delivery_verifier,
+                v1_owned_project=v1_owned_project,
+                legacy_admissions_frozen=legacy_admissions_frozen,
+                legacy_exclusion_unavailable=(
+                    legacy_exclusion_unavailable or issue_lookup_unavailable
+                ),
             )
         except Exception as e:
             logger.error(f"Issue discovery failed: {e}", exc_info=True)
@@ -3086,6 +3124,14 @@ def _poll_project(
             )
         elif issue_state.action == IssueAction.SKIP_LABELED:
             logger.debug(f"Issue #{issue_state.number}: terminal label, skipping")
+        elif issue_state.action == IssueAction.SKIP_V1_OWNED:
+            logger.debug(
+                "Issue #%d: reserved for workflow-control v1, skipping", issue_state.number
+            )
+        elif issue_state.action == IssueAction.SKIP_LEGACY_FROZEN:
+            logger.debug("Issue #%d: legacy admissions frozen, skipping", issue_state.number)
+        elif issue_state.action == IssueAction.SKIP_V1_LOOKUP_UNAVAILABLE:
+            logger.debug("Issue #%d: v1 ownership lookup unavailable, skipping", issue_state.number)
         elif issue_state.action == IssueAction.SKIP_DEPENDENCY:
             blockers = ", ".join(issue_state.open_blockers)
             logger.info(

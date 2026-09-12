@@ -1100,5 +1100,87 @@ CapacityAvailability = _register_enum(
 CapacityPoolTemplateClass = _register_enum(
     "capacity_pool.template_class", "CapacityPoolTemplateClass", ["LEGACY", "V1_CLONE_FIXED"]
 )
+RolloutStageStatus = _register_enum(
+    "rollout_projection.status",
+    "RolloutStageStatus",
+    ["UNINITIALIZED", "ENTERING", "ACTIVE", "EXITING", "ROLLED_BACK", "RETIRED"],
+)
+RolloutOperationKind = _register_enum(
+    "rollout_operation.kind",
+    "RolloutOperationKind",
+    [
+        "INITIALIZE",
+        "ADVANCE",
+        "ROLLBACK",
+        "RECORD_EVIDENCE",
+        "ALLOW_PROJECT",
+        "REGISTER_POOL",
+        "FREEZE_LEGACY",
+        "ARCHIVE_LEGACY",
+        "REMOVE_CREDENTIALS",
+    ],
+)
+RolloutOperationStatus = _register_enum(
+    "rollout_operation.status",
+    "RolloutOperationStatus",
+    ["SUCCEEDED", "REJECTED"],
+)
+RolloutOperationRejectionCode = _register_enum(
+    "rollout_operation.rejection_code",
+    "RolloutOperationRejectionCode",
+    [
+        "CAS_MISMATCH",
+        "CHECKLIST_FAILED",
+        "DUPLICATE_PUBLICATION",
+        "STALE_OVERWRITE",
+        "DUAL_ENGINE_OWNERSHIP",
+        "DUAL_CLASS_IDENTITY",
+        "PUBLICATION_EXISTS",
+        "LEGACY_DRAIN_INCOMPLETE",
+        "OBSERVATION_PERIOD_OPEN",
+        "STAGE_ORDER",
+        "UNKNOWN_KIND",
+        "AUTHORITY_REVOKED",
+        "IDEMPOTENCY_CONFLICT",
+        "REAPER_AUTHORITY_MISMATCH",
+        "CLONE_CREDENTIAL_REMOVAL_UNATTESTED",
+        "STREAM_NAMESPACE_CLASS_MISMATCH",
+        "UNKNOWN_TEMPLATE_CLASS",
+        "COHORT_CAP_EXCEEDED",
+        "PROJECT_NOT_REGISTERED",
+        "FORGE_IO_WHILE_MAINTENANCE",
+        "CONTROLLER_NOT_MAINTENANCE",
+        "ISSUANCE_KEY_MISSING",
+        "BACKUP_EVIDENCE_MISSING",
+        "OWNED_WORK_PRESENT",
+        "PUBLICATION_NOT_DISABLED",
+        "PILOT_NOT_SINGLE_PROJECT",
+        "POOL_INVENTORY_INCOMPLETE",
+        "REPRESENTATIVE_RUNS_MISSING",
+        "CREDENTIALS_STILL_PRESENT",
+        "ARCHIVE_INCOMPLETE",
+        "HISTORICAL_READONLY_MISSING",
+    ],
+)
+RolloutChecklistGate = _register_enum(
+    "rollout_checklist.gate",
+    "RolloutChecklistGate",
+    ["ENTRY", "EXIT", "ROLLBACK"],
+)
+RolloutEngine = _register_enum(
+    "rollout_project.engine",
+    "RolloutEngine",
+    ["LEGACY", "V1"],
+)
+RolloutReaperAuthority = _register_enum(
+    "rollout_capacity_pool.reaper_authority",
+    "RolloutReaperAuthority",
+    ["LEGACY_PEL_ALLOWLIST", "V1_AUTHENTICATED_LOSS"],
+)
+RolloutLegacyArchiveKind = _register_enum(
+    "rollout_legacy_archive.kind",
+    "RolloutLegacyArchiveKind",
+    ["TASK", "PR", "ISSUE", "STREAM", "EVIDENCE"],
+)
 
 __all__ += [name for name in globals() if name[:1].isupper()]

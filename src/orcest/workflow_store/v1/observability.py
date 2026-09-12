@@ -236,6 +236,27 @@ def collect_observability(
         "SELECT COALESCE(MAX(? - created_at_ms), 0) FROM outbox WHERE state = 'PENDING'",
         (now_ms,),
     )
+    rollout_stage = 0
+    rollout_revision = 0
+    try:
+        rollout_row = conn.execute(
+            "SELECT stage, stage_revision, status FROM rollout_projection "
+            "WHERE controller_id = 'ORCEST_V1'"
+        ).fetchone()
+        if rollout_row is not None:
+            rollout_stage = int(rollout_row[0])
+            rollout_revision = int(rollout_row[1])
+            metrics.append(
+                MetricSample(
+                    "workflow_rollout_stage",
+                    rollout_stage,
+                    _labels(status=str(rollout_row[2])),
+                )
+            )
+            metrics.append(MetricSample("workflow_rollout_revision", rollout_revision))
+    except sqlite3.OperationalError:
+        pass
+
     oldest_projection = _scalar(
         conn,
         "SELECT COALESCE(MAX(? - created_at_ms), 0) FROM projection_outbox WHERE state = 'PENDING'",
