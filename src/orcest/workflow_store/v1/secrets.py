@@ -420,6 +420,11 @@ class SecretStore:
         return value
 
     def iter_versions(self) -> Iterator[SecretVersionHandle]:
+        for reference in self.iter_version_references():
+            yield self.verify(reference.secret_id, reference.version)
+
+    def iter_version_references(self) -> Iterator[SecretReference]:
+        """List installed version identities without reading secret payloads."""
         for secret_dir in sorted(self._root.iterdir()):
             if not secret_dir.is_dir() or secret_dir.is_symlink():
                 continue
@@ -433,7 +438,7 @@ class SecretStore:
                     continue
                 if not child.name.isdigit():
                     continue
-                yield self.verify(secret_dir.name, int(child.name))
+                yield SecretReference(secret_id=secret_dir.name, version=int(child.name))
 
     def _install_version_locked(
         self,

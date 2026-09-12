@@ -43,6 +43,7 @@ from pathlib import Path
 from orcest.workflow_store.v1.errors import (
     IntegrityConflictError,
     LayoutError,
+    ObjectNotFoundError,
     QuotaExceededError,
     StorageLockError,
 )
@@ -309,10 +310,21 @@ def unique_incoming_path(incoming_dir: Path) -> Path:
 
 
 def quarantine_file(*, src: Path, quarantine_dir: Path, store_root: Path) -> Path:
-    """Rename ``src`` into quarantine with a fresh name; fsync the directories."""
+    """Rename ``src`` into quarantine with a fresh name and a fresh mtime.
+
+    ``os.rename`` keeps the source inode's ``st_mtime``, so the second
+    quarantine grace period would otherwise be measured from the object's
+    original write time. Stamp the destination before directory fsyncs so
+    ``purge_quarantine_directory`` ages from quarantine time.
+    """
     mkdir_durable(quarantine_dir, stop=store_root)
     dest = trusted_join(quarantine_dir, str(uuid.uuid4()))
-    os.rename(src, dest)
+    try:
+        os.rename(src, dest)
+    except FileNotFoundError as exc:
+        raise ObjectNotFoundError("quarantine source is not installed") from exc
+    os.utime(dest, None, follow_symlinks=False)
+    fsync_file(dest)
     fsync_dir(quarantine_dir)
     fsync_dir(src.parent)
     return dest

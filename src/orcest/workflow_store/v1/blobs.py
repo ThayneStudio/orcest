@@ -37,6 +37,7 @@ from orcest.workflow_store.v1.fs import (
     StorageLock,
     default_free_bytes,
     digest_hex,
+    fsync_dir,
     promote_no_clobber,
     read_exact_file,
     trusted_join,
@@ -138,6 +139,19 @@ class WorkflowBlobStore:
                 reference(verified)
             return verified
 
+    def discard_staged(self, incoming_path: str) -> None:
+        """Discard a staged (not-yet-installed) incoming file by its exact
+        ``incoming/<name>`` relative path. A no-op if it is already gone."""
+        parts = incoming_path.split("/")
+        if len(parts) != 2 or parts[0] != "incoming":
+            raise IntegrityConflictError("Workflow Blob incoming path is invalid")
+        path = trusted_join(self._root, parts[0], parts[1])
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
+        fsync_dir(path.parent)
+
     def verify(self, blob_digest: str) -> WorkflowBlobRecord:
         """Recompute the domain-separated digest; a readable file is not enough."""
         require_valid_content_digest(blob_digest, field="blob_digest")
@@ -153,6 +167,14 @@ class WorkflowBlobStore:
         return read_exact_file(self._dest(record), max_bytes=self._quota.max_object_bytes)
 
     def iter_objects(self) -> Iterator[WorkflowBlobRecord]:
+        for record in self.iter_object_inventory():
+            try:
+                yield self.verify(record.blob_digest)
+            except ObjectNotFoundError:
+                continue
+
+    def iter_object_inventory(self) -> Iterator[WorkflowBlobRecord]:
+        """List installed identities using names and stat data without reading payloads."""
         for kind in sorted(_MEDIA_KINDS):
             kind_root = self._root / "objects" / kind / "sha256"
             if not kind_root.is_dir():
@@ -163,7 +185,16 @@ class WorkflowBlobStore:
                 for child in sorted(shard.iterdir()):
                     if not child.is_file() or child.is_symlink():
                         continue
-                    yield self.verify(f"sha256:{child.name}")
+                    try:
+                        byte_length = child.stat().st_size
+                    except FileNotFoundError:
+                        continue
+                    yield WorkflowBlobRecord(
+                        blob_digest=f"sha256:{child.name}",
+                        media_kind=kind,
+                        byte_length=byte_length,
+                        storage_key=child.relative_to(self._root).as_posix(),
+                    )
 
     def _locate(self, blob_digest: str) -> tuple[Path, str]:
         hex_part = digest_hex(blob_digest)
