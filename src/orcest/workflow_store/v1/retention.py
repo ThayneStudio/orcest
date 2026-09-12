@@ -74,10 +74,13 @@ def collect_orphan_candidate_objects(
     """
     now = _now_ms() if now_ms is None else now_ms
     quarantined: list[str] = []
-    for record in list(candidate_store.iter_objects()):
+    for record in candidate_store.iter_object_inventory():
         if _is_referenced_candidate(run_store, record.bundle_digest):
             continue
-        age_ms = now - candidate_store.installed_mtime_ms(record.bundle_digest)
+        try:
+            age_ms = now - candidate_store.installed_mtime_ms(record.bundle_digest)
+        except ObjectNotFoundError:
+            continue
         if age_ms < grace_ms:
             continue
         with storage_lock:
@@ -138,13 +141,16 @@ def collect_terminal_storage_restoration_staging(
                 or current["terminal_at_ms"] > now - grace_ms
             ):
                 continue
-            _discard_staged_object(
-                object_kind=row["object_kind"],
-                staged_object_key=row["staged_object_key"],
-                candidate_store=candidate_store,
-                blob_store=blob_store,
-                secret_store=secret_store,
-            )
+            try:
+                _discard_staged_object(
+                    object_kind=row["object_kind"],
+                    staged_object_key=row["staged_object_key"],
+                    candidate_store=candidate_store,
+                    blob_store=blob_store,
+                    secret_store=secret_store,
+                )
+            except ObjectNotFoundError:
+                pass
             cleaned.append(operation_id)
     return cleaned
 
@@ -193,7 +199,10 @@ def purge_quarantine_directory(
         for child in sorted(quarantine_dir.iterdir()):
             if not child.is_file() or child.is_symlink():
                 continue
-            age_ms = now - int(child.stat().st_mtime * 1000)
+            try:
+                age_ms = now - int(child.stat().st_mtime * 1000)
+            except FileNotFoundError:
+                continue
             if age_ms < grace_ms:
                 continue
             try:

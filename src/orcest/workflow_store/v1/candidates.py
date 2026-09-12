@@ -231,7 +231,10 @@ class CandidateObjectStore:
         authority -- only as a physical age floor before the reference
         recheck that must gate every deletion."""
         record = self.verify(bundle_digest)
-        return int(self._dest(record).stat().st_mtime * 1000)
+        try:
+            return int(self._dest(record).stat().st_mtime * 1000)
+        except FileNotFoundError as exc:
+            raise ObjectNotFoundError("Candidate object is not installed") from exc
 
     def quarantine(self, bundle_digest: str) -> None:
         """Move an installed object out of the live CAS into quarantine.
@@ -248,7 +251,10 @@ class CandidateObjectStore:
 
     def iter_objects(self) -> Iterator[CandidateObjectRecord]:
         for record in self.iter_object_inventory():
-            yield self.verify(record.bundle_digest)
+            try:
+                yield self.verify(record.bundle_digest)
+            except ObjectNotFoundError:
+                continue
 
     def iter_object_inventory(self) -> Iterator[CandidateObjectRecord]:
         """List installed identities using names and stat data without reading payloads."""
@@ -264,9 +270,13 @@ class CandidateObjectStore:
                 if not child.name.endswith(".bundle"):
                     continue
                 digest = f"sha256:{child.name[: -len('.bundle')]}"
+                try:
+                    byte_length = child.stat().st_size
+                except FileNotFoundError:
+                    continue
                 yield CandidateObjectRecord(
                     bundle_digest=digest,
-                    byte_length=child.stat().st_size,
+                    byte_length=byte_length,
                     storage_key=child.relative_to(self._root).as_posix(),
                 )
 

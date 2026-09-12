@@ -168,7 +168,10 @@ class WorkflowBlobStore:
 
     def iter_objects(self) -> Iterator[WorkflowBlobRecord]:
         for record in self.iter_object_inventory():
-            yield self.verify(record.blob_digest)
+            try:
+                yield self.verify(record.blob_digest)
+            except ObjectNotFoundError:
+                continue
 
     def iter_object_inventory(self) -> Iterator[WorkflowBlobRecord]:
         """List installed identities using names and stat data without reading payloads."""
@@ -182,10 +185,14 @@ class WorkflowBlobStore:
                 for child in sorted(shard.iterdir()):
                     if not child.is_file() or child.is_symlink():
                         continue
+                    try:
+                        byte_length = child.stat().st_size
+                    except FileNotFoundError:
+                        continue
                     yield WorkflowBlobRecord(
                         blob_digest=f"sha256:{child.name}",
                         media_kind=kind,
-                        byte_length=child.stat().st_size,
+                        byte_length=byte_length,
                         storage_key=child.relative_to(self._root).as_posix(),
                     )
 

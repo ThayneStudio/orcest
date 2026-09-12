@@ -13,6 +13,7 @@ import pytest
 from orcest.workflow_store.store import RunStore
 from orcest.workflow_store.v1.blobs import WorkflowBlobStore
 from orcest.workflow_store.v1.candidates import CandidateObjectStore
+from orcest.workflow_store.v1.errors import ObjectNotFoundError
 from orcest.workflow_store.v1.fs import ControlLayout, QuotaConfig, StorageLock
 from orcest.workflow_store.v1.retention import (
     collect_orphan_candidate_objects,
@@ -171,6 +172,36 @@ def test_collect_orphan_candidate_objects_skips_an_object_still_within_grace(
     assert candidate_store._dest(record).is_file()
 
 
+def test_collect_orphan_candidate_objects_continues_when_mtime_lookup_races(
+    run_store: RunStore,
+    candidate_store: CandidateObjectStore,
+    lock: StorageLock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vanished = candidate_store.install(b"vanishes-during-mtime")
+    surviving = candidate_store.install(b"survives-mtime-race")
+    _age_installed_object(candidate_store._dest(vanished), age_ms=30 * DAY_MS)
+    _age_installed_object(candidate_store._dest(surviving), age_ms=30 * DAY_MS)
+
+    original = CandidateObjectStore.installed_mtime_ms
+
+    def flaky_mtime(self: CandidateObjectStore, bundle_digest: str) -> int:
+        if bundle_digest == vanished.bundle_digest:
+            raise ObjectNotFoundError("Candidate object is not installed")
+        return original(self, bundle_digest)
+
+    monkeypatch.setattr(CandidateObjectStore, "installed_mtime_ms", flaky_mtime)
+
+    quarantined = collect_orphan_candidate_objects(
+        run_store, candidate_store, storage_lock=lock, grace_ms=7 * DAY_MS
+    )
+
+    assert vanished.bundle_digest not in quarantined
+    assert quarantined == [surviving.bundle_digest]
+    assert candidate_store._dest(vanished).is_file()
+    assert not candidate_store._dest(surviving).is_file()
+
+
 # -- collect_terminal_storage_restoration_staging -----------------------------
 
 
@@ -267,6 +298,49 @@ def test_collect_terminal_staging_respects_grace_period(
     assert candidate_store._incoming_path(incoming_path).is_file()
 
 
+def test_collect_terminal_staging_continues_when_staged_object_vanishes(
+    run_store: RunStore,
+    candidate_store: CandidateObjectStore,
+    blob_store: WorkflowBlobStore,
+    secret_store: SecretStore,
+    lock: StorageLock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming_a, _record_a = candidate_store.stage_upload_bytes(b"gone-staging")
+    incoming_b, _record_b = candidate_store.stage_upload_bytes(b"kept-staging")
+    op_a = _begin_restoration(run_store, staged_object_key=incoming_a)
+    op_b = _begin_restoration(run_store, staged_object_key=incoming_b)
+    run_store.fail_storage_restoration_operation(
+        operation_id=op_a, rejection_code="INTEGRITY_CONFLICT", now_ms=0
+    )
+    run_store.fail_storage_restoration_operation(
+        operation_id=op_b, rejection_code="INTEGRITY_CONFLICT", now_ms=0
+    )
+
+    original = CandidateObjectStore.discard_staged
+
+    def flaky_discard(self: CandidateObjectStore, incoming_path: str) -> None:
+        if incoming_path == incoming_a:
+            raise ObjectNotFoundError("staged object is not installed")
+        original(self, incoming_path)
+
+    monkeypatch.setattr(CandidateObjectStore, "discard_staged", flaky_discard)
+
+    cleaned = collect_terminal_storage_restoration_staging(
+        run_store,
+        candidate_store=candidate_store,
+        blob_store=blob_store,
+        secret_store=secret_store,
+        storage_lock=lock,
+        grace_ms=7 * DAY_MS,
+        now_ms=8 * DAY_MS,
+    )
+
+    assert op_a in cleaned
+    assert op_b in cleaned
+    assert not candidate_store._incoming_path(incoming_b).is_file()
+
+
 # -- purge_quarantine_directory -----------------------------------------------
 
 
@@ -288,3 +362,68 @@ def test_purge_quarantine_directory_deletes_only_aged_files(
     removed = purge_quarantine_directory(quarantine_dir, storage_lock=lock, grace_ms=7 * DAY_MS)
     assert len(removed) == 1
     assert list(quarantine_dir.iterdir()) == []
+
+
+def test_purge_quarantine_directory_starts_grace_from_quarantine_time(
+    run_store: RunStore,
+    candidate_store: CandidateObjectStore,
+    layout: ControlLayout,
+    lock: StorageLock,
+) -> None:
+    record = candidate_store.install(b"already-aged-orphan")
+    dest = candidate_store._dest(record)
+    _age_installed_object(dest, age_ms=30 * DAY_MS)
+    original_mtime = dest.stat().st_mtime
+
+    quarantined = collect_orphan_candidate_objects(
+        run_store, candidate_store, storage_lock=lock, grace_ms=7 * DAY_MS
+    )
+    assert quarantined == [record.bundle_digest]
+
+    quarantine_dir = layout.candidates_root / "quarantine"
+    quarantined_files = list(quarantine_dir.iterdir())
+    assert len(quarantined_files) == 1
+    assert quarantined_files[0].stat().st_mtime > original_mtime
+
+    removed = purge_quarantine_directory(quarantine_dir, storage_lock=lock, grace_ms=7 * DAY_MS)
+    assert removed == []
+    assert len(list(quarantine_dir.iterdir())) == 1
+
+
+def test_purge_quarantine_directory_continues_when_a_file_vanishes(
+    candidate_store: CandidateObjectStore,
+    layout: ControlLayout,
+    lock: StorageLock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = candidate_store.install(b"purge-first")
+    second = candidate_store.install(b"purge-second")
+    candidate_store.quarantine(first.bundle_digest)
+    candidate_store.quarantine(second.bundle_digest)
+    quarantine_dir = layout.candidates_root / "quarantine"
+    quarantined_files = sorted(quarantine_dir.iterdir())
+    assert len(quarantined_files) == 2
+    for path in quarantined_files:
+        _age_installed_object(path, age_ms=30 * DAY_MS)
+
+    vanished = quarantined_files[0]
+    surviving = quarantined_files[1]
+    original_stat = Path.stat
+    seen = {"count": 0}
+
+    def flaky_stat(self: Path, *args: object, **kwargs: object) -> os.stat_result:
+        follow_symlinks = kwargs.get("follow_symlinks", True)
+        # is_file() and the age check both follow symlinks; is_symlink() does not.
+        # Raise only on the age-check stat so the listing still sees the file.
+        if self == vanished and follow_symlinks:
+            seen["count"] += 1
+            if seen["count"] >= 2:
+                raise FileNotFoundError
+        return original_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", flaky_stat)
+
+    removed = purge_quarantine_directory(quarantine_dir, storage_lock=lock, grace_ms=7 * DAY_MS)
+
+    assert removed == [surviving.name]
+    assert not surviving.exists()
