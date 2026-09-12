@@ -140,6 +140,12 @@ from orcest.workflow_store.v1.errors import (
     StorageLockError,
 )
 from orcest.workflow_store.v1.fs import ControlLayout, QuotaConfig, StorageLock
+from orcest.workflow_store.v1.isolation import (
+    V1_OFFER_STREAM_PREFIX,
+    is_legacy_pel_allowlisted,
+    is_v1_protocol_stream,
+    legacy_pel_denied,
+)
 from orcest.workflow_store.v1.offer_projection import (
     activity_offer_protocol,
     dispatch_pending_offers,
@@ -150,6 +156,25 @@ from orcest.workflow_store.v1.retention import (
     collect_orphan_candidate_objects,
     collect_terminal_storage_restoration_staging,
     purge_quarantine_directory,
+)
+from orcest.workflow_store.v1.rollout import (
+    DEFAULT_OBSERVATION_PERIOD_MS,
+    ChecklistItemResult,
+    LegacyRolloutControls,
+    RolloutCapacityPoolRecord,
+    RolloutChecklist,
+    RolloutOperationResult,
+    RolloutProjection,
+    RolloutProjectRecord,
+    allow_rollout_project,
+    apply_rollout_operation,
+    archive_legacy_work,
+    engine_write_scope,
+    evaluate_rollout_checklist,
+    get_rollout_projection,
+    load_legacy_rollout_controls,
+    record_rollout_evidence,
+    register_rollout_capacity_pool,
 )
 from orcest.workflow_store.v1.secret_provision import (
     SecretProvisionReplayConflictError,
@@ -314,4 +339,25 @@ __all__ = [
     "collect_orphan_candidate_objects",
     "collect_terminal_storage_restoration_staging",
     "purge_quarantine_directory",
+    "V1_OFFER_STREAM_PREFIX",
+    "is_legacy_pel_allowlisted",
+    "is_v1_protocol_stream",
+    "legacy_pel_denied",
+    "DEFAULT_OBSERVATION_PERIOD_MS",
+    "ChecklistItemResult",
+    "LegacyRolloutControls",
+    "RolloutCapacityPoolRecord",
+    "RolloutChecklist",
+    "RolloutOperationResult",
+    "RolloutProjectRecord",
+    "RolloutProjection",
+    "allow_rollout_project",
+    "apply_rollout_operation",
+    "archive_legacy_work",
+    "engine_write_scope",
+    "evaluate_rollout_checklist",
+    "get_rollout_projection",
+    "load_legacy_rollout_controls",
+    "record_rollout_evidence",
+    "register_rollout_capacity_pool",
 ]

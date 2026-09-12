@@ -73,6 +73,8 @@ STORAGE_RESTORATION_ACCEPTED_PROTOCOL = "orcest.storage-restoration-accepted/1"
 STORAGE_RESTORATION_RESULT_PROTOCOL = "orcest.storage-restoration-result/1"
 MANAGEMENT_COMMAND_PROTOCOL = "orcest.management/1"
 MANAGEMENT_COMMAND_RESULT_PROTOCOL = "orcest.management-result/1"
+ROLLOUT_OPERATION_PROTOCOL = "orcest.rollout-operation/1"
+ROLLOUT_OPERATION_RESULT_PROTOCOL = "orcest.rollout-operation-result/1"
 
 __all__ = [
     "ATTEMPT_CLAIM_PROTOCOL",
@@ -108,6 +110,8 @@ __all__ = [
     "ADJUDICATION_RECEIPT_PROTOCOL",
     "MANAGEMENT_COMMAND_PROTOCOL",
     "MANAGEMENT_COMMAND_RESULT_PROTOCOL",
+    "ROLLOUT_OPERATION_PROTOCOL",
+    "ROLLOUT_OPERATION_RESULT_PROTOCOL",
 ]
 
 
@@ -1366,4 +1370,43 @@ register_envelope(
         "claim_deadline_ms": Field(validator=_is_nonneg_int),
     },
     protocol_field="protocol",
+)
+
+
+# ---------------------------------------------------------------------------
+# Staged migration operations (operations-and-rollout.md Stages 0-5)
+# ---------------------------------------------------------------------------
+
+
+def _rollout_operation_result_invariant(value: Mapping[str, Any]) -> None:
+    status = value.get("status")
+    if status == "SUCCEEDED":
+        _require(value.get("stage") is not None, "SUCCEEDED requires non-null stage")
+        _require(
+            value.get("stage_revision") is not None, "SUCCEEDED requires non-null stage_revision"
+        )
+        _require(value.get("rejection_code") is None, "SUCCEEDED must not carry rejection_code")
+    elif status == "REJECTED":
+        _require(value.get("rejection_code") is not None, "REJECTED requires a rejection_code")
+        _require(value.get("stage") is None, "REJECTED must not carry stage")
+        _require(value.get("stage_revision") is None, "REJECTED must not carry stage_revision")
+
+
+register_envelope(ROLLOUT_OPERATION_PROTOCOL, {})
+register_envelope(
+    ROLLOUT_OPERATION_RESULT_PROTOCOL,
+    {
+        "rollout_operation_id": Field(validator=_is_uuid),
+        "operation_kind": Field(enum=_enum_values(enums.RolloutOperationKind)),
+        "status": Field(enum=_enum_values(enums.RolloutOperationStatus)),
+        "replayed": Field(validator=_is_bool),
+        "stage": Field(required=False, nullable=True, validator=_is_nonneg_int),
+        "stage_revision": Field(required=False, nullable=True, validator=_is_nonneg_int),
+        "rejection_code": Field(
+            required=False,
+            nullable=True,
+            enum=_enum_values(enums.RolloutOperationRejectionCode),
+        ),
+    },
+    object_validator=_rollout_operation_result_invariant,
 )
