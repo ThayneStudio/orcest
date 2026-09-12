@@ -27,8 +27,10 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, ParamSpec, T
 import click
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from orcest.fleet.config import DEFAULT_CONFIG_PATH
+from orcest.shared.provider_versions import PROVIDER_CLI_PROBE_STATUSES
 from orcest.workflow_contract.v1.digest import sha256_chunks_hex
 
 if TYPE_CHECKING:
@@ -1463,6 +1465,16 @@ def _safe_cli_version(value: object) -> str:
     return "[dim]missing[/dim]"
 
 
+def _safe_provider_cli_status(value: object, *, has_payload: bool) -> Text:
+    """Return canonical provider status text without interpreting Rich markup."""
+    if not has_payload:
+        return Text("legacy", style="dim")
+    if not isinstance(value, str) or value not in PROVIDER_CLI_PROBE_STATUSES:
+        return Text("invalid", style="red")
+    status = str(value)
+    return Text(status, style="green" if status == "ok" else "red")
+
+
 def _print_worker_provider_cli_heartbeats(console: Console, ssh_target: str) -> None:
     """Display secret-free provider CLI version heartbeat fields."""
     from orcest.fleet.orchestrator import get_worker_heartbeat_details
@@ -1489,22 +1501,17 @@ def _print_worker_provider_cli_heartbeats(console: Console, ssh_target: str) -> 
         revision = str(record.get("revision", ""))
         provider_cli = record.get("provider_cli")
         cli_payload: dict[str, Any] = provider_cli if isinstance(provider_cli, dict) else {}
-        status = cli_payload.get("status")
-        status_text = str(status) if isinstance(status, str) and len(status) <= 64 else "legacy"
-        if status_text == "ok":
-            status_text = "[green]ok[/green]"
-        elif status_text == "legacy":
-            status_text = "[dim]legacy[/dim]"
-        else:
-            status_text = f"[red]{status_text}[/red]"
         table.add_row(
-            worker_id,
-            backend,
-            revision[:12],
+            Text(worker_id),
+            Text(backend),
+            Text(revision[:12]),
             _safe_cli_version(cli_payload.get("desired_version")),
             _safe_cli_version(cli_payload.get("template_version")),
             _safe_cli_version(cli_payload.get("observed_version")),
-            status_text,
+            _safe_provider_cli_status(
+                cli_payload.get("status"),
+                has_payload=isinstance(provider_cli, dict),
+            ),
         )
     console.print(table)
 
@@ -1606,7 +1613,7 @@ def _print_source_revision_report(console: Console, report: Any) -> None:
             status_text = "[yellow]degraded[/yellow]"
         else:
             status_text = "[red]mismatch[/red]"
-        table.add_row(surface.surface, (surface.revision or "none")[:12], status_text)
+        table.add_row(Text(surface.surface), Text((surface.revision or "none")[:12]), status_text)
 
     console.print(table)
     if report.healthy:
