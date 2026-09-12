@@ -417,6 +417,35 @@ def test_poll_cycle_marks_v1_lookup_unavailable_once(
     assert "ownership snapshot" in caplog.text
 
 
+def test_poll_cycle_fails_closed_for_prs_when_rollout_controls_unavailable(
+    mocker, fake_redis_client, orchestrator_config, gh_mock
+):
+    orchestrator_config.workflow_state_root = "/var/lib/orcest/workflow"
+    discover = mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[],
+    )
+    mocker.patch(
+        "orcest.orchestrator.loop.load_legacy_change_request_exclusion_snapshot",
+    )
+    mocker.patch(
+        "orcest.orchestrator.loop.load_legacy_rollout_controls",
+        side_effect=OSError("database unavailable"),
+    )
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    _poll_cycle(
+        orchestrator_config,
+        fake_redis_client,
+        fake_redis_client,
+        {},
+        logging.getLogger("test"),
+        3600,
+    )
+
+    assert discover.call_args.kwargs["legacy_exclusion_unavailable"] is True
+
+
 def test_poll_cycle_handles_v1_lookup_unavailable_action(
     mocker, fake_redis_client, orchestrator_config, gh_mock, caplog
 ):

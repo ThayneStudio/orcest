@@ -2299,7 +2299,7 @@ def _poll_project(
         max_total_attempts=config.max_total_attempts,
         stale_pending_timeout_seconds=config.stale_pending_timeout_seconds,
         legacy_exclusion_predicate=legacy_exclusion_predicate,
-        legacy_exclusion_unavailable=legacy_exclusion_unavailable,
+        legacy_exclusion_unavailable=(legacy_exclusion_unavailable or issue_lookup_unavailable),
         legacy_admissions_frozen=legacy_admissions_frozen,
     )
 

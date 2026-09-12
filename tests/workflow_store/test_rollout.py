@@ -355,6 +355,35 @@ def test_stage3_fails_on_stale_overwrite(tmp_path: Path) -> None:
         assert "no_stale_overwrite" in failed
 
 
+def test_advance_persists_exit_and_entry_checklist_provenance(tmp_path: Path) -> None:
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        _complete_stage0(store)
+        _register_pools(store)
+        operation_id = _uid()
+        result = apply_rollout_operation(
+            store,
+            rollout_operation_id=operation_id,
+            operation_kind="ADVANCE",
+            expected_stage=0,
+            expected_stage_revision=1,
+            requested_stage=1,
+            authenticated_principal_id="rollout-operator",
+            authorization_context_digest=AUTHZ,
+            now_ms=10,
+        )
+
+        assert result.status == "SUCCEEDED"
+        rows = store.conn.execute(
+            "SELECT stage, gate, item_id FROM rollout_checklist_results "
+            "WHERE rollout_operation_id = ? ORDER BY stage, gate, item_id",
+            (operation_id,),
+        ).fetchall()
+        assert {(row["stage"], row["gate"]) for row in rows} == {
+            (0, "EXIT"),
+            (1, "ENTRY"),
+        }
+
+
 def test_stage5_drain_archive_credentials_and_observation(tmp_path: Path) -> None:
     with RunStore(tmp_path, verify_local_filesystem=False) as store:
         _complete_stage0(store)
@@ -509,3 +538,27 @@ def test_rollback_blocked_after_publication(tmp_path: Path) -> None:
         )
         assert rolled.status == "REJECTED"
         assert rolled.rejection_code == "PUBLICATION_EXISTS"
+
+
+def test_rollback_below_stage5_restores_legacy_credential_delivery(tmp_path: Path) -> None:
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        store.conn.execute(
+            "UPDATE rollout_projection SET stage = 5, stage_revision = 1, "
+            "status = 'ACTIVE', legacy_admissions_frozen = 1, "
+            "raw_task_credentials_removed = 1 WHERE controller_id = 'ORCEST_V1'"
+        )
+        store.conn.commit()
+
+        rolled = _op(
+            store,
+            kind="ROLLBACK",
+            expected_stage=5,
+            expected_revision=1,
+            requested_stage=4,
+            now_ms=90,
+        )
+
+        assert rolled.status == "SUCCEEDED"
+        projection = get_rollout_projection(store)
+        assert projection.legacy_admissions_frozen is False
+        assert projection.raw_task_credentials_removed is False

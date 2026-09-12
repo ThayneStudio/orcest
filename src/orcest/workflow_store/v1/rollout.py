@@ -138,6 +138,8 @@ class ChecklistItemResult:
     passed: bool
     evidence_code: str
     detail: str
+    stage: int | None = None
+    gate: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,11 +231,15 @@ def evaluate_rollout_checklist(
         raise ValueError(f"unknown rollout stage {stage}")
     clock = _now_ms() if now_ms is None else now_ms
     items = tuple(
-        _evaluate_item(
-            store,
-            item_id=item_id,
-            now_ms=clock,
-            observation_period_ms=observation_period_ms,
+        replace(
+            _evaluate_item(
+                store,
+                item_id=item_id,
+                now_ms=clock,
+                observation_period_ms=observation_period_ms,
+            ),
+            stage=stage,
+            gate=gate,
         )
         for item_id in _STAGE_ITEMS[stage][gate]
     )
@@ -814,7 +820,9 @@ def _plan_rollback(
         observation_started_at_ms=None,
         publication_enabled=requested_stage >= 3,
         legacy_admissions_frozen=False,
-        raw_task_credentials_removed=projection.raw_task_credentials_removed,
+        raw_task_credentials_removed=(
+            projection.raw_task_credentials_removed if requested_stage >= 5 else False
+        ),
         historical_readonly_retained=projection.historical_readonly_retained,
     )
     return None, checklist, updated
@@ -1273,8 +1281,8 @@ def _persist_checklist(store: RunStore, operation_id: str, checklist: RolloutChe
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 operation_id,
-                checklist.stage,
-                checklist.gate,
+                checklist.stage if item.stage is None else item.stage,
+                checklist.gate if item.gate is None else item.gate,
                 item.item_id,
                 1 if item.passed else 0,
                 item.evidence_code,
