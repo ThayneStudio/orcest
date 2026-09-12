@@ -1,0 +1,2221 @@
+[
+  {
+    "case_id": "fim.controller_dies_admit_capture_first_snapshot_installation",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_snapshot_admission.py",
+        "function": "test_admission_restarts_through_three_committed_boundaries"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.entering_transition_has_cancellation_pending_snapshot_unsatisfied",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_reducer/test_continuation.py",
+        "function": "test_arbitration_precedence"
+      },
+      {
+        "module": "tests/workflow_reducer/test_reduce.py",
+        "function": "test_pending_snapshot_wins_internal_arbitration"
+      },
+      {
+        "module": "tests/workflow_reducer/test_reduce.py",
+        "function": "test_cancellation_suppresses_semantic_work"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.differing_snapshot_capture_races_current_claimed_result",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_snapshot_admission.py",
+        "function": "test_unrelated_base_observation_does_not_change_admitted_snapshot"
+      }
+    ],
+    "note": "Snapshot capture/coalescing semantics are verified; an explicit race against an in-flight claimed Result/fenced Activity is not isolated as its own scenario."
+  },
+  {
+    "case_id": "fim.base_spec_policy_capture_reaches_safe_boundary",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_reducer/test_reduce.py",
+        "function": "test_policy_only_replan_reselects_prior_candidate_after_identity_revalidation"
+      },
+      {
+        "module": "tests/workflow_store/test_snapshot_admission.py",
+        "function": "test_snapshot_capture_retains_ordered_provenance_and_blobs"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.controller_dies_activity_outbox_commit",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_activity_attempts.py",
+        "function": "test_create_activity_commits_activity_attempt_and_outbox_atomically"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.controller_dies_redis_publish_but_dispatch_acknowledgement",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_offer_projection.py",
+        "function": "test_dispatch_only_publishes_pending_rows_once"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.controller_dies_attempt_attemptclaim_reciprocal_claim_transaction",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_attempt_claims_schema.py",
+        "function": "test_attempt_claim_persists_and_is_retrievable_by_attempt"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_claims_launch.py",
+        "function": "test_claim_replay_returns_same_claim_and_no_second_authority_grant"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.response_timeout_injected_claim_launch_upload_create",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_attempt_claims_launch.py",
+        "function": "test_claim_replay_returns_same_claim_and_no_second_authority_grant"
+      },
+      {
+        "module": "tests/workflow_store/test_capacity_reports.py",
+        "function": "test_replaying_same_report_id_and_body_returns_stored_response"
+      },
+      {
+        "module": "tests/workflow_store/test_worker_loss_reports.py",
+        "function": "test_replaying_same_idempotency_key_returns_stored_response"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_liveness.py",
+        "function": "test_replayed_sequence_never_rewinds_state"
+      }
+    ],
+    "note": "Each endpoint family's idempotent-replay convergence is tested individually; there is no single harness that replays every listed endpoint kind in one case."
+  },
+  {
+    "case_id": "fim.result_request_uuid_reused_across_accepted_upload",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_attempt_results.py",
+        "function": "test_exact_replay_returns_stored_response"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_results.py",
+        "function": "test_key_reuse_with_different_body_conflicts"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_results.py",
+        "function": "test_expired_upload_result_records_upload_expired_without_terminalizing"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_results.py",
+        "function": "test_terminal_before_deadline_creates_stale_request_only"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_results.py",
+        "function": "test_superseded_generation_creates_stale_request_only"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.authenticated_old_generation_claim_run_result_arrives",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_attempt_results.py",
+        "function": "test_terminal_before_deadline_creates_stale_request_only"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.capability_signing_key_retired_revoked_absent_restore",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_store.py",
+        "function": "test_capability_rotation_preserves_retired_key_and_revocation_disables_issuance"
+      },
+      {
+        "module": "tests/workflow_store/test_store.py",
+        "function": "test_capability_key_illegal_transitions_are_rejected"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.selected_capability_key_emergency_revoked_without_replacement",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_store.py",
+        "function": "test_capability_rotation_preserves_retired_key_and_revocation_disables_issuance"
+      }
+    ],
+    "note": "Revocation-disables-issuance is covered; the specific atomic clear-issuance-without-rewriting-Controller-Mode framing is not asserted by name."
+  },
+  {
+    "case_id": "fim.new_store_bootstraps_capability_signing_keys_crashes",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_store.py",
+        "function": "test_capability_key_bootstrap_register_then_select_and_issue_binding"
+      },
+      {
+        "module": "tests/workflow_store/test_store.py",
+        "function": "test_capability_key_illegal_transitions_are_rejected"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.bootstrap_capability_signing_secret_provisioning_adoption_crashes",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_secret_provision.py",
+        "function": "test_stage0_capability_signing_key_is_provisionable_before_any_active_key"
+      },
+      {
+        "module": "tests/workflow_store/test_secret_provision.py",
+        "function": "test_other_purposes_are_rejected_before_an_active_key_is_selected"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.retry_panel_staffing_startup_recovery_ordinary_planning",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_attempt_deadlines.py",
+        "function": "test_claim_deadline_never_creates_an_offer_when_mode_gate_fails"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_deadlines.py",
+        "function": "test_claim_deadline_never_creates_an_offer_when_no_issuance_key"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.capability_key_operation_response_lost_expected_registry",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_store.py",
+        "function": "test_capability_key_bootstrap_register_then_select_and_issue_binding"
+      }
+    ],
+    "note": "CAS/issuance semantics are covered by the bootstrap test; a dedicated lost-response replay test for capability-key operations was not found by name."
+  },
+  {
+    "case_id": "fim.controller_mode_operation_response_lost_races_another",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_store.py",
+        "function": "test_controller_mode_set_mode_closed_matrix_all_distinct_pairs"
+      },
+      {
+        "module": "tests/workflow_store/test_store.py",
+        "function": "test_controller_mode_rejects_no_change_except_dispatch_policy_change"
+      }
+    ],
+    "note": "The closed transition matrix is covered; explicit lost-response replay for controller-mode operations was not found by name."
+  },
+  {
+    "case_id": "fim.new_store_opens_initialize_retried_ordinary_mode",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_store.py",
+        "function": "test_controller_mode_initializes_to_maintenance_without_history"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.verified_backup_restored_initialized_mode_including_maintenance",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_store.py",
+        "function": "test_controller_mode_restore_branches_are_fail_closed"
+      },
+      {
+        "module": "tests/workflow_store/test_store.py",
+        "function": "test_controller_mode_restore_backup_rejects_asymmetric_prior_policy"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.backup_begins_controller_already_maintenance",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_conformance/test_backup_mode_branches.py",
+        "function": "test_backup_in_maintenance_stays_in_place"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.backup_begins_controller_already_exactly_dispatch_paused",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_conformance/test_backup_mode_branches.py",
+        "function": "test_backup_in_dispatch_paused_pause_admission_stays_in_place"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.third_branch_backup_succeeds_fails_crashes_newly",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_conformance/test_backup_mode_branches.py",
+        "function": "test_third_branch_backup_restores_prior_mode_unless_operator_intervened"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.model_backed_claim_launch_attestation_boundary_injected",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_attempt_claims_launch.py",
+        "function": "test_launch_acceptance_consumes_one_shot_and_rejects_reused_isolation"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_claims_launch.py",
+        "function": "test_reused_workspace_context_or_invocation_cannot_attest_new_attempt"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.accepted_launch_attestation_replayed_deadline_deadline_attempt",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_attempt_claims_launch.py",
+        "function": "test_launch_replay_after_terminalization_is_expired_without_provider"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_claims_launch.py",
+        "function": "test_revoked_claim_key_denies_capability_rematerialization_on_replay"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_claims_launch.py",
+        "function": "test_revoked_launch_capability_key_denies_even_exact_replay"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.controller_dies_during_artifact_upload_admission",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_durability.py",
+        "function": "test_crash_before_file_fsync_leaves_no_object_and_no_reference"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.controller_dies_artifact_fsync_candidate_row",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_durability.py",
+        "function": "test_crash_before_promote_leaves_no_live_reference"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.controller_dies_candidate_commit",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_durability.py",
+        "function": "test_crash_after_promote_before_reference_leaves_exact_object"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_results.py",
+        "function": "test_accepts_result_and_consumes_promoted_upload_atomically"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.redis_flushed_queued_work",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_offer_projection.py",
+        "function": "test_reconstruction_republishes_only_current_offered_attempts"
+      },
+      {
+        "module": "tests/workflow_store/test_offer_projection.py",
+        "function": "test_reconstruction_is_reachable_from_a_fresh_process_boundary"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.redis_flushed_running_work",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_attempt_liveness.py",
+        "function": "test_missing_redis_liveness_storage_is_the_only_supported_path"
+      },
+      {
+        "module": "tests/workflow_store/test_startup_recovery.py",
+        "function": "test_run_startup_recovery_rebuilds_offers_without_a_synthetic_result"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.controller_process_crashes_unexpired_claimed_attempt_restarts",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_startup_recovery.py",
+        "function": "test_run_startup_recovery_rebuilds_offers_without_a_synthetic_result"
+      },
+      {
+        "module": "tests/workflow_store/test_startup_recovery.py",
+        "function": "test_run_startup_recovery_expires_due_deadlines_before_reconstructing"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.redis_flushed_wait_condition_health_observation_budget",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_startup_recovery.py",
+        "function": "test_sweep_due_deadlines_wakes_due_wait_and_expires_due_claim"
+      },
+      {
+        "module": "tests/workflow_store/test_startup_recovery.py",
+        "function": "test_sweep_due_deadlines_expires_due_execution_deadline"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.envelope_reaches_two_workers",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_attempt_claims_schema.py",
+        "function": "test_attempt_claim_is_source_unique_on_attempt_id"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_claims_launch.py",
+        "function": "test_claim_rejects_wrong_session_and_stale_generation"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.old_generation_result_arrives",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_attempt_results.py",
+        "function": "test_superseded_generation_creates_stale_request_only"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.first_result_arrives_execution_deadline_but_capability",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_attempt_results.py",
+        "function": "test_execution_deadline_equality_expires_current_attempt"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_results.py",
+        "function": "test_already_terminal_late_result_is_audit_only"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.first_unseen_result_arrives_maintenance_including_semantic",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_store.py",
+        "function": "test_controller_mode_behavior_gates_are_closed"
+      },
+      {
+        "module": "tests/workflow_conformance/test_maintenance_result_gate.py",
+        "function": "test_submit_attempt_result_in_maintenance_creates_no_row"
+      },
+      {
+        "module": "tests/workflow_conformance/test_maintenance_result_gate.py",
+        "function": "test_replay_of_an_already_ledgered_key_still_works_in_maintenance"
+      }
+    ],
+    "note": "The store-level gate is domain-tested directly against submit_attempt_result; the literal HTTP 503 CONTROLLER_MAINTENANCE wire body cannot be exercised end-to-end because no attempts/results HTTP transport exists yet (see registration_http.py / run_commands_http.py for the only two endpoints wired to HTTP so far)."
+  },
+  {
+    "case_id": "fim.attempt_capability_request_arrives_fixed_authentication_expiry",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_attempt_results.py",
+        "function": "test_result_after_capability_auth_expiry_creates_no_registry_row"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_liveness.py",
+        "function": "test_liveness_at_or_after_execution_deadline_is_refused"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.non_result_attempt_endpoint_called_during_post",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_attempt_liveness.py",
+        "function": "test_liveness_at_or_after_execution_deadline_is_refused"
+      }
+    ],
+    "note": "Liveness is confirmed to deny in the post-deadline grace window; launch/source/upload/rotation denial in the same window is not each confirmed by a same-named test."
+  },
+  {
+    "case_id": "fim.result_payload_union_fuzzed_across_activity_outcome",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_attempt_results.py",
+        "function": "test_verify_receipt_missing_is_rejected"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_results.py",
+        "function": "test_verify_receipt_candidate_mismatch_is_rejected"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_results.py",
+        "function": "test_verify_receipt_outcome_result_mismatch_is_rejected"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_results.py",
+        "function": "test_verify_receipt_stale_profile_hash_is_rejected"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_results.py",
+        "function": "test_verify_receipt_rejects_non_null_launch_attestation_id"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.liveness_responses_lost_reordered_duplicated_redis_flushed",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_attempt_liveness.py",
+        "function": "test_replayed_sequence_never_rewinds_state"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_liveness.py",
+        "function": "test_skipped_sequence_is_accepted_and_advances"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_liveness.py",
+        "function": "test_lower_sequence_after_a_higher_one_does_not_rewind"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.unclaimed_offer_reaches_claim_deadline_capacity_provider",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_attempt_deadlines.py",
+        "function": "test_claim_deadline_expires_offered_attempt_and_replans_activity"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_deadlines.py",
+        "function": "test_claim_deadline_allows_offer_and_records_compatible_capacity"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.accepted_worker_result_reports_infrastructure_authenticated_pool",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_worker_loss_reports.py",
+        "function": "test_accepted_report_terminalizes_attempt_and_returns_activity_to_planned"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_results.py",
+        "function": "test_verify_receipt_error_admits_failed_retryable_with_verification_error"
+      }
+    ],
+    "note": "The pool-manager worker-loss path (WORKER_LOST TerminalFact/terminal_reason) is covered exactly; a Result-path INFRASTRUCTURE outcome producing ordinary FAILED plus WORKER_LOST Recovery Evidence without a TerminalFact was not confirmed by a same-named test distinguishing the two paths."
+  },
+  {
+    "case_id": "fim.no_capacity_claim_deadline_occurs_review_adjudication",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_attempt_deadlines.py",
+        "function": "test_panel_claim_deadline_coalesces_when_a_peer_is_still_claimed"
+      },
+      {
+        "module": "tests/workflow_store/test_wait_conditions.py",
+        "function": "test_submit_recovery_evidence_drops_panel_slot_raced_to_live_attempt"
+      },
+      {
+        "module": "tests/workflow_store/test_wait_conditions.py",
+        "function": "test_submit_recovery_evidence_panel_already_satisfied_when_all_slots_race_away"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.worker_destroyed_uncommitted_edits",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_worker_loss_reports.py",
+        "function": "test_accepted_report_terminalizes_attempt_and_returns_activity_to_planned"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.old_new_workers_coexist",
+    "status": "deferred",
+    "confidence": null,
+    "refs": [],
+    "note": "No CapacityPool/template/principal/stream/consumer-group class-separation code exists yet. `capacity_pool.template_class` (LEGACY / V1_CLONE_FIXED) is only a registered enum literal (workflow_contract/v1/enums.py) -- nothing in submit_capacity_report, submit_worker_loss_report, or claim_attempt reads or enforces it, and there is no WorkerSession/pool registration table with a class column. This is a production gap, not a test gap; it belongs to the v1 pool-manager/worker-session protocol leaf, not this issue's test-only scope."
+  },
+  {
+    "case_id": "fim.legacy_worker_pel_reaper_injected_against_v1",
+    "status": "deferred",
+    "confidence": null,
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_legacy_exclusion_true_while_run_is_live"
+      },
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_legacy_exclusion_aggregates_all_matching_publications"
+      },
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_legacy_exclusion_survives_active_terminal_cleanup_reservation"
+      }
+    ],
+    "note": "The Publication/Change-Request ownership dimension of this row IS implemented and tested: is_change_request_excluded_from_legacy_database/_engine give the legacy orchestrator a read-only exclusion set it must honor, hardened further here against wrong-repo/unknown-ref/terminal-cleanup-race inputs. The Redis stream/PEL-reaper/claim/ACK/delete/synthetic-Result dimension of this row has no v1 counterpart to inject against yet (see old_new_workers_coexist) -- there is no v1 Redis consumer group, principal, or worker-loss transport for a legacy reaper to collide with beyond the store-level orcest.worker-loss/1 API already exercised in test_worker_loss_reports.py."
+  },
+  {
+    "case_id": "fim.review_receipts_arrive_all_permutations",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_reducer/test_reduce.py",
+        "function": "test_review_receipts_in_either_order_reach_aggregating"
+      },
+      {
+        "module": "tests/workflow_reducer/test_ledger.py",
+        "function": "test_reordered_equivalent_reviews_share_aggregating_pointers"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.remediation_produces_new_candidate_more_review_adjudication",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_attempt_results.py",
+        "function": "test_adjudication_overrule_reopens_next_panel_round_with_real_slots"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.reviewer_provider_capacity_disappears",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_offer_gate.py",
+        "function": "test_capacity_available_requires_both_profile_and_pool_health"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.multiple_panel_results_terminal_facts_race_peer",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_wait_conditions.py",
+        "function": "test_wake_capacity_waits_panel_is_all_or_none"
+      },
+      {
+        "module": "tests/workflow_store/test_wait_conditions.py",
+        "function": "test_submit_recovery_evidence_drops_panel_slot_raced_to_live_attempt"
+      },
+      {
+        "module": "tests/workflow_store/test_wait_conditions.py",
+        "function": "test_submit_recovery_evidence_panel_already_satisfied_when_all_slots_race_away"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.all_compatible_capacity_disappears_later_authenticated_pool",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_capacity_reports.py",
+        "function": "test_wakes_waiting_capacity_run_and_returns_wait_condition_id"
+      },
+      {
+        "module": "tests/workflow_store/test_capacity_reports.py",
+        "function": "test_unavailable_observation_does_not_wake_waiting_capacity_run"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.review_adjudication_panel_planned_no_complete_legal",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_wait_conditions.py",
+        "function": "test_create_wait_condition_freezes_planned_panel_slots"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.provider_rate_limit_result_supplies_past_excessively",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_reducer/test_recovery.py",
+        "function": "test_provider_retry_after_is_duration_from_accepted_at"
+      },
+      {
+        "module": "tests/workflow_reducer/test_recovery.py",
+        "function": "test_provider_retry_after_duration_is_clamped_to_policy_ceiling"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.evidence_wait_selection_races_accepted_target_observation",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_wait_conditions.py",
+        "function": "test_wake_due_wait_timers_wakes_exactly_once"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.provider_credential_rotates_availability_was_observed_prior",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_health_probes.py",
+        "function": "test_provider_probe_suspends_and_available_recheck_resumes_exact_member"
+      },
+      {
+        "module": "tests/workflow_store/test_health_probes.py",
+        "function": "test_unrelated_available_integrity_probe_cannot_wake_storage_wait"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.capacity_report_worker_loss_report_response_lost",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_capacity_reports.py",
+        "function": "test_replaying_same_report_id_and_body_returns_stored_response"
+      },
+      {
+        "module": "tests/workflow_store/test_worker_loss_reports.py",
+        "function": "test_replaying_same_idempotency_key_returns_stored_response"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.forge_provider_integrity_probe_crashes_i_o",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_health_probes.py",
+        "function": "test_health_probe_request_is_persisted_with_outbox_before_probe_io"
+      },
+      {
+        "module": "tests/workflow_store/test_health_probes.py",
+        "function": "test_health_probe_request_identity_conflict_is_rejected"
+      },
+      {
+        "module": "tests/workflow_store/test_health_probes.py",
+        "function": "test_health_probe_matrix_is_closed"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.forge_polling_search_crashes_i_o_transient",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_forge_observations.py",
+        "function": "test_transient_failure_leaves_request_and_outbox_pending"
+      },
+      {
+        "module": "tests/workflow_store/test_forge_observations.py",
+        "function": "test_late_failure_fact_after_completion_is_rejected"
+      },
+      {
+        "module": "tests/workflow_store/test_forge_observations.py",
+        "function": "test_due_request_rejects_stale_expected_observation_fence"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.ordinary_forge_schedule_becomes_due_pending_response",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_forge_observations.py",
+        "function": "test_maintenance_mode_creates_no_request"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.successful_initial_project_register_response_lost_controller",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_project_registration.py",
+        "function": "test_lost_response_replays_byte_identically"
+      },
+      {
+        "module": "tests/workflow_store/test_project_registration.py",
+        "function": "test_fault_before_commit_leaves_no_project_or_schedule"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.work_item_discovery_returns_empty_repeats_unchanged",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_forge_observations.py",
+        "function": "test_a_b_a_sequence_records_three_observations_but_adjacent_repeat_coalesces"
+      },
+      {
+        "module": "tests/workflow_store/test_forge_observations.py",
+        "function": "test_adapter_event_id_replay_is_idempotent_and_conflict_is_rejected"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.discovery_adds_removes_work_item_completes_project",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_forge_observations.py",
+        "function": "test_discovery_completion_creates_children_deterministically"
+      },
+      {
+        "module": "tests/workflow_store/test_forge_observations.py",
+        "function": "test_discovery_completion_preserves_paused_children_and_never_reactivates"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.initial_publication_complete_marker_search_returns_live",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_one_observation_cannot_satisfy_pre_and_post_base_phases"
+      },
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_multiple_live_selects_bytewise_lowest_and_does_not_link"
+      },
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_merged_terminal_closes_publication_and_creates_reservation"
+      },
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_zero_live_no_terminal_does_not_mutate"
+      },
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_zero_live_closed_terminal_closes_publication_without_reservation"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.probe_completion_commits_fanout_crashes_affected_run",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_health_probes.py",
+        "function": "test_health_probe_unavailable_suspends_only_frozen_members_and_replays_once"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.logical_forge_credential_rotates_connectivity_probe_adapter",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_forge_observations.py",
+        "function": "test_adapter_event_id_replay_rejects_changed_credential_binding"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.two_health_probe_requests_freeze_same_prior",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_health_probes.py",
+        "function": "test_health_probe_request_identity_conflict_is_rejected"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.capacity_report_expiry_set_equal_just_beyond",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_capacity_reports.py",
+        "function": "test_expires_at_ms_outside_ttl_bound_is_rejected"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.budget_report_missing_stale_reports_exact_limit",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_budget_reports.py",
+        "function": "test_submit_budget_report_derives_exhausted"
+      },
+      {
+        "module": "tests/workflow_store/test_budget_reports.py",
+        "function": "test_expiry_is_bounded_by_reset_and_max_age"
+      },
+      {
+        "module": "tests/workflow_store/test_budget_reports.py",
+        "function": "test_available_report_freezes_and_wakes_same_project_waiting_budget_runs"
+      },
+      {
+        "module": "tests/workflow_store/test_budget_reports.py",
+        "function": "test_fanout_wakes_each_member_run_exactly_once"
+      },
+      {
+        "module": "tests/workflow_store/test_budget_reports.py",
+        "function": "test_run_budget_report_fanout_is_idempotent_and_resumable"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.candidate_edits_orcest",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_snapshot_admission.py",
+        "function": "test_unrelated_base_observation_does_not_change_admitted_snapshot"
+      },
+      {
+        "module": "tests/workflow_contract/test_project_bundle_compile.py",
+        "function": "test_compile_deterministic_across_clones"
+      }
+    ],
+    "note": "Snapshot-freeze immutability and compile determinism are tested; the specific narrative of a live mid-Run .orcest edit not perturbing the already-bound policy/hash is not exercised end to end under that framing."
+  },
+  {
+    "case_id": "fim.work_item_spec_changes",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_reducer/test_reduce.py",
+        "function": "test_policy_only_replan_reselects_prior_candidate_after_identity_revalidation"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.pending_work_item_change_b_trusted_base",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_snapshot_admission.py",
+        "function": "test_snapshot_capture_retains_ordered_provenance_and_blobs"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.policy_only_snapshot_supersedes_run_retained_candidate",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_reducer/test_reduce.py",
+        "function": "test_policy_only_replan_reselects_prior_candidate_after_identity_revalidation"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.active_work_item_closes_loses_labels",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_forge_observations.py",
+        "function": "test_discovery_completion_preserves_paused_children_and_never_reactivates"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.dependency_becomes_unknown_open_attempt_claimed_controller",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_reducer/test_contract_coverage.py",
+        "function": "test_every_legal_pair_has_one_expected_reduction"
+      }
+    ],
+    "note": "The generic legal-(state,trigger)-pair reducer skeleton includes the DEPENDENCY trigger; the specific restart-survives-without-hot-fencing-the-claim narrative is not isolated as its own scenario."
+  },
+  {
+    "case_id": "fim.target_observed_b",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_forge_observations.py",
+        "function": "test_a_b_a_sequence_records_three_observations_but_adjacent_repeat_coalesces"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.base_advances",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_base_mismatch_supersedes_effect_activity_and_pending_outbox"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.trusted_base_alone_advances_under_supersede_boundary",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_stale_generation_checkpoint_is_audit_only"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.specification_text_workflow_configuration_effective_policy_changes",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_reducer/test_reduce.py",
+        "function": "test_policy_only_replan_reselects_prior_candidate_after_identity_revalidation"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.controller_dies_publication_ref_creation",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_decide_ref_cas_used_end_to_end_with_publish_effect"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.controller_dies_change_request_creation",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_exact_create_proof_requires_the_create_response_observation"
+      },
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_one_live_advances_to_change_request_observed"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.controller_dies_publication_row_update",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_complete_publication_effect_replay_after_active_returns_checkpoint"
+      },
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_complete_publication_effect_replay_after_active_with_fresh_checkpoint_id"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.pr_head_advances_during_remediation",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_base_mismatch_supersedes_effect_activity_and_pending_outbox"
+      },
+      {
+        "module": "tests/workflow_store/test_post_publication_remediation.py",
+        "function": "test_ref_update_cas_mismatch_supersedes_update_effect"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.external_actor_advances_owned_pr_head_during",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_post_link_base_mismatch_supersedes_effect_and_blocks_completion"
+      },
+      {
+        "module": "tests/workflow_store/test_post_publication_remediation.py",
+        "function": "test_ref_read_cas_mismatch_does_not_affect_stale_generation"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.base_advances_initial_ref_mutation",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_plan_publish_effect_second_generation_increments"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.base_advances_provisional_change_request_observation_but",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_plan_publish_effect_replan_after_provisional_ref_uses_concrete_cas"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.publishing_supersede_boundary_base_mismatch_commits_pending",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_snapshot_admission.py",
+        "function": "test_later_snapshot_installation_plans_mandatory_replan"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.base_advances_again_higher_initial_effect_s",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_plan_publish_effect_replan_after_ambiguous_ref_reconciliation_uses_concrete_cas"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.deterministic_publication_ref_contains_foreign_sha_linkage",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_plan_publish_effect_replan_does_not_adopt_foreign_observed_ref"
+      },
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_plan_publish_effect_linked_replan_never_adopts_stale_foreign_ref"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.pre_link_foreign_sha_valid_git_but",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_plan_publish_effect_replan_does_not_adopt_foreign_observed_ref"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.pre_link_foreign_sha_carries_positive_incompatible",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_record_publication_ownership_conflict_creates_fact_and_boundary"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.changed_typed_complete_change_request_search_result",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_record_reconciliation_fact_redundant_publications_proven"
+      },
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_multiple_live_selects_bytewise_lowest_and_does_not_link"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.changed_post_link_typed_complete_change_request",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_zero_live_no_terminal_does_not_mutate"
+      },
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_conflicting_one_live_after_prior_association_raises"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.individual_discovery_head_feedback_merge_close_observation",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_post_publication_remediation.py",
+        "function": "test_ref_read_cas_mismatch_does_not_affect_stale_generation"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.associated_owned_change_request_has_missing_byte",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_post_publication_remediation.py",
+        "function": "test_plan_and_complete_repair_run_marker_activity"
+      },
+      {
+        "module": "tests/workflow_store/test_post_publication_remediation.py",
+        "function": "test_plan_repair_run_marker_activity_supersedes_prior_active"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.run_marker_repair_response_lost_body_head",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_post_publication_remediation.py",
+        "function": "test_plan_repair_run_marker_activity_replay_is_idempotent"
+      },
+      {
+        "module": "tests/workflow_store/test_post_publication_remediation.py",
+        "function": "test_plan_repair_run_marker_activity_replay_conflict_on_outbox_destination_mismatch"
+      },
+      {
+        "module": "tests/workflow_store/test_post_publication_remediation.py",
+        "function": "test_complete_repair_run_marker_replay_after_terminal_is_noop"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.linked_live_v1_change_request_loses_duplicates",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_legacy_exclusion_true_while_run_is_live"
+      },
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_legacy_exclusion_aggregates_all_matching_publications"
+      },
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_legacy_exclusion_false_for_unknown_ref"
+      },
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_legacy_exclusion_snapshot_is_repository_scoped"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.duplicate_head_marker_ref_equivalence_complete_set",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_terminal_duplicate_cleanup_action_processes_one_member_at_a_time"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.redundant_close_response_lost_ambiguous",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_complete_terminal_duplicate_cleanup_action_replay_conflict_raises"
+      },
+      {
+        "module": "tests/workflow_store/test_post_publication_remediation.py",
+        "function": "test_plan_close_publication_activity_replay_conflict_on_outbox_destination_mismatch"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.exact_redundant_close_observation_commits_controller_crashes",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_complete_terminal_duplicate_cleanup_action_rejects_wrong_outcome"
+      },
+      {
+        "module": "tests/workflow_store/test_post_publication_remediation.py",
+        "function": "test_complete_close_publication_possible_create_closes_publication"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.complete_search_proves_positive_merged_terminal_live",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_merged_terminal_closes_publication_and_creates_reservation"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.terminal_duplicate_cleanup_classifies_member_as_positive",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_terminal_duplicate_cleanup_action_processes_one_member_at_a_time"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.terminal_duplicate_close_detach_response_lost_cas",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_complete_terminal_duplicate_cleanup_action_replay_conflict_raises"
+      },
+      {
+        "module": "tests/workflow_store/test_post_publication_remediation.py",
+        "function": "test_complete_close_publication_possible_create_superseded_is_noop"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.controller_crashes_terminal_cleanup_outcome_but_selecting",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_terminal_duplicate_cleanup_action_processes_one_member_at_a_time"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.stale_publication_effect_returns_newer_intent",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_plan_publish_effect_replay_conflict_raises"
+      },
+      {
+        "module": "tests/workflow_store/test_publications.py",
+        "function": "test_stale_complete_checkpoint_is_audit_only"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.attempt_credential_rotation_dies_applied_transaction",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_credential_rotation.py",
+        "function": "test_stale_prior_version_yields_cas_lost_with_no_side_effects"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.attempt_credential_rotation_loses_prior_version_cas",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_credential_rotation.py",
+        "function": "test_cas_lost_replay_matches_and_conflicts_correctly"
+      },
+      {
+        "module": "tests/workflow_store/test_credential_rotation.py",
+        "function": "test_stale_prior_version_yields_cas_lost_with_no_side_effects"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.attempt_credential_rotation_dies_applied_reference_update",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_credential_rotation.py",
+        "function": "test_applied_replay_returns_identical_result_without_second_version"
+      },
+      {
+        "module": "tests/workflow_store/test_credential_rotation.py",
+        "function": "test_applied_rotation_rechecks_attempt_fence_at_install"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.each_needs_human_reason_injected",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_reducer/test_human_boundary.py",
+        "function": "test_every_boundary_reason_has_a_non_empty_resolution_mapping"
+      },
+      {
+        "module": "tests/workflow_store/test_human_boundary.py",
+        "function": "test_create_human_boundary_basic_shape"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.wait_wake_human_resolution_commits_controller_crashes",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_human_boundary.py",
+        "function": "test_submit_human_resolution_replay_is_idempotent"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.panel_planning_cannot_staff_every_frozen_review",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_wait_conditions.py",
+        "function": "test_create_wait_condition_freezes_planned_panel_slots"
+      },
+      {
+        "module": "tests/workflow_store/test_wait_conditions.py",
+        "function": "test_wake_capacity_waits_panel_is_all_or_none"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.wait_has_durable_timer_typed_wake_evidence",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_wait_conditions.py",
+        "function": "test_create_wait_condition_rejects_missing_timer_and_wake"
+      },
+      {
+        "module": "tests/workflow_store/test_wait_conditions.py",
+        "function": "test_wake_due_wait_timers_wakes_exactly_once"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.secret_rotation_reaches_wait_s_minimum_version",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_wait_conditions.py",
+        "function": "test_wake_secret_recovery_wait_requires_minimum_version"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.integrity_probe_proves_candidate_workflow_blob_secret",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_health_probes.py",
+        "function": "test_health_probe_unavailable_suspends_only_frozen_members_and_replays_once"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.integrity_probe_instead_proves_exact_object_available",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_health_probes.py",
+        "function": "test_available_integrity_probe_resumes_recovering_run"
+      },
+      {
+        "module": "tests/workflow_store/test_health_probes.py",
+        "function": "test_available_integrity_recheck_wakes_exact_storage_wait"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.authorized_forge_specification_amendment_observed_specification_conflict",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_reducer/test_reduce.py",
+        "function": "test_recovery_evidence_enter_human_boundary_records_reason_pointer"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.controller_dies_compound_specification_amendment_safe_boundary",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_management_commands.py",
+        "function": "test_resolve_human_boundary_command_rejects_specification_amended"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.routine_timeout_capacity_test_review_failures_repeat",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_reducer/test_recovery.py",
+        "function": "test_repeated_non_progress_reaches_diagnosis_then_replan_boundary"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.same_verification_failure_reaches_maxrepaircyclesbeforediagnosis",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_reducer/test_recovery.py",
+        "function": "test_repeated_repair_fingerprint_reaches_diagnosis_boundary"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.same_consensus_blocker_sustained_new_adjudication_blocker",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_reducer/test_recovery.py",
+        "function": "test_repeated_non_progress_reaches_diagnosis_then_replan_boundary"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.gc_races_admission_backup",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_backup.py",
+        "function": "test_backup_copies_immutable_objects_after_releasing_storage_lock"
+      },
+      {
+        "module": "tests/workflow_store/test_retention.py",
+        "function": "test_collect_orphan_candidate_objects_skips_a_referenced_object"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.live_candidate_secret_version_workflow_blob_becomes",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_storage_restoration.py",
+        "function": "test_storage_restoration_fact_wakes_only_frozen_member_and_replays_once"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.startup_foreign_key_check_finds_only_missing",
+    "status": "deferred",
+    "confidence": null,
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_store.py",
+        "function": "test_unsupported_schema_can_fail_closed_as_maintenance"
+      }
+    ],
+    "note": "`_raise_unhealthy_startup` (store.py) treats ANY `PRAGMA foreign_key_check` row as a global StartupIntegrityError -> fail-closed MAINTENANCE; there is no narrower branch that distinguishes a missing-WorkflowBlob-parent violation, verifies its frozen digest/media kind, and runs the bounded exclusive-repair path the spec describes. The coarser global fail-closed behavior IS exercised (see the linked test), but the specific bounded repair contract this row requires is not yet implemented in production code -- it is a distinct piece of work, not a test gap."
+  },
+  {
+    "case_id": "fim.all_configured_backups_lack_live_object_authorized",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_storage_restoration.py",
+        "function": "test_begin_storage_restoration_operation_replay_returns_same_projection"
+      },
+      {
+        "module": "tests/workflow_store/test_storage_restoration.py",
+        "function": "test_complete_storage_restoration_operation_is_idempotent_and_cas_fenced"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.provisional_change_request_cancellation_races_merge",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_post_publication_remediation.py",
+        "function": "test_complete_close_publication_possible_create_superseded_is_noop"
+      },
+      {
+        "module": "tests/workflow_store/test_post_publication_remediation.py",
+        "function": "test_complete_close_publication_head_bound_superseded_is_noop"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.cancellation_arrives_change_request_authority_exists",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_post_publication_remediation.py",
+        "function": "test_plan_close_publication_activity_possible_create"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.cancellation_completes_current_reconciliation_proves_no_open",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_post_publication_remediation.py",
+        "function": "test_complete_close_publication_possible_create_closes_publication"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.change_request_creation_succeeds_externally_response_lost",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_post_publication_remediation.py",
+        "function": "test_plan_close_publication_activity_replay_is_idempotent"
+      },
+      {
+        "module": "tests/workflow_store/test_post_publication_remediation.py",
+        "function": "test_complete_close_publication_possible_create_rejects_head_bound_activity"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.cancellation_search_discovers_change_request_head_moves",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_post_publication_remediation.py",
+        "function": "test_complete_close_publication_head_bound_closes_publication"
+      },
+      {
+        "module": "tests/workflow_store/test_post_publication_remediation.py",
+        "function": "test_plan_close_publication_activity_supersedes_prior_active"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.current_head_feedback_contains_merge_conflict_failing",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_post_publication_remediation.py",
+        "function": "test_ref_update_cas_mismatch_supersedes_update_effect"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.validated_candidate_upload_expires_result_finalization",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_candidate_transfer.py",
+        "function": "test_expiring_validated_upload_discards_staged_bundle"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.upload_expiry_races_validation_promotion_first_candidate",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_candidate_transfer.py",
+        "function": "test_expiry_at_equality_wins_for_put_and_replays_exact_body"
+      },
+      {
+        "module": "tests/workflow_store/test_candidate_transfer.py",
+        "function": "test_mid_promotion_expiry_discards_staged_bundle_and_created_object"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.content_put_first_candidate_result_independently_hit",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_candidate_transfer.py",
+        "function": "test_expiry_at_equality_wins_for_put_and_replays_exact_body"
+      },
+      {
+        "module": "tests/workflow_store/test_attempt_results.py",
+        "function": "test_expired_upload_result_records_upload_expired_without_terminalizing"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.backup_requested_claimed_attempt_submitting_near_execution",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_backup.py",
+        "function": "test_backup_barrier_times_out_with_claimed_attempts"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.backup_barrier_exceeds_backup_barrier_max_ms",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_backup.py",
+        "function": "test_backup_barrier_times_out_with_claimed_attempts"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.backup_restore_run_storagerestorationoperation_pending",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_backup.py",
+        "function": "test_backup_captures_sqlite_and_object_stores_and_writes_verified_manifest"
+      },
+      {
+        "module": "tests/workflow_store/test_storage_restoration.py",
+        "function": "test_list_pending_storage_restoration_operations_excludes_terminal"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.backup_restore_runs_retained_terminal_secret_restoration",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_backup.py",
+        "function": "test_backup_never_writes_plaintext_secret_bytes"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.backup_restore_runs_retained_applied_cas_lost",
+    "status": "deferred",
+    "confidence": null,
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_credential_rotation.py",
+        "function": "test_secret_version_fanout_cursor_is_restartable_and_idempotent"
+      }
+    ],
+    "note": "Credential Rotation Request replay/fanout durability is tested at the store layer, but backup/restore's handling of retained APPLIED/CAS_LOST Credential Rotation Request replay metadata specifically is not exercised -- retention.py's own docstring states 'CredentialRotationRequest replay metadata ... retention [is] owned by their own leaves and are out of scope here', confirming this half of the row belongs to a different, not-yet-landed leaf rather than to this issue."
+  },
+  {
+    "case_id": "fim.terminal_secret_operation_replay_metadata_cleanup_races",
+    "status": "deferred",
+    "confidence": null,
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_retention.py",
+        "function": "test_collect_terminal_staging_never_touches_a_pending_operation"
+      }
+    ],
+    "note": "retention.py explicitly scopes 'Secret Provision staging, CredentialRotationRequest replay metadata, and Terminal Duplicate Cleanup Reservation retention are owned by their own leaves and are out of scope here' (module docstring). The atomic purge-metadata-only-with-Operation-retention guarantee this row requires has no implementation to test against yet."
+  },
+  {
+    "case_id": "fim.controller_secret_store_fails_each_secret_provision",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_secret_provision.py",
+        "function": "test_record_retry_checkpoint_keeps_operation_pending"
+      },
+      {
+        "module": "tests/workflow_store/test_secret_provision.py",
+        "function": "test_crash_between_accept_and_install_resumes_the_same_target_version"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.controller_crashes_secret_version_commit_prefix_affected",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_credential_rotation.py",
+        "function": "test_secret_version_fanout_cursor_is_restartable_and_idempotent"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.secret_provision_202_response_lost_asynchronous_completion",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_secret_provision.py",
+        "function": "test_identical_replay_returns_same_response"
+      },
+      {
+        "module": "tests/workflow_store/test_secret_provision.py",
+        "function": "test_replay_after_missing_secret_metadata_does_not_change_persisted_attestation"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.secret_provision_retry_discovers_lost_cas_revoked",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_secret_provision.py",
+        "function": "test_stale_prior_version_is_rejected_cas_lost"
+      },
+      {
+        "module": "tests/workflow_store/test_secret_provision.py",
+        "function": "test_revoked_authority_is_rejected_with_403"
+      },
+      {
+        "module": "tests/workflow_store/test_secret_provision.py",
+        "function": "test_owner_purpose_matrix_violation_is_integrity_conflict"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.corrected_secret_provision_follows_terminally_rejected_operation",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_secret_provision.py",
+        "function": "test_rejection_releases_target_version_for_a_corrected_request"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.backup_restore_run_secretprovisionoperation_pending",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_secret_provision.py",
+        "function": "test_record_retry_checkpoint_keeps_operation_pending"
+      },
+      {
+        "module": "tests/workflow_store/test_backup.py",
+        "function": "test_backup_captures_sqlite_and_object_stores_and_writes_verified_manifest"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.orphan_secret_provision_staging_races_acceptance_gc",
+    "status": "automated",
+    "confidence": "thematic",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_retention.py",
+        "function": "test_collect_terminal_staging_continues_when_staged_object_vanishes"
+      },
+      {
+        "module": "tests/workflow_store/test_secret_provision.py",
+        "function": "test_concurrent_reservation_of_the_same_target_is_cas_lost"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.backup_restored_empty_redis",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_storage_restoration.py",
+        "function": "test_advance_redis_epoch_is_monotonic"
+      },
+      {
+        "module": "tests/workflow_store/test_offer_projection.py",
+        "function": "test_reconstruction_is_reachable_from_a_fresh_process_boundary"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.accepted_management_command_response_lost",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_management_commands.py",
+        "function": "test_cancel_command_replays_identical_body"
+      },
+      {
+        "module": "tests/workflow_store/test_management_commands.py",
+        "function": "test_cancel_command_id_reuse_with_different_body_conflicts"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.storage_restoration_202_lost_reconciliation_reaches_restored",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_storage_restoration.py",
+        "function": "test_begin_storage_restoration_operation_replay_returns_same_projection"
+      },
+      {
+        "module": "tests/workflow_store/test_storage_restoration.py",
+        "function": "test_complete_storage_restoration_operation_is_idempotent_and_cas_fenced"
+      },
+      {
+        "module": "tests/workflow_store/test_storage_restoration.py",
+        "function": "test_fail_storage_restoration_operation_is_idempotent_and_cas_fenced"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.project_registration_accepted_business_rejection_response_lost",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_project_registration.py",
+        "function": "test_same_key_different_body_conflicts_without_mutation"
+      },
+      {
+        "module": "tests/workflow_store/test_project_registration.py",
+        "function": "test_stale_revision_revalidate_is_cas_without_operation"
+      },
+      {
+        "module": "tests/workflow_store/test_project_registration.py",
+        "function": "test_concurrent_register_cannot_steal_repository"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "fim.controller_endpoint_attempted_over_plaintext_http_including",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_project_registration.py",
+        "function": "test_registration_tls_client_cert_requirement_is_configurable"
+      },
+      {
+        "module": "tests/workflow_store/test_project_registration.py",
+        "function": "test_cli_onboard_rejects_plaintext_and_disabled_tls"
+      }
+    ],
+    "note": ""
+  }
+]
