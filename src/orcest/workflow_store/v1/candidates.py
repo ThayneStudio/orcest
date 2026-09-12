@@ -33,6 +33,7 @@ from orcest.workflow_store.v1.fs import (
     digest_hex,
     fsync_dir,
     promote_no_clobber,
+    quarantine_file,
     read_exact_file,
     trusted_join,
     write_incoming_bytes,
@@ -223,7 +224,40 @@ class CandidateObjectStore:
         record = self.verify(bundle_digest)
         return read_exact_file(self._dest(record), max_bytes=self._quota.max_object_bytes)
 
+    def installed_mtime_ms(self, bundle_digest: str) -> int:
+        """Filesystem modification time of an installed object, for GC's
+        age-based orphan grace period (persistence-and-recovery.md
+        "Retention and garbage collection"). Never trusted as lifecycle
+        authority -- only as a physical age floor before the reference
+        recheck that must gate every deletion."""
+        record = self.verify(bundle_digest)
+        try:
+            return int(self._dest(record).stat().st_mtime * 1000)
+        except FileNotFoundError as exc:
+            raise ObjectNotFoundError("Candidate object is not installed") from exc
+
+    def quarantine(self, bundle_digest: str) -> None:
+        """Move an installed object out of the live CAS into quarantine.
+
+        Callers MUST already hold ``self._lock`` (the shared storage
+        mutation lock) and MUST have just rechecked there is no live
+        database reference to ``bundle_digest`` -- this method performs no
+        reference check of its own.
+        """
+        record = self.verify(bundle_digest)
+        dest = self._dest(record)
+        quarantine_dir = trusted_join(self._root, "quarantine")
+        quarantine_file(src=dest, quarantine_dir=quarantine_dir, store_root=self._root)
+
     def iter_objects(self) -> Iterator[CandidateObjectRecord]:
+        for record in self.iter_object_inventory():
+            try:
+                yield self.verify(record.bundle_digest)
+            except ObjectNotFoundError:
+                continue
+
+    def iter_object_inventory(self) -> Iterator[CandidateObjectRecord]:
+        """List installed identities using names and stat data without reading payloads."""
         objects_sha = trusted_join(self._root, "objects", "sha256")
         if not objects_sha.is_dir():
             return
@@ -236,7 +270,15 @@ class CandidateObjectStore:
                 if not child.name.endswith(".bundle"):
                     continue
                 digest = f"sha256:{child.name[: -len('.bundle')]}"
-                yield self.verify(digest)
+                try:
+                    byte_length = child.stat().st_size
+                except FileNotFoundError:
+                    continue
+                yield CandidateObjectRecord(
+                    bundle_digest=digest,
+                    byte_length=byte_length,
+                    storage_key=child.relative_to(self._root).as_posix(),
+                )
 
     def _verify_at(self, path: Path, expected: CandidateObjectRecord) -> CandidateObjectRecord:
         data = read_exact_file(path, max_bytes=self._quota.max_object_bytes)

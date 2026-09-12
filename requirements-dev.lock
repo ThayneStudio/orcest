@@ -18,6 +18,10 @@ certifi==2026.5.20
     #   httpcore
     #   httpx
     #   requests
+cffi==2.1.1
+    # via
+    #   -c requirements.lock
+    #   cryptography
 charset-normalizer==3.4.7
     # via
     #   -c requirements.lock
@@ -30,6 +34,10 @@ click==8.3.1
     #   uvicorn
 coverage==7.16.0
     # via pytest-cov
+cryptography==41.0.7
+    # via
+    #   -c requirements.lock
+    #   orcest (pyproject.toml)
 fakeredis==2.37.1
     # via orcest (pyproject.toml)
 fastapi==0.141.1
@@ -101,6 +109,10 @@ proxmoxer==2.3.0
     # via
     #   -c requirements.lock
     #   orcest (pyproject.toml)
+pycparser==3.0
+    # via
+    #   -c requirements.lock
+    #   cffi
 pydantic==2.13.5
     # via fastapi
 pydantic-core==2.46.5
