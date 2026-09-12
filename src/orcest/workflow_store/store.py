@@ -123,7 +123,7 @@ from orcest.workflow_contract.v1.verification import (
     verification_profile_from_effective_policy,
 )
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 CONTROLLER_COMPATIBILITY_VERSION = 1
 _NEW_ATTEMPT_TERMINAL_FACT_COLUMNS = {
     "expected_deadline_ms": "INTEGER",
@@ -6666,6 +6666,126 @@ CREATE TABLE IF NOT EXISTS storage_restoration_operations (
       AND terminal_at_ms IS NOT NULL)
   )
 );
+
+CREATE TABLE IF NOT EXISTS rollout_projection (
+  controller_id TEXT PRIMARY KEY CHECK (controller_id = '{CONTROLLER_ID}'),
+  stage INTEGER NOT NULL CHECK (stage BETWEEN 0 AND 5),
+  stage_revision INTEGER NOT NULL CHECK (stage_revision >= 0),
+  status TEXT NOT NULL CHECK (
+    status IN ({_sql_in(_enum_values("rollout_projection.status"))})
+  ),
+  last_operation_id TEXT,
+  entered_at_ms INTEGER CHECK (entered_at_ms IS NULL OR entered_at_ms >= 0),
+  observation_started_at_ms INTEGER CHECK (
+    observation_started_at_ms IS NULL OR observation_started_at_ms >= 0
+  ),
+  publication_enabled INTEGER NOT NULL CHECK (publication_enabled IN (0, 1)),
+  legacy_admissions_frozen INTEGER NOT NULL CHECK (legacy_admissions_frozen IN (0, 1)),
+  raw_task_credentials_removed INTEGER NOT NULL CHECK (raw_task_credentials_removed IN (0, 1)),
+  historical_readonly_retained INTEGER NOT NULL CHECK (historical_readonly_retained IN (0, 1)),
+  FOREIGN KEY (last_operation_id)
+    REFERENCES rollout_operations(rollout_operation_id) ON DELETE RESTRICT,
+  CHECK ((stage_revision = 0 AND status = 'UNINITIALIZED')
+    OR (stage_revision > 0 AND status != 'UNINITIALIZED'))
+);
+
+CREATE TABLE IF NOT EXISTS rollout_operations (
+  rollout_operation_id TEXT PRIMARY KEY,
+  protocol_version TEXT NOT NULL,
+  operation_kind TEXT NOT NULL CHECK (
+    operation_kind IN ({_sql_in(_enum_values("rollout_operation.kind"))})
+  ),
+  expected_stage INTEGER NOT NULL CHECK (expected_stage BETWEEN 0 AND 5),
+  expected_stage_revision INTEGER NOT NULL CHECK (expected_stage_revision >= 0),
+  requested_stage INTEGER CHECK (requested_stage IS NULL OR requested_stage BETWEEN 0 AND 5),
+  authenticated_principal_id TEXT NOT NULL,
+  authorization_context_digest TEXT NOT NULL,
+  request_digest TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (
+    status IN ({_sql_in(_enum_values("rollout_operation.status"))})
+  ),
+  rejection_code TEXT CHECK (
+    rejection_code IS NULL OR rejection_code IN (
+      {_sql_in(_enum_values("rollout_operation.rejection_code"))}
+    )
+  ),
+  result_stage INTEGER CHECK (result_stage IS NULL OR result_stage BETWEEN 0 AND 5),
+  result_stage_revision INTEGER CHECK (
+    result_stage_revision IS NULL OR result_stage_revision >= 0
+  ),
+  response_http_status INTEGER NOT NULL CHECK (response_http_status BETWEEN 100 AND 599),
+  response_json TEXT NOT NULL,
+  response_digest TEXT NOT NULL,
+  committed_at_ms INTEGER NOT NULL CHECK (committed_at_ms >= 0),
+  CHECK (
+    (status = 'SUCCEEDED' AND rejection_code IS NULL AND result_stage IS NOT NULL
+      AND result_stage_revision IS NOT NULL)
+    OR (status = 'REJECTED' AND rejection_code IS NOT NULL AND result_stage IS NULL
+      AND result_stage_revision IS NULL)
+  )
+);
+
+CREATE TABLE IF NOT EXISTS rollout_checklist_results (
+  rollout_operation_id TEXT NOT NULL
+    REFERENCES rollout_operations(rollout_operation_id) ON DELETE RESTRICT,
+  stage INTEGER NOT NULL CHECK (stage BETWEEN 0 AND 5),
+  gate TEXT NOT NULL CHECK (gate IN ({_sql_in(_enum_values("rollout_checklist.gate"))})),
+  item_id TEXT NOT NULL,
+  passed INTEGER NOT NULL CHECK (passed IN (0, 1)),
+  evidence_code TEXT NOT NULL,
+  detail TEXT NOT NULL,
+  PRIMARY KEY (rollout_operation_id, gate, item_id)
+);
+
+CREATE TABLE IF NOT EXISTS rollout_capacity_pools (
+  capacity_pool_id TEXT PRIMARY KEY,
+  template_class TEXT NOT NULL CHECK (
+    template_class IN ({_sql_in(_enum_values("capacity_pool.template_class"))})
+  ),
+  template_id TEXT NOT NULL UNIQUE,
+  pool_manager_principal_id TEXT NOT NULL UNIQUE,
+  redis_acl_identity TEXT NOT NULL UNIQUE,
+  redis_prefix TEXT NOT NULL UNIQUE,
+  consumer_group TEXT NOT NULL UNIQUE,
+  stream_namespace TEXT NOT NULL UNIQUE,
+  reaper_authority TEXT NOT NULL CHECK (
+    reaper_authority IN ({_sql_in(_enum_values("rollout_capacity_pool.reaper_authority"))})
+  ),
+  clone_credential_removal_attested INTEGER NOT NULL CHECK (
+    clone_credential_removal_attested IN (0, 1)
+  ),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS rollout_projects (
+  project_id TEXT PRIMARY KEY,
+  repository_locator TEXT NOT NULL UNIQUE,
+  engine TEXT NOT NULL CHECK (engine IN ({_sql_in(_enum_values("rollout_project.engine"))})),
+  cohort TEXT,
+  publication_enabled INTEGER NOT NULL CHECK (publication_enabled IN (0, 1)),
+  intake_enabled INTEGER NOT NULL CHECK (intake_enabled IN (0, 1)),
+  enabled_at_ms INTEGER NOT NULL CHECK (enabled_at_ms >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS rollout_evidence (
+  evidence_id TEXT PRIMARY KEY,
+  stage INTEGER NOT NULL CHECK (stage BETWEEN 0 AND 5),
+  item_id TEXT NOT NULL,
+  recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= 0),
+  UNIQUE (stage, item_id)
+);
+
+CREATE TABLE IF NOT EXISTS rollout_legacy_archive (
+  archive_id TEXT PRIMARY KEY,
+  project_id TEXT,
+  kind TEXT NOT NULL CHECK (
+    kind IN ({_sql_in(_enum_values("rollout_legacy_archive.kind"))})
+  ),
+  identity TEXT NOT NULL,
+  archived_at_ms INTEGER NOT NULL CHECK (archived_at_ms >= 0),
+  readonly INTEGER NOT NULL CHECK (readonly = 1),
+  UNIQUE (kind, identity)
+);
 """
 
 _V8_TO_V9 = f"""
@@ -7389,6 +7509,7 @@ _V18_TO_V19 = _SCHEMA[_SCHEMA.index("CREATE TABLE IF NOT EXISTS review_receipts"
 _V19_TO_V20 = _SCHEMA[_SCHEMA.index("CREATE TABLE IF NOT EXISTS publications") :]
 _V20_TO_V21 = _SCHEMA[_SCHEMA.index("CREATE TABLE IF NOT EXISTS management_commands") :]
 _V21_TO_V22 = _SCHEMA[_SCHEMA.index("CREATE TABLE IF NOT EXISTS controller_state") :]
+_V22_TO_V23 = _SCHEMA[_SCHEMA.index("CREATE TABLE IF NOT EXISTS rollout_projection") :]
 
 # Appended after whichever script actually put forge_observation_schedules into
 # its final shape (a plain CREATE TABLE for a fresh/pre-v5 database, or the
@@ -7586,6 +7707,7 @@ class RunStore:
             19,
             20,
             21,
+            22,
         }:
             raise SchemaVersionError(
                 f"unsupported workflow.db schema version {current}; "
@@ -8075,8 +8197,7 @@ class RunStore:
                         _now_ms(),
                     ),
                 )
-            else:
-                assert current == 21
+            elif current == 21:
                 self.conn.executescript("BEGIN EXCLUSIVE;\n" + _V21_TO_V22)
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -8084,6 +8205,18 @@ class RunStore:
                     (
                         SCHEMA_VERSION,
                         "workflow-control-v1-durable-restart-and-storage-recovery",
+                        _now_ms(),
+                    ),
+                )
+            else:
+                assert current == 22
+                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _V22_TO_V23)
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        "workflow-control-v1-staged-rollout",
                         _now_ms(),
                     ),
                 )
@@ -8112,6 +8245,15 @@ class RunStore:
                     _now_ms(),
                     _now_ms(),
                 ),
+            )
+            self.conn.execute(
+                "INSERT OR IGNORE INTO rollout_projection"
+                "(controller_id, stage, stage_revision, status, last_operation_id, "
+                "entered_at_ms, observation_started_at_ms, publication_enabled, "
+                "legacy_admissions_frozen, raw_task_credentials_removed, "
+                "historical_readonly_retained) "
+                "VALUES (?, 0, 0, 'UNINITIALIZED', NULL, NULL, NULL, 0, 0, 0, 0)",
+                (CONTROLLER_ID,),
             )
             self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self.conn.commit()

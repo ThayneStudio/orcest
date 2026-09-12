@@ -39,6 +39,9 @@ class IssueAction(str, Enum):
     SKIP_DELIVERY_COOLDOWN = "skip_delivery_cooldown"
     SKIP_VERIFYING = "skip_verifying"  # Durable delivery verification is in flight
     SKIP_DEPENDENCY = "skip_dependency"  # One or more prerequisite issues still open
+    SKIP_V1_OWNED = "skip_v1_owned"  # Reserved for the workflow-control v1 engine
+    SKIP_LEGACY_FROZEN = "skip_legacy_frozen"  # Stage 5 froze new legacy admissions
+    SKIP_V1_LOOKUP_UNAVAILABLE = "skip_v1_lookup_unavailable"
 
 
 @dataclass
@@ -115,12 +118,16 @@ def discover_actionable_issues(
     label_config: LabelConfig,
     max_attempts: int = 3,
     issue_delivery_verifier: IssueDeliveryVerifierConfig | None = None,
+    v1_owned_project: bool = False,
+    legacy_admissions_frozen: bool = False,
+    legacy_exclusion_unavailable: bool = False,
 ) -> list[IssueState]:
     """Discover issues labeled `orcest:ready` that need implementation.
 
     Filter cascade:
-    1. Fetch issues with the `orcest:ready` label
-    2. Skip if terminal `orcest:needs-human` label present
+    1. Exclude a project reserved for the workflow-control v1 engine
+    2. Fetch issues with the `orcest:ready` label
+    3. Skip if terminal `orcest:needs-human` label present
     3. Skip if Redis lock exists (worker in progress)
     4. Skip if usage-exhausted cooldown is active
     5. Skip if a nonterminal delivery-verification job holds the dispatch barrier
@@ -146,6 +153,13 @@ def discover_actionable_issues(
     verifier_config = issue_delivery_verifier or IssueDeliveryVerifierConfig()
     issues = gh.list_labeled_issues(repo, label_config.ready, token)
     results: list[IssueState] = []
+    skip_action: IssueAction | None = None
+    if legacy_exclusion_unavailable:
+        skip_action = IssueAction.SKIP_V1_LOOKUP_UNAVAILABLE
+    elif legacy_admissions_frozen:
+        skip_action = IssueAction.SKIP_LEGACY_FROZEN
+    elif v1_owned_project:
+        skip_action = IssueAction.SKIP_V1_OWNED
 
     # Cache of blocker issue states for the duration of this discovery cycle.
     # If 10 dependent issues all reference #5, we hit gh once.
@@ -158,6 +172,18 @@ def discover_actionable_issues(
         issue_labels: list[str] = [
             name for lbl in (issue_data.get("labels") or []) if (name := lbl.get("name"))
         ]
+
+        if skip_action is not None:
+            results.append(
+                IssueState(
+                    number=number,
+                    title=title,
+                    body=body,
+                    action=skip_action,
+                    labels=issue_labels,
+                )
+            )
+            continue
 
         # Skip if human intervention is required.
         if label_config.needs_human in issue_labels:

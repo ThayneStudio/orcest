@@ -74,6 +74,7 @@ class PRAction(str, Enum):
     # The v1 ownership snapshot could not be read, so fail closed without
     # pretending that an ownership association was actually observed.
     SKIP_V1_LOOKUP_UNAVAILABLE = "skip_v1_lookup_unavailable"
+    SKIP_LEGACY_FROZEN = "skip_legacy_frozen"  # Stage 5 froze new legacy admissions
 
 
 @dataclass
@@ -565,6 +566,7 @@ def discover_actionable_prs(
     stale_pending_timeout_seconds: int = 7200,
     legacy_exclusion_predicate: Callable[..., bool] | None = None,
     legacy_exclusion_unavailable: bool = False,
+    legacy_admissions_frozen: bool = False,
 ) -> list[PRState]:
     """Discover PRs that need action.
 
@@ -634,6 +636,21 @@ def discover_actionable_prs(
                     branch=branch,
                     head_sha=head_sha,
                     action=PRAction.SKIP_V1_LOOKUP_UNAVAILABLE,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                    base_branch=base_branch,
+                )
+            )
+            continue
+        if legacy_admissions_frozen:
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_LEGACY_FROZEN,
                     ci_failures=[],
                     review_threads=[],
                     labels=pr_labels,

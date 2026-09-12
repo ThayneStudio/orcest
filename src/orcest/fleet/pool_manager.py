@@ -57,6 +57,7 @@ from orcest.shared.provider_stream_health import (
     stream_health_snapshot_key,
 )
 from orcest.shared.redis_client import RedisClient
+from orcest.workflow_store.v1.isolation import is_legacy_pel_allowlisted, is_v1_protocol_stream
 
 logger = logging.getLogger(__name__)
 
@@ -2012,7 +2013,7 @@ class PoolManager:
                     "stream",
                 }:
                     raise RuntimeError(f"unexpected Redis TYPE output {key_type!r}")
-                if key_type == "stream":
+                if key_type == "stream" and is_legacy_pel_allowlisted(fq_key):
                     streams.add(fq_key)
         except Exception:
             logger.warning("Failed to discover task streams from Redis", exc_info=True)
@@ -2026,6 +2027,8 @@ class PoolManager:
     def _is_task_stream_key(key: str) -> bool:
         """Return True for backend task streams, not arbitrary tasks:* keys."""
         parts = key.split(":")
+        if is_v1_protocol_stream(key):
+            return False
         if len(parts) == 2:
             return parts[0] == "tasks" and bool(parts[1]) and parts[1] != "issue"
         if len(parts) == 3:
@@ -2286,6 +2289,14 @@ class PoolManager:
         task_streams, discovery_complete = self._task_streams_with_discovery_status()
         recovered_all = discovery_complete
         for fq_stream in task_streams:
+            if is_v1_protocol_stream(fq_stream) or not is_legacy_pel_allowlisted(fq_stream):
+                logger.warning(
+                    "Reaped VM %d: refusing legacy PEL authority on v1 stream %s",
+                    vm_id,
+                    fq_stream,
+                )
+                recovered_all = False
+                continue
             unrecovered_entries = False
             entries = self._read_consumer_pending(fq_stream, consumer)
             if entries is None:
@@ -2723,6 +2734,13 @@ class PoolManager:
             )
 
     def _safe_xack(self, fq_stream: str, entry_id: str) -> bool:
+        if is_v1_protocol_stream(fq_stream) or not is_legacy_pel_allowlisted(fq_stream):
+            logger.error(
+                "Refusing to ACK v1/non-legacy stream %s entry %s",
+                fq_stream,
+                entry_id,
+            )
+            return False
         try:
             self._redis.xack_raw(fq_stream, CONSUMER_GROUP, entry_id)
             return True

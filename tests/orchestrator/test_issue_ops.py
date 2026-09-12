@@ -996,3 +996,35 @@ def test_clear_attempts(fake_redis_client):
 
     clear_attempts(fake_redis_client, REPO, 200)
     assert get_attempt_count(fake_redis_client, REPO, 200) == 0
+
+
+def test_skip_v1_owned_project(issue_gh_mock, fake_redis_client, label_config):
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=1, labels=[{"name": label_config.ready}]),
+    ]
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+        v1_owned_project=True,
+    )
+
+    assert results[0].action == IssueAction.SKIP_V1_OWNED
+
+
+def test_skip_legacy_frozen_issues(issue_gh_mock, fake_redis_client, label_config):
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=1, labels=[{"name": label_config.ready}]),
+    ]
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+        legacy_admissions_frozen=True,
+    )
+
+    assert results[0].action == IssueAction.SKIP_LEGACY_FROZEN

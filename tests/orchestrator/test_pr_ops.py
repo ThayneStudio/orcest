@@ -139,6 +139,21 @@ def test_v1_association_lookup_failure_excludes_for_current_poll(
     gh_mock.get_ci_status.assert_not_called()
 
 
+def test_skip_pr_when_legacy_admissions_frozen(gh_mock, fake_redis_client, label_config):
+    gh_mock.list_open_prs.return_value = [_make_pr_data(number=10)]
+
+    results = discover_actionable_prs(
+        repo=REPO,
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        legacy_admissions_frozen=True,
+    )
+
+    assert results[0].action == PRAction.SKIP_LEGACY_FROZEN
+    gh_mock.get_ci_status.assert_not_called()
+
+
 def test_skip_labeled_pr(gh_mock, fake_redis_client, label_config):
     """A PR carrying a terminal orcest label is classified as SKIP_LABELED."""
     gh_mock.list_open_prs.return_value = [
