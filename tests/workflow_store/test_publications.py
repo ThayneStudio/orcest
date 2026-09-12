@@ -2725,3 +2725,81 @@ def test_legacy_exclusion_aggregates_all_matching_publications(store: RunStore) 
         repository_locator="test-org/test-repo",
         deterministic_ref=deterministic_publication_ref(RUN_ID),
     )
+
+
+def test_legacy_exclusion_survives_active_terminal_cleanup_reservation(store: RunStore) -> None:
+    """operations-and-rollout.md, required failure-injection matrix: "a linked
+    live-v1 Change Request loses, duplicates, or corrupts its body marker while
+    the legacy selector runs" -- "after positive-merged terminalization it also
+    excludes the selected ID/ref and every unresolved terminal-cleanup member
+    until their durable outcomes."
+
+    A MERGED terminal Run still carries an ACTIVE Terminal Duplicate Cleanup
+    Reservation for its LIVE duplicate members. The legacy exclusion query must
+    keep excluding that Run's ref/external-id for as long as the Reservation is
+    ACTIVE, even though ``runs.state`` is no longer one of the ordinary
+    nonterminal states the bare exclusion predicate checks.
+    """
+    _plan_effect(store)
+    members = (
+        _member(member_class="LIVE", change_request_external_id="1"),
+        _member(
+            member_class="TERMINAL",
+            change_request_external_id="9",
+            terminal_state="MERGED",
+            merge_commit=DESIRED_COMMIT,
+        ),
+    )
+    _record_search(
+        store,
+        change_request_search_result_id=SEARCH_RESULT_ID,
+        forge_observation_id=FORGE_OBS_ID,
+        publication_effect_checkpoint_id=CHECKPOINT_ID_1,
+        publication_id=PUBLICATION_ID,
+        effect_generation=1,
+        project_id=PROJECT_ID,
+        run_marker=render_run_marker(run_id=RUN_ID, publication_id=PUBLICATION_ID),
+        deterministic_ref=deterministic_publication_ref(RUN_ID),
+        external_revision="search-rev-1",
+        members=members,
+        terminal_publication_effect_checkpoint_id=CHECKPOINT_ID_2,
+        terminal_duplicate_cleanup_reservation_id=RESERVATION_ID,
+    )
+
+    publication = store.get_publication(PUBLICATION_ID)
+    assert publication is not None
+    assert publication.state == "CLOSED"
+    assert publication.terminal_duplicate_cleanup_reservation_id == RESERVATION_ID
+    reservation = store.get_terminal_duplicate_cleanup_reservation(RESERVATION_ID)
+    assert reservation is not None
+    assert reservation.state == "ACTIVE"
+
+    # This store-layer primitive closes the Publication and opens the cleanup
+    # Reservation, but the reducer-level "sets Run MERGED" transition this
+    # implies is a separate concern this file does not otherwise exercise (see
+    # test_legacy_exclusion_aggregates_all_matching_publications for the same
+    # pattern). Apply it directly so the Run is genuinely terminal by the bare
+    # 'runs.state NOT IN (...)' predicate, isolating what the ACTIVE-Reservation
+    # OR-clause alone is responsible for.
+    store.conn.execute(
+        "UPDATE runs SET state = 'MERGED', terminal_outcome = 'MERGED' WHERE run_id = ?",
+        (RUN_ID,),
+    )
+    run = store.get_run(RUN_ID)
+    assert run is not None
+    assert run.state == "MERGED"
+
+    owned_ref = deterministic_publication_ref(RUN_ID)
+    assert store.is_change_request_excluded_from_legacy_engine(
+        repository_locator="test-org/test-repo",
+        deterministic_ref=owned_ref,
+    ), "the terminalized Run's ref must stay excluded while its cleanup Reservation is ACTIVE"
+    assert is_change_request_excluded_from_legacy_database(
+        store.state_root,
+        repository_locator="test-org/test-repo",
+        deterministic_ref=owned_ref,
+    )
+    assert store.is_change_request_excluded_from_legacy_engine(
+        repository_locator="test-org/test-repo",
+        change_request_external_id="9",
+    ), "the terminal-linked Change Request itself must stay excluded too"

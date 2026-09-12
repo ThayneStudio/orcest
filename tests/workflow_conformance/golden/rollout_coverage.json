@@ -1,0 +1,113 @@
+[
+  {
+    "case_id": "vsr.controller_publishes_compatibility_matrix_in_readiness",
+    "status": "deferred",
+    "confidence": null,
+    "refs": [],
+    "note": "No controller readiness endpoint exists yet (registration_http.py and run_commands_http.py are the only two HTTP front doors implemented so far); there is no build-revision/schema-range/queue-protocol-range/controller-API-range/reducer-version/worker-profile-identity compatibility-matrix output to test."
+  },
+  {
+    "case_id": "vsr.new_major_protocol_uses_new_stream_names",
+    "status": "deferred",
+    "confidence": null,
+    "refs": [],
+    "note": "Every registered protocol literal in protocol_registry.py is still '/1'; there is no second major version and no stream-naming code keyed on protocol major version to test rejection/isolation against yet."
+  },
+  {
+    "case_id": "vsr.controller_dual_publish_only_with_single_winner_claim",
+    "status": "deferred",
+    "confidence": null,
+    "refs": [],
+    "note": "Dual-publish-across-versions has no implementation to test; it presumes the new-major-protocol stream-naming work above exists first."
+  },
+  {
+    "case_id": "vsr.rolling_worker_upgrade_canary_procedure",
+    "status": "deferred",
+    "confidence": null,
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_attempt_claims_launch.py",
+        "function": "test_launch_acceptance_consumes_one_shot_and_rejects_reused_isolation"
+      },
+      {
+        "module": "tests/workflow_store/test_worker_loss_reports.py",
+        "function": "test_accepted_report_terminalizes_attempt_and_returns_activity_to_planned"
+      }
+    ],
+    "note": "This is an operational rollout runbook (deploy canaries, run synthetic tests, widen the cohort, drain old workers, destroy idle capacity) rather than a single assertable outcome. The individual technical guarantees it leans on -- claim isolation, worker-loss handling -- are unit-tested elsewhere (linked); the sequencing itself is a rehearsed operator procedure, not something this test suite can execute end to end."
+  },
+  {
+    "case_id": "vsr.controller_api_accepts_preceding_compatible_worker_minor_version",
+    "status": "deferred",
+    "confidence": null,
+    "refs": [],
+    "note": "There is no versioned controller API (no HTTP transport for claim/launch/result/liveness endpoints yet) and therefore no minor-version-overlap-window logic to test."
+  },
+  {
+    "case_id": "vsr.database_migrations_forward_only_transactional",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_store.py",
+        "function": "test_schema_migration_rolls_back_as_one_transaction"
+      },
+      {
+        "module": "tests/workflow_store/test_store.py",
+        "function": "test_v1_database_migrates_capability_tables_and_backup_columns"
+      },
+      {
+        "module": "tests/workflow_store/test_store.py",
+        "function": "test_v20_database_migrates_management_command_tables"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "vsr.filesystem_rewrite_migration_runs_in_maintenance_with_journal",
+    "status": "deferred",
+    "confidence": null,
+    "refs": [],
+    "note": "No 'migration journal' concept exists in the codebase (confirmed by grep); migrations that would require a filesystem rewrite or table rebuild under a verified backup are not yet distinguished from ordinary transactional migrations."
+  },
+  {
+    "case_id": "vsr.stored_protocol_object_unknown_literal_rejected",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_contract/test_protocol_framework.py",
+        "function": "test_error_envelope_rejects_unknown_code"
+      },
+      {
+        "module": "tests/workflow_contract/test_protocol_framework.py",
+        "function": "test_known_protocol_literals_includes_registered_ones"
+      },
+      {
+        "module": "tests/workflow_contract/test_no_shadow_contracts.py",
+        "function": "test_no_shadow_protocol_version_literals"
+      }
+    ],
+    "note": ""
+  },
+  {
+    "case_id": "vsr.schema_reducer_version_skew_fails_closed",
+    "status": "automated",
+    "confidence": "exact",
+    "refs": [
+      {
+        "module": "tests/workflow_store/test_store.py",
+        "function": "test_unsupported_schema_can_fail_closed_as_maintenance"
+      },
+      {
+        "module": "tests/workflow_store/test_store.py",
+        "function": "test_create_run_rejects_unsupported_reducer_version"
+      },
+      {
+        "module": "tests/workflow_store/test_store.py",
+        "function": "test_unsupported_reducer_version_can_fail_closed_as_maintenance"
+      }
+    ],
+    "note": ""
+  }
+]
