@@ -30,6 +30,7 @@ from orcest.shared.provider_stream_health import (
 from orcest.shared.result_stream_health import (
     RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS,
     RESULT_PENDING_STALE_IDLE_SECONDS,
+    format_result_stream_metrics,
     result_consumer_heartbeat_key,
 )
 
@@ -259,6 +260,8 @@ def test_disconnected_redis(fake_redis_client, mocker):
     assert snap.redis_ok is False
     assert snap.queue_depths == {}
     assert snap.result_stream_health.inspection_error == ("test:results: inspection unavailable")
+    assert snap.result_stream_health.sampled_max_delivery_count is None
+    assert dict(format_result_stream_metrics(snap.result_stream_health))["Max deliveries"] == "--"
 
 
 def test_connection_lost_during_fetch(fake_redis_client, mocker):
@@ -274,6 +277,8 @@ def test_connection_lost_during_fetch(fake_redis_client, mocker):
     assert snap.redis_ok is False
     assert snap.queue_depths == {}
     assert snap.result_stream_health.inspection_error == ("test:results: inspection unavailable")
+    assert snap.result_stream_health.sampled_max_delivery_count is None
+    assert dict(format_result_stream_metrics(snap.result_stream_health))["Max deliveries"] == "--"
 
 
 # ---------------------------------------------------------------------------

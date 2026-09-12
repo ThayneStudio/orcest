@@ -15,6 +15,7 @@ from orcest.shared.result_stream_health import (
     format_result_stream_warning,
     inspect_result_stream_raw,
     result_consumer_heartbeat_key,
+    unavailable_result_stream_health,
 )
 
 pytestmark = pytest.mark.unit
@@ -229,9 +230,101 @@ def test_pending_inspection_stays_incomplete_when_shrink_does_not_explain_shortf
 
     assert health.sampled_pending == 0
     assert health.pending_inspection_complete is False
+    assert health.sampled_max_delivery_count is None
+    assert health.sampled_oldest_pending_idle_seconds is None
     assert health.inspection_error == (
         f"{stream}: pending result inspection ended after 0 of 101 entries"
     )
+    metrics = dict(format_result_stream_metrics(health))
+    assert metrics["Oldest pending idle"] == "--"
+    assert metrics["Max deliveries"] == "--"
+    assert metrics["Pending inspected"] == "0/101 incomplete"
+
+
+def test_first_pending_page_error_does_not_claim_zero_deliveries(fake_redis_client, mocker):
+    stream = fake_redis_client._prefixed(RESULTS_STREAM)
+    fake_redis_client.client.xadd(stream, {"task_id": "retained"})
+    _mock_group(mocker, fake_redis_client, pending=101, lag=0)
+    mocker.patch.object(
+        fake_redis_client.client,
+        "xpending_range",
+        side_effect=redis_lib.ResponseError("NOPERM secret endpoint detail"),
+    )
+
+    health = inspect_result_stream_raw(fake_redis_client, stream)
+
+    assert health.pending == 101
+    assert health.sampled_pending == 0
+    assert health.sampled_max_delivery_count is None
+    assert health.sampled_oldest_pending_idle_seconds is None
+    assert health.max_delivery_count is None
+    assert health.stale is False
+    assert health.inspection_error == (
+        f"{stream}: pending result inspection ResponseError after 0 of 101 entries"
+    )
+    assert "secret endpoint detail" not in str(health)
+    metrics = dict(format_result_stream_metrics(health))
+    assert metrics["Oldest pending idle"] == "--"
+    assert metrics["Max deliveries"] == "--"
+    assert metrics["Pending inspected"] == "0/101 incomplete"
+    warning = format_result_stream_warning(health)
+    assert warning is not None
+    assert warning.startswith("RESULT STREAM UNHEALTHY")
+    assert "max_deliveries=0" not in warning
+
+
+def test_empty_pending_still_reports_confirmed_zero_deliveries(fake_redis_client):
+    stream = fake_redis_client._prefixed(RESULTS_STREAM)
+
+    health = inspect_result_stream_raw(fake_redis_client, stream)
+
+    assert health.pending == 0
+    assert health.sampled_pending == 0
+    assert health.sampled_max_delivery_count == 0
+    assert health.pending_inspection_complete is True
+    metrics = dict(format_result_stream_metrics(health))
+    assert metrics["Max deliveries"] == "0"
+    assert metrics["Oldest pending idle"] == "--"
+    assert metrics["Pending inspected"] == "0/0"
+
+
+def test_unavailable_result_stream_does_not_claim_zero_deliveries():
+    health = unavailable_result_stream_health("test:results")
+
+    assert health.sampled_max_delivery_count is None
+    assert health.pending_inspection_complete is False
+    metrics = dict(format_result_stream_metrics(health))
+    assert metrics["Max deliveries"] == "--"
+    assert metrics["Oldest pending idle"] == "--"
+
+
+def test_consumer_liveness_error_with_pending_work_does_not_claim_zero_deliveries(
+    fake_redis_client, mocker
+):
+    stream = fake_redis_client._prefixed(RESULTS_STREAM)
+    fake_redis_client.client.xadd(stream, {"task_id": "retained"})
+    mocker.patch.object(
+        fake_redis_client.client,
+        "xinfo_groups",
+        return_value=[{"name": RESULTS_GROUP, "consumers": 1, "pending": 4, "lag": 0}],
+    )
+    mocker.patch.object(
+        fake_redis_client.client,
+        "xinfo_consumers",
+        side_effect=redis_lib.ResponseError("NOPERM secret consumer detail"),
+    )
+
+    health = inspect_result_stream_raw(fake_redis_client, stream)
+
+    assert health.pending == 4
+    assert health.sampled_pending == 0
+    assert health.sampled_max_delivery_count is None
+    assert health.pending_inspection_complete is False
+    assert health.max_delivery_count is None
+    assert "secret" not in str(health)
+    metrics = dict(format_result_stream_metrics(health))
+    assert metrics["Max deliveries"] == "--"
+    assert metrics["Oldest pending idle"] == "--"
 
 
 def test_empty_result_stream_without_consumer_group_is_healthy(fake_redis_client, mocker):
@@ -244,8 +337,10 @@ def test_empty_result_stream_without_consumer_group_is_healthy(fake_redis_client
 
     assert health.stream_exists is True
     assert health.retained_entries == 0
+    assert health.sampled_max_delivery_count == 0
     assert health.inspection_error is None
     assert format_result_stream_warning(health) is None
+    assert dict(format_result_stream_metrics(health))["Max deliveries"] == "0"
 
 
 def test_registered_result_consumer_without_heartbeat_does_not_count_as_live(
@@ -373,7 +468,11 @@ def test_malformed_pending_collection_or_row_is_explicit_and_secret_free(
 
     assert health.inspection_error == f"{stream}: pending result metadata is malformed"
     assert health.pending_inspection_complete is False
+    assert health.sampled_max_delivery_count is None
     assert "secret" not in str(health)
+    metrics = dict(format_result_stream_metrics(health))
+    assert metrics["Max deliveries"] == "--"
+    assert metrics["Oldest pending idle"] == "--"
 
 
 def test_results_constants_are_shared_by_worker_and_orchestrator_modules():

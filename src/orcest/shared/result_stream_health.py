@@ -49,7 +49,7 @@ class ResultStreamHealth:
     live_consumers: int
     youngest_consumer_heartbeat_age_seconds: int | None
     sampled_oldest_pending_idle_seconds: int | None
-    sampled_max_delivery_count: int
+    sampled_max_delivery_count: int | None
     sampled_pending: int
     pending_inspection_complete: bool
     inspection_error: str | None = None
@@ -82,7 +82,10 @@ class ResultStreamHealth:
         return (
             self.sampled_oldest_pending_idle_seconds is not None
             and self.sampled_oldest_pending_idle_seconds >= RESULT_PENDING_STALE_IDLE_SECONDS
-        ) or self.sampled_max_delivery_count >= RESULT_PENDING_STALE_DELIVERIES
+        ) or (
+            self.sampled_max_delivery_count is not None
+            and self.sampled_max_delivery_count >= RESULT_PENDING_STALE_DELIVERIES
+        )
 
 
 def inspect_result_stream(redis: RedisClient) -> ResultStreamHealth:
@@ -102,11 +105,17 @@ def inspect_result_stream_raw(redis: RedisClient, stream: str) -> ResultStreamHe
     try:
         key_type = str(cast(Any, redis.client.type(stream)))
         if key_type == "none":
-            return _result(stream, stream_exists=False, retained_entries=0)
+            return _result(
+                stream,
+                stream_exists=False,
+                retained_entries=0,
+                sampled_max_delivery_count=0,
+            )
         if key_type != "stream":
             return _result(
                 stream,
                 stream_exists=True,
+                pending_inspection_complete=False,
                 inspection_error=f"{stream}: expected stream, found {key_type}",
             )
 
@@ -118,6 +127,7 @@ def inspect_result_stream_raw(redis: RedisClient, stream: str) -> ResultStreamHe
                 stream,
                 stream_exists=True,
                 retained_entries=retained_entries,
+                pending_inspection_complete=False,
                 inspection_error=f"{stream}: results consumer group metadata is malformed",
             )
 
@@ -129,6 +139,7 @@ def inspect_result_stream_raw(redis: RedisClient, stream: str) -> ResultStreamHe
                     stream,
                     stream_exists=True,
                     retained_entries=retained_entries,
+                    pending_inspection_complete=False,
                     inspection_error=f"{stream}: results consumer group metadata is malformed",
                 )
             named_groups.append((name, group))
@@ -139,11 +150,13 @@ def inspect_result_stream_raw(redis: RedisClient, stream: str) -> ResultStreamHe
                     stream,
                     stream_exists=True,
                     retained_entries=retained_entries,
+                    sampled_max_delivery_count=0,
                 )
             return _result(
                 stream,
                 stream_exists=True,
                 retained_entries=retained_entries,
+                pending_inspection_complete=False,
                 inspection_error=f"{stream}: results consumer group {RESULTS_GROUP!r} is missing",
             )
 
@@ -152,6 +165,7 @@ def inspect_result_stream_raw(redis: RedisClient, stream: str) -> ResultStreamHe
                 stream,
                 stream_exists=True,
                 retained_entries=retained_entries,
+                pending_inspection_complete=False,
                 inspection_error=f"{stream}: results consumer group metadata is malformed",
             )
 
@@ -164,6 +178,7 @@ def inspect_result_stream_raw(redis: RedisClient, stream: str) -> ResultStreamHe
                 stream,
                 stream_exists=True,
                 retained_entries=retained_entries,
+                pending_inspection_complete=False,
                 inspection_error=f"{stream}: results consumer group work is unavailable",
             )
         lag = max(raw_lag, 0)
@@ -181,6 +196,8 @@ def inspect_result_stream_raw(redis: RedisClient, stream: str) -> ResultStreamHe
                 pending=pending,
                 lag=lag,
                 consumers=consumers,
+                sampled_max_delivery_count=0 if pending == 0 else None,
+                pending_inspection_complete=pending == 0,
                 inspection_error=consumer_error,
             )
 
@@ -208,7 +225,11 @@ def inspect_result_stream_raw(redis: RedisClient, stream: str) -> ResultStreamHe
             inspection_error=pending_error,
         )
     except (redis_lib.RedisError, AttributeError, TypeError, ValueError) as exc:
-        return _result(stream, inspection_error=f"{stream}: {type(exc).__name__}")
+        return _result(
+            stream,
+            pending_inspection_complete=False,
+            inspection_error=f"{stream}: {type(exc).__name__}",
+        )
 
 
 def format_result_stream_warning(health: ResultStreamHealth) -> str | None:
@@ -234,10 +255,15 @@ def format_result_stream_warning(health: ResultStreamHealth) -> str | None:
         if health.sampled_oldest_pending_idle_seconds is None
         else f"{health.sampled_oldest_pending_idle_seconds}s"
     )
+    max_deliveries = (
+        "unknown"
+        if health.sampled_max_delivery_count is None
+        else str(health.sampled_max_delivery_count)
+    )
     return (
         f"STALE result handling on {health.stream}: pending={health.pending} "
         f"lag={health.lag} oldest_pending_idle={oldest} "
-        f"max_deliveries={health.sampled_max_delivery_count} "
+        f"max_deliveries={max_deliveries} "
         f"sampled={health.sampled_pending}/{health.pending}"
     )
 
@@ -251,7 +277,9 @@ def format_result_stream_metrics(health: ResultStreamHealth) -> tuple[tuple[str,
         else f"{health.sampled_oldest_pending_idle_seconds}s{incomplete_suffix}"
     )
     max_deliveries = (
-        "0" if health.pending == 0 else f"{health.sampled_max_delivery_count}{incomplete_suffix}"
+        "--"
+        if health.sampled_max_delivery_count is None
+        else f"{health.sampled_max_delivery_count}{incomplete_suffix}"
     )
     youngest_consumer = (
         "--"
@@ -294,7 +322,7 @@ def _result(
     live_consumers: int = 0,
     youngest_consumer_heartbeat_age_seconds: int | None = None,
     sampled_oldest_pending_idle_seconds: int | None = None,
-    sampled_max_delivery_count: int = 0,
+    sampled_max_delivery_count: int | None = None,
     sampled_pending: int = 0,
     pending_inspection_complete: bool = True,
     inspection_error: str | None = None,
@@ -371,7 +399,7 @@ def _inspect_consumer_liveness(
 
 def _inspect_pending_entries(
     redis: RedisClient, stream: str, pending: int
-) -> tuple[int, int | None, int, bool, str | None]:
+) -> tuple[int, int | None, int | None, bool, str | None]:
     if pending == 0:
         return 0, None, 0, True, None
 
@@ -381,6 +409,11 @@ def _inspect_pending_entries(
     oldest_idle_ms = 0
     max_delivery_count = 0
     seen_ids: set[str] = set()
+
+    def _sampled_idle_and_deliveries() -> tuple[int | None, int | None]:
+        if sampled_pending == 0:
+            return None, None
+        return oldest_idle_ms // 1000, max_delivery_count
 
     while sampled_pending < target:
         count = min(RESULT_PENDING_PAGE_SIZE, target - sampled_pending)
@@ -392,45 +425,50 @@ def _inspect_pending_entries(
                 ),
             )
         except (redis_lib.RedisError, AttributeError, TypeError, ValueError) as exc:
+            oldest_idle, deliveries = _sampled_idle_and_deliveries()
             return (
                 sampled_pending,
-                oldest_idle_ms // 1000 if sampled_pending else None,
-                max_delivery_count,
+                oldest_idle,
+                deliveries,
                 False,
                 f"{stream}: pending result inspection {type(exc).__name__} after "
                 f"{sampled_pending} of {pending} entries",
             )
         rows = _mapping_rows(raw_rows)
         if rows is None or len(rows) > count:
+            oldest_idle, deliveries = _sampled_idle_and_deliveries()
             return (
                 sampled_pending,
-                oldest_idle_ms // 1000 if sampled_pending else None,
-                max_delivery_count,
+                oldest_idle,
+                deliveries,
                 False,
                 f"{stream}: pending result metadata is malformed",
             )
         if not rows:
             current_pending, recheck_error = _recheck_pending(redis, stream)
             if recheck_error is not None:
+                oldest_idle, deliveries = _sampled_idle_and_deliveries()
                 return (
                     sampled_pending,
-                    oldest_idle_ms // 1000 if sampled_pending else None,
-                    max_delivery_count,
+                    oldest_idle,
+                    deliveries,
                     False,
                     recheck_error,
                 )
             if current_pending is not None and current_pending <= sampled_pending:
+                oldest_idle, deliveries = _sampled_idle_and_deliveries()
                 return (
                     sampled_pending,
-                    oldest_idle_ms // 1000 if sampled_pending else None,
-                    max_delivery_count,
+                    oldest_idle,
+                    deliveries,
                     True,
                     None,
                 )
+            oldest_idle, deliveries = _sampled_idle_and_deliveries()
             return (
                 sampled_pending,
-                oldest_idle_ms // 1000 if sampled_pending else None,
-                max_delivery_count,
+                oldest_idle,
+                deliveries,
                 False,
                 f"{stream}: pending result inspection ended after "
                 f"{sampled_pending} of {pending} entries",
@@ -449,10 +487,11 @@ def _inspect_pending_entries(
                 or idle_ms is None
                 or deliveries is None
             ):
+                oldest_idle, sampled_deliveries = _sampled_idle_and_deliveries()
                 return (
                     sampled_pending,
-                    oldest_idle_ms // 1000 if sampled_pending else None,
-                    max_delivery_count,
+                    oldest_idle,
+                    sampled_deliveries,
                     False,
                     (f"{stream}: pending result metadata is malformed"),
                 )
@@ -463,16 +502,17 @@ def _inspect_pending_entries(
             last_id = message_id
 
         if last_id is None:
+            oldest_idle, sampled_deliveries = _sampled_idle_and_deliveries()
             return (
                 sampled_pending,
-                oldest_idle_ms // 1000 if sampled_pending else None,
-                max_delivery_count,
+                oldest_idle,
+                sampled_deliveries,
                 False,
                 (f"{stream}: pending result metadata is malformed"),
             )
         cursor = f"({last_id}"
 
-    oldest_idle_seconds = oldest_idle_ms // 1000
+    oldest_idle_seconds, sampled_deliveries = _sampled_idle_and_deliveries()
     complete = sampled_pending == pending
     error = None
     if not complete:
@@ -480,7 +520,7 @@ def _inspect_pending_entries(
             f"{stream}: pending result inspection incomplete: inspected "
             f"{sampled_pending} of {pending} entries"
         )
-    return sampled_pending, oldest_idle_seconds, max_delivery_count, complete, error
+    return sampled_pending, oldest_idle_seconds, sampled_deliveries, complete, error
 
 
 def _recheck_pending(redis: RedisClient, stream: str) -> tuple[int | None, str | None]:
