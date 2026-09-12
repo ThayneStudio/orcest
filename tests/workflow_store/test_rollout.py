@@ -562,3 +562,95 @@ def test_rollback_below_stage5_restores_legacy_credential_delivery(tmp_path: Pat
         projection = get_rollout_projection(store)
         assert projection.legacy_admissions_frozen is False
         assert projection.raw_task_credentials_removed is False
+
+
+def test_legacy_drained_requires_zero_nonterminal_legacy_runs(tmp_path: Path) -> None:
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        _insert_project(store)
+        _insert_project(store, project_id=PROJECT_ID_2, locator="legacy-org/legacy-repo")
+        allow_rollout_project(
+            store,
+            project_id=PROJECT_ID,
+            repository_locator=REPO,
+            engine="V1",
+            publication_enabled=False,
+            intake_enabled=True,
+        )
+        allow_rollout_project(
+            store,
+            project_id=PROJECT_ID_2,
+            repository_locator="legacy-org/legacy-repo",
+            engine="LEGACY",
+            publication_enabled=False,
+            intake_enabled=True,
+        )
+        store.create_run(
+            run_id=_uid(),
+            project_id=PROJECT_ID_2,
+            work_item_key="legacy-work",
+            state="ADMITTED",
+        )
+        store.create_run(
+            run_id=_uid(),
+            project_id=PROJECT_ID,
+            work_item_key="v1-work",
+            state="BUILDING",
+        )
+        archive_legacy_work(
+            store,
+            archive_id=_uid(),
+            kind="TASK",
+            identity="task-1",
+            project_id=PROJECT_ID_2,
+            now_ms=1,
+        )
+        record_rollout_evidence(
+            store, evidence_id=_uid(), stage=5, item_id="legacy_drained", now_ms=1
+        )
+
+        checklist = evaluate_rollout_checklist(store, stage=5, gate="EXIT")
+        drained = next(item for item in checklist.items if item.item_id == "legacy_drained")
+        assert drained.passed is False
+        assert "nonterminal=1" in drained.detail
+        assert "archived_tasks=1" in drained.detail
+
+        store.conn.execute(
+            "UPDATE runs SET state = 'MERGED' WHERE project_id = ?",
+            (PROJECT_ID_2,),
+        )
+        store.conn.commit()
+        checklist = evaluate_rollout_checklist(store, stage=5, gate="EXIT")
+        drained = next(item for item in checklist.items if item.item_id == "legacy_drained")
+        assert drained.passed is True
+        assert "nonterminal=0" in drained.detail
+
+
+def test_issue_intake_engine_requires_intake_enabled(tmp_path: Path) -> None:
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        _insert_project(store)
+        allow_rollout_project(
+            store,
+            project_id=PROJECT_ID,
+            repository_locator=REPO,
+            engine="V1",
+            publication_enabled=False,
+            intake_enabled=False,
+        )
+
+    disabled = load_legacy_rollout_controls(tmp_path, repository_locator=REPO)
+    assert disabled.issue_intake_engine is None
+    assert disabled.excludes_issue_intake() is False
+
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        allow_rollout_project(
+            store,
+            project_id=PROJECT_ID,
+            repository_locator=REPO,
+            engine="V1",
+            publication_enabled=False,
+            intake_enabled=True,
+        )
+
+    enabled = load_legacy_rollout_controls(tmp_path, repository_locator=REPO)
+    assert enabled.issue_intake_engine == "V1"
+    assert enabled.excludes_issue_intake() is True

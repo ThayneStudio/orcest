@@ -549,7 +549,8 @@ def load_legacy_rollout_controls(
     conn = open_read_only(db_path)
     try:
         row = conn.execute(
-            "SELECT engine FROM rollout_projects WHERE repository_locator = ? COLLATE NOCASE",
+            "SELECT engine, intake_enabled FROM rollout_projects "
+            "WHERE repository_locator = ? COLLATE NOCASE",
             (repository_locator,),
         ).fetchone()
         projection = conn.execute(
@@ -562,7 +563,7 @@ def load_legacy_rollout_controls(
             bool(projection["raw_task_credentials_removed"]) if projection is not None else False
         )
         return LegacyRolloutControls(
-            issue_intake_engine=None if row is None else str(row["engine"]),
+            issue_intake_engine=_issue_intake_engine(row),
             legacy_admissions_frozen=frozen,
             omit_raw_task_credentials=omitted,
         )
@@ -1002,9 +1003,14 @@ def _evaluate_item(
             str(proj.legacy_admissions_frozen),
         )
     if item_id == "legacy_drained":
-        pending = _count(conn, "SELECT COUNT(*) FROM rollout_legacy_archive WHERE kind = 'TASK'")
-        evidence = _has_evidence(conn, 5, "legacy_drained")
-        return _item(item_id, evidence or pending > 0, "drain", f"archived_tasks={pending}")
+        remaining = _legacy_owned_nonterminal_run_count(conn)
+        archived = _count(conn, "SELECT COUNT(*) FROM rollout_legacy_archive WHERE kind = 'TASK'")
+        return _item(
+            item_id,
+            remaining == 0,
+            "drain",
+            f"nonterminal={remaining} archived_tasks={archived}",
+        )
     if item_id == "legacy_archived":
         kinds = {
             row["kind"] for row in conn.execute("SELECT DISTINCT kind FROM rollout_legacy_archive")
@@ -1038,6 +1044,25 @@ def _evaluate_item(
     if item_id == "v1_keeps_publications":
         return _item(item_id, True, "publication", "retained")
     return _item(item_id, False, "unknown", item_id)
+
+
+def _issue_intake_engine(row: sqlite3.Row | None) -> str | None:
+    if row is None:
+        return None
+    engine = str(row["engine"])
+    if engine == "V1" and not bool(row["intake_enabled"]):
+        return None
+    return engine
+
+
+def _legacy_owned_nonterminal_run_count(conn: sqlite3.Connection) -> int:
+    return _count(
+        conn,
+        "SELECT COUNT(*) FROM runs r "
+        "LEFT JOIN rollout_projects rp ON rp.project_id = r.project_id "
+        "WHERE r.state NOT IN ('MERGED', 'CLOSED', 'CANCELLED') "
+        "AND COALESCE(rp.engine, 'LEGACY') != 'V1'",
+    )
 
 
 def _item(item_id: str, passed: bool, evidence_code: str, detail: str) -> ChecklistItemResult:
