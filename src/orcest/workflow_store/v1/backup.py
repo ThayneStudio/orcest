@@ -281,9 +281,12 @@ def _capture_backup_unit(
     now_ms = int(time.time() * 1000)
 
     db_dest = staging / "workflow.db"
-    with sqlite3.connect(db_dest) as dest_conn:
+    dest_conn = sqlite3.connect(db_dest)
+    try:
         run_store.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         run_store.conn.backup(dest_conn)
+    finally:
+        dest_conn.close()
     os.chmod(db_dest, FILE_MODE)
     fsync_file(db_dest)
     entries.append(

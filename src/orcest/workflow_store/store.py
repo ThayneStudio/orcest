@@ -2522,6 +2522,30 @@ def _health_probe_subject(fact: "HealthProbeFactRecord") -> dict[str, Any]:
     return {key: value for key, value in subject.items() if key != "probe_evidence"}
 
 
+def _validate_secret_version_pair(secret_id: object, version: object) -> tuple[str, int]:
+    require_lowercase_uuid(str(secret_id), field="secret_id")
+    version_text = str(version)
+    if not version_text.isdigit():
+        raise ValueError(f"secret version must be a positive integer, got {version!r}")
+    parsed_version = int(version_text)
+    if parsed_version < 1:
+        raise ValueError("secret version must be positive")
+    return str(secret_id), parsed_version
+
+
+def _parse_secret_version_object_id(object_id: str) -> tuple[str, int]:
+    """Parse the ``<secret_id>/<version>`` convention used for
+    ``SECRET_VERSION`` ``object_id`` values, with the same validation as
+    ``_parse_secret_version_scope`` (lowercase UUID secret_id, positive
+    integer version) instead of a bare partition/``int()`` failure."""
+    secret_id, sep, version_text = object_id.partition("/")
+    if not sep:
+        raise ValueError(
+            f"SECRET_VERSION object_id must be '<secret_id>/<version>', got {object_id!r}"
+        )
+    return _validate_secret_version_pair(secret_id, version_text)
+
+
 def _parse_secret_version_scope(
     scope_id: str, subject_bindings: Mapping[str, Any]
 ) -> tuple[str, int]:
@@ -2534,11 +2558,7 @@ def _parse_secret_version_scope(
             version = right
     if secret_id is None or version is None:
         raise ValueError("SECRET_VERSION_INTEGRITY requires secret_id/version bindings")
-    require_lowercase_uuid(str(secret_id), field="secret_id")
-    parsed_version = int(version)
-    if parsed_version < 1:
-        raise ValueError("secret version must be positive")
-    return str(secret_id), parsed_version
+    return _validate_secret_version_pair(secret_id, version)
 
 
 def _health_probe_recovery_category(fact: "HealthProbeFactRecord") -> str:
@@ -21847,9 +21867,9 @@ class RunStore:
                 existing_id = existing_record.storage_restoration_fact_id
             else:
                 if object_kind == "SECRET_VERSION":
-                    secret_id, _, version_text = object_id.partition("/")
+                    secret_id, version = _parse_secret_version_object_id(object_id)
                     members = self._secret_recovery_matching_run_ids(
-                        secret_id=secret_id, version=int(version_text)
+                        secret_id=secret_id, version=version
                     )
                     scope_kind, scope_id = "SECRET", object_id
                 else:
