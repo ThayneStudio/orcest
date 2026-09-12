@@ -91,6 +91,9 @@ from orcest.shared.logging import setup_logging
 from orcest.shared.models import (
     CONSUMER_GROUP,
     PROVIDER_NAME_RE,
+    RESULTS_CONSUMER_NAME,
+    RESULTS_GROUP,
+    RESULTS_STREAM,
     TRANSIENT_SUMMARY_PREFIX,
     ResultStatus,
     Task,
@@ -100,10 +103,8 @@ from orcest.shared.models import (
 )
 from orcest.shared.providers import ProviderEntry
 from orcest.shared.redis_client import RedisClient, is_redis_oom_error
+from orcest.shared.result_stream_health import record_result_consumer_heartbeat
 from orcest.workflow_store import load_legacy_change_request_exclusion_snapshot
-
-RESULTS_STREAM = "results"
-RESULTS_GROUP = "orchestrator"
 
 # Observability counters (Task 8 hygiene).
 # Per-provider under providers:{provider}: namespace, project-scoped via key_prefix.
@@ -3132,7 +3133,7 @@ def _consume_results_for_project(
     while True:
         entries = redis.xreadgroup(
             group=RESULTS_GROUP,
-            consumer="orchestrator-main",
+            consumer=RESULTS_CONSUMER_NAME,
             stream=RESULTS_STREAM,
             count=10,
             block_ms=None,
@@ -3193,7 +3194,7 @@ def _consume_results_for_project(
     while True:
         entries = redis.xreadgroup(
             group=RESULTS_GROUP,
-            consumer="orchestrator-main",
+            consumer=RESULTS_CONSUMER_NAME,
             stream=RESULTS_STREAM,
             count=10,
             block_ms=None,
@@ -3243,6 +3244,12 @@ def _consume_results_for_project(
                     ack_err,
                     exc_info=True,
                 )
+
+    # Redis before 7.2 leaves XINFO CONSUMERS ``idle`` growing while a healthy
+    # consumer polls an empty stream. Record successful consumer-loop passes in
+    # a separate expiring key so health checks do not report that deployment as
+    # dead merely because there was no result to consume.
+    record_result_consumer_heartbeat(redis)
 
 
 def _handle_result(
