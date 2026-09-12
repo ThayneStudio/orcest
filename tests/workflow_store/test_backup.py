@@ -165,6 +165,51 @@ def test_backup_never_writes_plaintext_secret_bytes(
             assert secret_bytes not in path.read_bytes()
 
 
+def test_backup_copies_immutable_objects_after_releasing_storage_lock(
+    run_store: RunStore, stores, lock: StorageLock, tmp_path: Path, monkeypatch
+) -> None:
+    candidate_store, blob_store, secret_store = stores
+    _running(run_store)
+    candidate_store.install(b"bundle-bytes")
+    blob_store.install("PROMPT_UTF8", b"blob-bytes")
+    secret_store.put_version("33333333-3333-4333-8333-333333333333", 1, b"secret-bytes")
+
+    def assert_lock_available() -> None:
+        assert lock.acquire(blocking=False)
+        lock.release()
+
+    candidate_read = candidate_store.read
+    blob_read = blob_store.read
+    secret_read = secret_store.read_value
+
+    def read_candidate(bundle_digest: str) -> bytes:
+        assert_lock_available()
+        return candidate_read(bundle_digest)
+
+    def read_blob(blob_digest: str) -> bytes:
+        assert_lock_available()
+        return blob_read(blob_digest)
+
+    def read_secret(secret_id: str, version: int) -> bytes:
+        assert_lock_available()
+        return secret_read(secret_id, version)
+
+    monkeypatch.setattr(candidate_store, "read", read_candidate)
+    monkeypatch.setattr(blob_store, "read", read_blob)
+    monkeypatch.setattr(secret_store, "read_value", read_secret)
+
+    destination = tmp_path / "backups"
+    destination.mkdir()
+    create_backup(
+        run_store,
+        candidate_store,
+        blob_store,
+        secret_store,
+        destination_root=destination,
+        encryption_key=os.urandom(32),
+    )
+
+
 def test_backup_barrier_times_out_with_claimed_attempts(
     run_store: RunStore, stores, tmp_path: Path
 ) -> None:

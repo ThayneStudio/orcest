@@ -29,10 +29,10 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from orcest.workflow_contract.v1.canonical import canonical_json_text
 from orcest.workflow_contract.v1.digest import content_digest, sha256_file_hex, sha256_hex
 from orcest.workflow_store.store import RunStore
-from orcest.workflow_store.v1.blobs import WorkflowBlobStore
-from orcest.workflow_store.v1.candidates import CandidateObjectStore
+from orcest.workflow_store.v1.blobs import WorkflowBlobRecord, WorkflowBlobStore
+from orcest.workflow_store.v1.candidates import CandidateObjectRecord, CandidateObjectStore
 from orcest.workflow_store.v1.fs import DIR_MODE, FILE_MODE, fsync_dir, fsync_file
-from orcest.workflow_store.v1.secrets import SecretStore
+from orcest.workflow_store.v1.secrets import SecretReference, SecretStore
 
 BACKUP_SERVICE_PRINCIPAL_ID = "controller-backup-service"
 MANIFEST_NAME = "manifest.json"
@@ -224,14 +224,24 @@ def create_backup(
                     raise BackupModeTransitionError(
                         "controller mode branch changed under the storage-lock barrier"
                     )
-                entries, created_at_ms = _capture_backup_unit(
+                candidate_records = tuple(candidate_store.iter_object_inventory())
+                blob_records = tuple(blob_store.iter_object_inventory())
+                secret_references = tuple(secret_store.iter_version_references())
+                sqlite_entry, created_at_ms = _capture_sqlite_snapshot(
                     run_store,
-                    candidate_store,
-                    blob_store,
-                    secret_store,
                     staging=staging,
-                    encryption_key=encryption_key,
                 )
+            entries = _capture_backup_objects(
+                candidate_store,
+                blob_store,
+                secret_store,
+                candidate_records=candidate_records,
+                blob_records=blob_records,
+                secret_references=secret_references,
+                sqlite_entry=sqlite_entry,
+                staging=staging,
+                encryption_key=encryption_key,
+            )
         finally:
             if pause_operation_id is not None:
                 _restore_prior_mode(run_store, pause_operation_id=pause_operation_id)
@@ -277,18 +287,13 @@ def create_backup(
     )
 
 
-def _capture_backup_unit(
+def _capture_sqlite_snapshot(
     run_store: RunStore,
-    candidate_store: CandidateObjectStore,
-    blob_store: WorkflowBlobStore,
-    secret_store: SecretStore,
     *,
     staging: Path,
-    encryption_key: bytes,
-) -> tuple[list[BackupManifestEntry], int]:
-    entries: list[BackupManifestEntry] = []
+) -> tuple[BackupManifestEntry, int]:
+    """Capture the mutable database while the caller holds ``storage.lock``."""
     now_ms = int(time.time() * 1000)
-
     db_dest = staging / "workflow.db"
     dest_conn = sqlite3.connect(db_dest)
     try:
@@ -298,17 +303,33 @@ def _capture_backup_unit(
         dest_conn.close()
     os.chmod(db_dest, FILE_MODE)
     fsync_file(db_dest)
-    entries.append(
+    return (
         BackupManifestEntry(
             relative_path="workflow.db",
             kind="SQLITE_SNAPSHOT",
             size=db_dest.stat().st_size,
             mode=FILE_MODE,
             sha256=sha256_file_hex(db_dest),
-        )
+        ),
+        now_ms,
     )
 
-    for record in candidate_store.iter_objects():
+
+def _capture_backup_objects(
+    candidate_store: CandidateObjectStore,
+    blob_store: WorkflowBlobStore,
+    secret_store: SecretStore,
+    *,
+    candidate_records: tuple[CandidateObjectRecord, ...],
+    blob_records: tuple[WorkflowBlobRecord, ...],
+    secret_references: tuple[SecretReference, ...],
+    sqlite_entry: BackupManifestEntry,
+    staging: Path,
+    encryption_key: bytes,
+) -> list[BackupManifestEntry]:
+    """Copy the frozen immutable-object inventory without holding ``storage.lock``."""
+    entries = [sqlite_entry]
+    for record in candidate_records:
         data = candidate_store.read(record.bundle_digest)
         dest = staging / "candidates" / record.storage_key
         _write_backup_file(dest, data)
@@ -322,7 +343,7 @@ def _capture_backup_unit(
             )
         )
 
-    for blob_record in blob_store.iter_objects():
+    for blob_record in blob_records:
         data = blob_store.read(blob_record.blob_digest)
         dest = staging / "blobs" / blob_record.storage_key
         _write_backup_file(dest, data)
@@ -337,28 +358,22 @@ def _capture_backup_unit(
         )
 
     aesgcm = AESGCM(encryption_key)
-    for handle in secret_store.iter_versions():
-        value = secret_store.read_value(handle.reference.secret_id, handle.reference.version)
+    for reference in secret_references:
+        value = secret_store.read_value(reference.secret_id, reference.version)
         nonce = os.urandom(_SECRET_NONCE_BYTES)
         ciphertext = aesgcm.encrypt(
             nonce,
             value,
             json.dumps(
                 {
-                    "secret_id": handle.reference.secret_id,
-                    "version": handle.reference.version,
+                    "secret_id": reference.secret_id,
+                    "version": reference.version,
                 },
                 sort_keys=True,
             ).encode("utf-8"),
         )
         envelope = nonce + ciphertext
-        dest = (
-            staging
-            / "secrets"
-            / handle.reference.secret_id
-            / "versions"
-            / f"{handle.reference.version}.enc"
-        )
+        dest = staging / "secrets" / reference.secret_id / "versions" / f"{reference.version}.enc"
         _write_backup_file(dest, envelope)
         entries.append(
             BackupManifestEntry(
@@ -370,4 +385,4 @@ def _capture_backup_unit(
             )
         )
 
-    return entries, now_ms
+    return entries

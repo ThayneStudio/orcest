@@ -247,6 +247,11 @@ class CandidateObjectStore:
         quarantine_file(src=dest, quarantine_dir=quarantine_dir, store_root=self._root)
 
     def iter_objects(self) -> Iterator[CandidateObjectRecord]:
+        for record in self.iter_object_inventory():
+            yield self.verify(record.bundle_digest)
+
+    def iter_object_inventory(self) -> Iterator[CandidateObjectRecord]:
+        """List installed identities using names and stat data without reading payloads."""
         objects_sha = trusted_join(self._root, "objects", "sha256")
         if not objects_sha.is_dir():
             return
@@ -259,7 +264,11 @@ class CandidateObjectStore:
                 if not child.name.endswith(".bundle"):
                     continue
                 digest = f"sha256:{child.name[: -len('.bundle')]}"
-                yield self.verify(digest)
+                yield CandidateObjectRecord(
+                    bundle_digest=digest,
+                    byte_length=child.stat().st_size,
+                    storage_key=child.relative_to(self._root).as_posix(),
+                )
 
     def _verify_at(self, path: Path, expected: CandidateObjectRecord) -> CandidateObjectRecord:
         data = read_exact_file(path, max_bytes=self._quota.max_object_bytes)

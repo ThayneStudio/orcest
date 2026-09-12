@@ -167,6 +167,11 @@ class WorkflowBlobStore:
         return read_exact_file(self._dest(record), max_bytes=self._quota.max_object_bytes)
 
     def iter_objects(self) -> Iterator[WorkflowBlobRecord]:
+        for record in self.iter_object_inventory():
+            yield self.verify(record.blob_digest)
+
+    def iter_object_inventory(self) -> Iterator[WorkflowBlobRecord]:
+        """List installed identities using names and stat data without reading payloads."""
         for kind in sorted(_MEDIA_KINDS):
             kind_root = self._root / "objects" / kind / "sha256"
             if not kind_root.is_dir():
@@ -177,7 +182,12 @@ class WorkflowBlobStore:
                 for child in sorted(shard.iterdir()):
                     if not child.is_file() or child.is_symlink():
                         continue
-                    yield self.verify(f"sha256:{child.name}")
+                    yield WorkflowBlobRecord(
+                        blob_digest=f"sha256:{child.name}",
+                        media_kind=kind,
+                        byte_length=child.stat().st_size,
+                        storage_key=child.relative_to(self._root).as_posix(),
+                    )
 
     def _locate(self, blob_digest: str) -> tuple[Path, str]:
         hex_part = digest_hex(blob_digest)
