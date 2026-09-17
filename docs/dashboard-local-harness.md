@@ -63,6 +63,8 @@ npm run harness -- --command pause
 npm run harness -- --command step
 npm run harness -- --command resume
 npm run harness -- --command reset
+npm run harness -- --command source-down
+npm run harness -- --command source-up
 npm run harness -- --command redis-down
 npm run harness -- --command redis-up
 npm run harness -- --command restart-dashboard
@@ -71,7 +73,10 @@ npm run harness -- --command stop
 
 Repeat `--state-dir` when using a custom directory. Pause stops progression and
 output, while keeping observations and worker heartbeats fresh. Step advances
-one stage. Redis down/up exercises unavailable data and reconnection. Restarting
+one stage. Source down/up stops and restores discovery updates while worker
+heartbeats and output continue; observations become stale after the normal age
+threshold. Automatic scenario transitions pause during this source outage.
+Redis down/up exercises unavailable data and reconnection. Restarting
 the dashboard invalidates existing sign-in sessions. Commands are local files,
 not unauthenticated HTTP control endpoints. Ctrl-C or `stop` shuts down the
 owned dashboard and Redis; it does not touch other processes. A new invocation
@@ -94,3 +99,33 @@ Harness testing establishes local application behavior. It does not establish
 real provider execution, actual GitHub delivery or production VM health. The
 live-fleet observation gate remains separate; no synthetic completion counts as
 real delivery evidence.
+
+
+## Sustained validation
+
+```sh
+npm run soak:local-harness -- --state-dir /your/durable/path/new-observation
+```
+
+This owns a separate harness on an unused port for 13 hours, leaving an existing
+interactive harness alone. It records minute samples, process identity, dashboard
+RSS, API latency, artifact hashes, synthetic execution/completion counts, and
+output reconnection checks. It stops discovery updates after five minutes,
+expects naturally stale observations, and restores updates after ten minutes.
+It keeps a real session until the normal twelve-hour expiry and reauthenticates.
+Sampling gaps, unexpected process replacement, artifact changes, output replay,
+or unexpected errors fail the run; evidence is not silently stitched together.
+
+The run rejects RSS above 512 MiB or growth above the larger of three times the
+15-minute warm sample and that sample plus 128 MiB. These are operational test
+budgets, not proof that all workloads are leak-free. The collector requires at
+least ten distinct attempts, ten synthetic completed attempts, and ten successful
+cursor reconnects in addition to expiry and stale/recovery observations.
+
+Use a pinned, separate source/build copy when continuing to edit the dashboard
+during a soak. Keep the machine awake: sleep or closing the process interrupts
+the interval. The collector writes samples and a summary under the requested
+new directory and rejects an existing samples file. On normal completion it
+stops its owned harness. `qualified: true` qualifies **only the local synthetic
+milestone**, never live-fleet readiness. A short collector smoke can use
+`--seconds 120 --sample-seconds 5`; it will not qualify the sustained gate.

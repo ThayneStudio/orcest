@@ -38,6 +38,8 @@ COMMANDS = (
     "redis-down",
     "redis-up",
     "restart-dashboard",
+    "source-down",
+    "source-up",
     "stop",
 )
 TOKEN = "local-harness"  # Public fixture credential: synthetic data, loopback only.
@@ -84,6 +86,7 @@ class Fleet:
         self.phase = 0
         self.generation = 0
         self.sequence = 0
+        self.source_online = True
 
     def observe(self, project, number, action, title, blockers=None, kind="issue"):
         r, repo = self.projects[project], self.repos[project]
@@ -199,29 +202,32 @@ class Fleet:
         self.phase += 1
 
     def refresh(self, *, output=False):
-        for i, r in enumerate(self.projects):
-            for entry in self.entries:
-                self.pool.record_usage(
-                    entry.account_key(),
-                    {
-                        "five_hour": {
-                            "utilization": 100
-                            if entry.provider == "grok" and self.phase < 4
-                            else 35
+        if self.source_online:
+            for i, r in enumerate(self.projects):
+                for entry in self.entries:
+                    self.pool.record_usage(
+                        entry.account_key(),
+                        {
+                            "five_hour": {
+                                "utilization": 100
+                                if entry.provider == "grok" and self.phase < 4
+                                else 35
+                            },
+                            "seven_day": {
+                                "utilization": 100
+                                if entry.provider == "grok" and self.phase < 4
+                                else 62
+                            },
                         },
-                        "seven_day": {
-                            "utilization": 100
-                            if entry.provider == "grok" and self.phase < 4
-                            else 62
-                        },
-                    },
+                    )
+                view.project_observation(r, self.repos[i], 10, self.pool)
+            # Touch observation freshness without clearing queued/start/merge evidence.
+            for (project, kind, number), state in self.records.items():
+                self.projects[project].hset(
+                    view.work_key(self.repos[project], kind, number),
+                    "observed_at",
+                    str(time.time()),
                 )
-            view.project_observation(r, self.repos[i], 10, self.pool)
-        # Touch observation freshness without clearing queued/start/merge evidence.
-        for (project, kind, number), state in self.records.items():
-            self.projects[project].hset(
-                view.work_key(self.repos[project], kind, number), "observed_at", str(time.time())
-            )
         for item, worker in self.running.values():
             project, task, _, _ = item
             r = self.projects[project]
@@ -389,6 +395,8 @@ def main():
                 elif command == "redis-up" and offline:
                     start_redis()
                     offline = False
+                elif command in ("source-down", "source-up"):
+                    fleet.source_online = command == "source-up"
                 elif command == "restart-dashboard":
                     stop(processes["dashboard"])
                     start_dashboard()
@@ -400,7 +408,7 @@ def main():
             if not offline:
                 if processes["redis"].poll() is not None:
                     raise RuntimeError("Redis exited unexpectedly")
-                if not paused and time.monotonic() >= next_step:
+                if not paused and fleet.source_online and time.monotonic() >= next_step:
                     fleet.step()
                     next_step = time.monotonic() + args.interval
                 if time.monotonic() >= next_output:
@@ -417,6 +425,7 @@ def main():
                         "phase": fleet.phase,
                         "paused": paused,
                         "redisOffline": offline,
+                        "sourceOnline": fleet.source_online,
                         "updatedAt": time.time(),
                         "lastCommand": last_command,
                         "synthetic": True,
@@ -425,7 +434,7 @@ def main():
                 next_status = time.monotonic() + 2
             time.sleep(0.2)
     finally:
-        for proc in processes.values():
+        for proc in reversed(list(processes.values())):
             stop(proc)
         client.close()
         log.close()

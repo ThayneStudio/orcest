@@ -34,7 +34,7 @@ dashboard restart/session invalidation, reset and logout. These checks do not
 substitute for the interactive and sustained validation above.
 
 Implementation is on `codex/dashboard-validation-resume`, including commits
-`a546094` (dependency patch and readiness record) and `bff33cf` (local harness).
+`ebb4876` (dependency patch and readiness record) and `0937c9f` (local harness).
 See [local harness instructions](../dashboard-local-harness.md).
 
 ## Separate rollout gates
@@ -47,6 +47,8 @@ See [local harness instructions](../dashboard-local-harness.md).
   existing task ownership, before any live rollout.
 
 The broader hardening goal remains incomplete until its required gates pass.
-The app's existing goal is still marked blocked; replacing it was rejected because
-it is unfinished. This document records the approved working milestone without
-misreporting that tracker state or marking the broader goal complete.
+The local acceptance run uses a thirteen-hour, separately pinned harness so normal
+twelve-hour session expiry can be observed. The collector smoke passed 24 samples
+and 21 output cursor reconnect checks over two minutes with zero errors; it does
+not qualify the longer run. Interactive browser QA is awaiting macOS Computer
+Use permissions. These items remain open until evidence is available.

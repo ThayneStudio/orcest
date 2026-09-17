@@ -26,6 +26,7 @@
     "preview": "node build/server/index.js",
     "pretest": "npm run check:node",
     "test": "vitest run",
+    "soak:local-harness": "node scripts/soak-local-harness.mjs",
     "check:local-harness": "node scripts/check-local-harness.mjs",
     "check:fleet-e2e": "node scripts/check-fleet-e2e.mjs"
   },
