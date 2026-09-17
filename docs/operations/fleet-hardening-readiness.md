@@ -27,7 +27,7 @@ its store tests do not prove recovery of the currently deployed legacy queue.
 | Queue recovery | Crash before ACK, durable pending state, replay, ownership safety under concurrency | Existing unit and real-Redis tests identified; local process rehearsal passed; managed Redis integration/concurrency: 12 passed |
 | External outages | GitHub/Redis failures pause safely and recover without lost outcomes or repeated effects | Unit result-replay coverage passes; local process rehearsal passed |
 | Restore and rollback | Restore data into an isolated instance; verify candidate rollback with exact artifacts | Local restore and real-script rollback rehearsals passed; deployment-specific validation remains |
-| Sustained operation | 24 hours of timestamped measurements with representative work and no unexplained failure | Started 2026-09-06T02:06:47Z; qualification pending |
+| Sustained operation | 24 hours of timestamped measurements with representative work and no unexplained failure | Interrupted after 14h34m on 2026-09-06; a new full interval is required |
 
 ## PR 814 comment dispositions
 
@@ -123,7 +123,7 @@ resources were then removed. This is executable rollback evidence for this
 runtime transition; it is not a claim that a live rollback or deployment occurred.
 
 
-## Reviewed candidate observation
+## Previous candidate observation (interrupted)
 
 [PR #817](https://github.com/ThayneStudio/orcest/pull/817) received an approving
 review with no blocking findings. Orcest merged it as
@@ -132,9 +132,9 @@ review with no blocking findings. Orcest merged it as
 passed lint, typecheck, unit, integration, dashboard, Docker image and Compose
 smoke checks.
 
-The merged candidate runs locally on loopback port 4319 under Node 24.20.0,
+During the previous observation, the merged candidate ran locally on loopback port 4319 under Node 24.20.0,
 reading the existing fleet through an SSH tunnel. Production service images and
-Cloudflare routes remain unchanged. Runtime source matches the previously
+Cloudflare routes were unchanged during that observation. Runtime source matches the previously
 validated `bbcb9b4` build; the later changes affect qualification tooling and
 this record. A local SHA-256 manifest pins the running build and browser assets.
 
@@ -162,3 +162,57 @@ process metadata and eventual result. Its credential file is excluded from all
 reports and source control. A half-hourly task follow-up checks the actual
 process and evidence, reporting meaningful failures or the final qualification
 result. The 24-hour gate remains incomplete until the evidence is audited.
+
+
+## Observation interruption and local restoration — 2026-09-17
+
+The September 6 observation did **not** qualify. Its last verified sample was
+2026-09-06T16:40:47Z: 875 samples over approximately 14 hours 34 minutes, with
+zero failed samples, three new execution attempts, and one verified delivery.
+The local candidate and collector subsequently disappeared together with their
+`/private/tmp` directories. The cause was not established. The raw samples are
+unavailable; these figures come from the prior recorded check results and the
+preserved interruption report. Do not combine this interval with a future run
+or describe it as a completed 24-hour observation.
+
+The candidate was restored into an isolated worktree under a persistent local
+validation directory, with Node 24.20.0 verified against the published checksum.
+The original checkout and its uncommitted vision documents were preserved.
+Current master has no dashboard source differences from the reviewed candidate.
+A new advisory affected the locked Vitest test tooling; Vitest and its associated
+packages were updated from 4.1.9 to 4.1.11. The dependency audit now reports zero
+advisories. This changes development tooling, not the dashboard runtime.
+
+Fresh validation:
+
+- Type checks, production build, and browser bundle smoke passed.
+- All 804 dashboard tests passed with the patched test runner.
+- The isolated Python writer → Redis → authenticated dashboard → live output →
+  CI wait → verified completion → logout contract check passed.
+- All five isolated process-recovery checks passed: claimant crash before ACK,
+  Redis outage, AOF restart/replay, independent RDB restore, and session
+  invalidation after dashboard restart.
+
+The restored candidate binds only `127.0.0.1:4318`. Its generated local access
+token is kept in a mode-0600 configuration file outside the repository. Local
+sign-in works independently of the fleet data connection. The management host
+failed DNS resolution on this Mac, so no fleet tunnel or production credentials
+have been restored. The dashboard must report unavailable data until that is
+resolved; an empty local dataset is not a substitute for live fleet evidence.
+No live service or Cloudflare configuration was changed.
+
+### Resuming the sustained observation
+
+1. Restore the management-host route and read back the actual fleet service
+   revisions, dashboard scope configuration, and worker/account inventory.
+2. Configure the local read connection through a loopback SSH tunnel; keep
+   credentials outside version control with restrictive file permissions.
+3. Verify readiness, browser sign-in, scoped work data and authenticated output.
+   Pin a manifest of all running build/browser artifacts and record process
+   identities before starting the clock.
+4. Store samples, logs, manifests, and the final report in persistent storage,
+   never a temporary directory. Treat termination, restarts and sample gaps as
+   interruptions. A restarted collector begins a new interval.
+5. Complete a new full 24-hour interval with representative execution and
+   independently verified delivery. Audit the evidence before declaring this
+   gate passed or considering fleet rollout.
