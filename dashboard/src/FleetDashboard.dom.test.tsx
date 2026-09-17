@@ -230,3 +230,13 @@ it("renders lifecycle columns, opens live and historical context, and separates 
     ).toBe(true),
   );
 });
+
+it("labels simulated fleet data without disguising it as a production feed", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ ...data, environment: "local-harness" }),
+  })));
+  render(<FleetDashboard />);
+  expect(await screen.findByText(/Local harness · Simulated fleet activity/)).toBeTruthy();
+});

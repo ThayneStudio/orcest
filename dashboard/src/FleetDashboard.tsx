@@ -285,6 +285,11 @@ export default function FleetDashboard() {
       </header>
       <main>
         <h1 className="sr-only">Orcest fleet</h1>
+        {data?.environment === "local-harness" && (
+          <p className="fleet-warning" role="status">
+            Local harness · Simulated fleet activity. No live projects or agents are affected.
+          </p>
+        )}
         <div className="fleet-summary-bar">
           {data?.pools.length ? (
             <span title="Allocated VMs out of all currently provisioned VMs; this is not the configured capacity limit.">

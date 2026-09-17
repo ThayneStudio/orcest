@@ -216,3 +216,20 @@ No live service or Cloudflare configuration was changed.
 5. Complete a new full 24-hour interval with representative execution and
    independently verified delivery. Audit the evidence before declaring this
    gate passed or considering fleet rollout.
+
+
+## Independent local development
+
+The [local harness](../dashboard-local-harness.md) now drives the actual dashboard
+with synthetic work using the real Python observation writers, owned Redis,
+sign-in and output transports. It needs no live-fleet route or provider accounts.
+Development and fault testing can continue while Tailscale is on another tailnet.
+The dashboard visibly identifies this environment. Synthetic outcomes never
+qualify the live-fleet delivery/observation gate.
+
+The harness acceptance check verifies dependency waits before execution, queue
+claiming, streamed output, CI waiting after execution, completion and dependency
+release, provider cooldown recovery, Redis unavailability/reconnection, dashboard
+restart/session invalidation, reset and logout. The dashboard suite now has 805
+passing tests, including the simulation label. Runtime setup and controls are
+repeatable from the documented harness command.
