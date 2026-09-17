@@ -4,22 +4,30 @@ import {spawn, spawnSync} from 'node:child_process';
 import {mkdtemp, readFile, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {once} from 'node:events';
 import {WebSocket} from 'ws';
 
 const state = await mkdtemp(join(tmpdir(), 'orcest-harness-check-'));
 const python = process.env.ORCEST_TEST_PYTHON || '../.venv/bin/python';
 const script = 'scripts/local-harness.py';
 const child = spawn(python, [script, '--state-dir', state, '--port', '0', '--paused'], {
-  stdio: ['ignore', 'pipe', 'pipe'],
+  stdio: ['ignore', 'pipe', 'pipe'], detached: true,
   env: {...process.env, REDIS_HOST: 'must-not-be-used.invalid', DASHBOARD_TOKEN: 'must-not-be-used'},
 });
 let diagnostics = '';
+let childFailure;
+let socketFailure;
+let interrupted = false;
+child.on('error', error => { childFailure = error; });
+for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { interrupted = true; });
 child.stdout.on('data', b => diagnostics += b);
 child.stderr.on('data', b => diagnostics += b);
 const until = async (check, description) => {
   const deadline = Date.now()+20000;
   while (Date.now()<deadline) {
+    if (interrupted) throw new Error('Harness check interrupted');
+    if (childFailure) throw childFailure;
+    if (socketFailure) throw socketFailure;
+    if (child.exitCode !== null || child.signalCode !== null) throw new Error(`Harness exited: ${diagnostics}`);
     try { const result = await check(); if (result) return result; } catch {}
     await new Promise(r => setTimeout(r, 200));
   }
@@ -42,7 +50,7 @@ try {
   };
   const read = async () => { const r=await request('/api/work'); assert.equal(r.status,200); return r.json(); };
   const command = async name => {
-    const result=spawnSync(python,[script,'--state-dir',state,'--command',name], {encoding:'utf8'});
+    const result=spawnSync(python,[script,'--state-dir',state,'--command',name], {encoding:'utf8',timeout:10000});
     assert.equal(result.status,0,result.stderr);
     await new Promise(r=>setTimeout(r,300));
   };
@@ -72,8 +80,10 @@ try {
   url.searchParams.set('prefix',attempt.outputPrefix);
   socket=new WebSocket(url,{headers:{Cookie:cookie}});
   let messages=[];
-  socket.on('message',data=>messages.push(JSON.parse(data.toString())));
-  socket.on('error',()=>{});
+  socket.on('message',data=>{
+    try { messages.push(JSON.parse(data.toString())); } catch (error) { socketFailure = error; }
+  });
+  socket.on('error',error=>{ socketFailure = error; });
   await command('resume');
   await until(()=>messages.some(m=>JSON.stringify(m).includes('[simulation')),'live output');
   await command('pause');
@@ -101,9 +111,20 @@ try {
   console.log('Local harness passed: isolation, 22 projects, accounts/workers, dependency lifecycle, live output, Redis outage/recovery, session restart, reset and logout.');
 } finally {
   socket?.terminate();
-  child.kill('SIGTERM');
-  if (child.exitCode === null && child.signalCode === null) {
-    await Promise.race([once(child,'exit'),new Promise((_,reject)=>setTimeout(()=>reject(new Error('Harness cleanup timed out')),15000).unref())]);
+  try {
+    if (child.pid && child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGTERM');
+      await new Promise(resolve => {
+        const timer = setTimeout(resolve, 30000);
+        child.once('exit', () => { clearTimeout(timer); resolve(); });
+      });
+      if (child.exitCode === null && child.signalCode === null) {
+        try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+        throw new Error('Harness cleanup timed out');
+      }
+    }
+  } finally {
+    await rm(state,{recursive:true,force:true});
   }
-  await rm(state,{recursive:true,force:true});
+  if (interrupted) process.exitCode = 130;
 }

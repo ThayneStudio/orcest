@@ -25,19 +25,10 @@ const logs = fs.openSync(path.join(root, 'harness.log'), 'a', 0o600);
 const python = process.env.ORCEST_TEST_PYTHON || '../.venv/bin/python';
 const harnessDir = path.join(root, 'fleet');
 const processStarted = Date.now();
-const child = spawn(python, ['scripts/local-harness.py', '--state-dir', harnessDir, '--port', '0'], {
-  stdio: ['ignore', logs, logs],
-});
+let child;
 let childFailure = null;
-child.on('error', error => { childFailure = error; });
 const sha = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 const manifest = {};
-for (const dir of ['build', 'dist']) {
-  for (const file of fs.readdirSync(dir, { recursive: true })) {
-    const full = path.join(dir, file);
-    if (fs.statSync(full).isFile()) manifest[full] = sha(full);
-  }
-}
 function save(name, value) {
   const target = path.join(root, name);
   fs.writeFileSync(target + '.tmp', JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
@@ -48,21 +39,30 @@ const readStatus = () => JSON.parse(fs.readFileSync(path.join(harnessDir, 'statu
 async function eventually(check, label, timeout = 30000) {
   const until = Date.now() + timeout;
   while (Date.now() < until) {
+    if (interrupted) throw new Error('Observation interrupted');
     if (childFailure) throw childFailure;
-    if (child.exitCode !== null) throw new Error(`Harness exited (${child.exitCode}): ${label}`);
+    if (child.exitCode !== null || child.signalCode !== null) throw new Error(`Harness exited (${child.exitCode}): ${label}`);
     try { const value = await check(); if (value) return value; } catch {}
     await sleep(200);
   }
   throw new Error(`Timed out: ${label}`);
 }
 function command(name) {
-  const result = spawnSync(python, ['scripts/local-harness.py', '--state-dir', harnessDir, '--command', name], { encoding: 'utf8' });
+  const result = spawnSync(python, ['scripts/local-harness.py', '--state-dir', harnessDir, '--command', name], { encoding: 'utf8', timeout: 10000 });
   assert.equal(result.status, 0, result.stderr);
 }
 const started = Date.now();
 let running = true;
 let interrupted = false;
-for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { interrupted = true; running = false; });
+let wakeSample;
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => {
+  interrupted = true; running = false; wakeSample?.();
+});
+const sampleSleep = ms => new Promise(resolve => {
+  const timer = setTimeout(finish, ms);
+  function finish() { clearTimeout(timer); wakeSample = undefined; resolve(); }
+  wakeSample = finish;
+});
 const summary = {
   synthetic: true, status: 'starting', qualified: false, startedAt: new Date(started).toISOString(),
   plannedSeconds: seconds, cadenceSeconds: cadence, samples: 0, failures: [],
@@ -74,6 +74,16 @@ let loginAt;
 let sessionExpiryAfterSeconds;
 let socket;
 try {
+  for (const dir of ['build', 'dist']) {
+    for (const file of fs.readdirSync(dir, { recursive: true })) {
+      const full = path.join(dir, file);
+      if (fs.statSync(full).isFile()) manifest[full] = sha(full);
+    }
+  }
+  child = spawn(python, ['scripts/local-harness.py', '--state-dir', harnessDir, '--port', '0'], {
+    stdio: ['ignore', logs, logs], detached: true,
+  });
+  child.on('error', error => { childFailure = error; });
   const initial = await eventually(() => { const s = readStatus(); return s.url && s; }, 'harness startup');
   const base = initial.url;
   const identity = { supervisor: initial.pid, redis: initial.redisPid, dashboard: initial.dashboardPid };
@@ -83,18 +93,22 @@ try {
     ...options, headers: { ...(cookie ? { Cookie: cookie } : {}), ...options.headers }, signal: AbortSignal.timeout(15000),
   });
   async function login() {
+    const requestedAt = Date.now();
     const response = await request('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"token":"local-harness"}' });
     assert.equal(response.status, 200);
     cookie = response.headers.get('set-cookie').split(';')[0];
-    loginAt = Date.now();
+    loginAt = requestedAt;
   }
   await eventually(async () => (await request('/api/ready')).status === 200, 'readiness');
   await login();
   const firstLoginAt = loginAt;
   summary.status = 'running';
+  const observationStarted = performance.now();
+  summary.startedAt = new Date().toISOString();
   const attempts = new Set();
   const deliveries = new Set();
   let previousSample = Date.now();
+  let previousSampleMonotonic = observationStarted;
   let sourceStopped = false;
   let sourceResumed = false;
   let warmRss = null;
@@ -111,27 +125,41 @@ try {
       const connection = new WebSocket(url, { headers: { Cookie: cookie } });
       socket = connection;
       let settled = false;
-      const timeout = setTimeout(() => { connection.terminate(); reject(new Error('Output probe timed out')); }, 10000);
+      const timeout = setTimeout(() => finish(new Error('Output probe timed out')), 10000);
       const finish = (error, result) => { if (settled) return; settled = true; clearTimeout(timeout); connection.terminate(); error ? reject(error) : resolve(result); };
       connection.on('message', raw => {
-        const message = JSON.parse(raw.toString());
-        if (message.error || message.unavailable) return finish(new Error('Output became unavailable'));
-        if (message.lines?.length) {
-          if (message.lines.some(line => priorLines.includes(line))) return finish(new Error('Output cursor replayed a previously read line'));
-          return finish(null, message);
-        }
-        if (message.done) finish(new Error('Execution ended during output probe'));
+        try {
+          const message = JSON.parse(raw.toString());
+          if (message.error || message.unavailable) return finish(new Error('Output became unavailable'));
+          assert(Array.isArray(message.lines), 'Output frame has no lines array');
+          assert(typeof message.last_id === 'string' && /^\d+-\d+$/.test(message.last_id), 'Output frame has no valid cursor');
+          if (message.lines.length) {
+            if (after) {
+              const [oldTime, oldSequence] = after.split('-').map(BigInt);
+              const [newTime, newSequence] = message.last_id.split('-').map(BigInt);
+              assert(newTime > oldTime || (newTime === oldTime && newSequence > oldSequence), 'Output cursor did not advance');
+            }
+            if (message.lines.some(line => priorLines.includes(line))) return finish(new Error('Output cursor replayed a previously read line'));
+            return finish(null, message);
+          }
+          if (message.done) finish(new Error('Execution ended during output probe'));
+        } catch (error) { finish(error); }
       });
       connection.on('error', error => finish(error));
+      connection.on('close', () => finish(new Error('Output probe closed before delivering lines')));
     });
   }
-  while (running && Date.now() - started < seconds * 1000) {
+  while (running) {
     const sampleStart = Date.now();
-    const elapsed = (sampleStart - started) / 1000;
+    const sampleMonotonic = performance.now();
+    const elapsed = (sampleMonotonic - observationStarted) / 1000;
     const sample = { at: new Date(sampleStart).toISOString(), elapsedSeconds: elapsed };
     try {
-      assert(sampleStart - previousSample <= Math.max(cadence * 1500, 30000), 'Sampling gap exceeds allowance');
+      assert(Math.max(sampleStart - previousSample, sampleMonotonic - previousSampleMonotonic) <= Math.max(cadence * 1500, 30000), 'Sampling gap exceeds allowance');
+      if (childFailure) throw childFailure;
+      assert(child.exitCode === null && child.signalCode === null, 'Harness exited during observation');
       previousSample = sampleStart;
+      previousSampleMonotonic = sampleMonotonic;
       const status = readStatus();
       assert.equal(status.pid, identity.supervisor);
       assert.equal(status.redisPid, identity.redis);
@@ -185,7 +213,7 @@ try {
       assert(lastRss < 512 * 1024, 'Dashboard RSS exceeds 512 MiB');
       if (warmRss !== null) assert(lastRss < Math.max(warmRss * 3, warmRss + 128 * 1024), 'Sustained memory growth exceeds the observation budget');
       sample.rssKiB = lastRss;
-      if (summary.samples % 10 === 0) for (const [file, expected] of Object.entries(manifest)) assert.equal(sha(file), expected, `Artifact changed: ${file}`);
+      if (summary.samples % 10 === 0 || elapsed >= seconds) for (const [file, expected] of Object.entries(manifest)) assert.equal(sha(file), expected, `Artifact changed: ${file}`);
     } catch (error) {
       sample.error = String(error.message || error);
       summary.failures.push({ at: sample.at, error: sample.error });
@@ -198,29 +226,37 @@ try {
       distinctAttempts: attempts.size, completedAttempts: deliveries.size, maxRssKiB: maxRss, lastRssKiB: lastRss,
       warmRssKiB: warmRss, sessionExpiryAfterSeconds });
     save('summary.json', summary);
-    if (running) await sleep(Math.max(0, cadence * 1000 - (Date.now() - sampleStart)));
+    if (elapsed >= seconds) break;
+    if (running) await sampleSleep(Math.max(0, Math.min(cadence * 1000 - (performance.now() - sampleMonotonic), seconds * 1000 - (performance.now() - observationStarted))));
   }
   summary.status = interrupted ? 'interrupted' : summary.failures.length ? 'failed' : 'finished';
-  summary.qualified = summary.status === 'finished' && seconds >= 13 * 3600 &&
+  summary.qualified = summary.status === 'finished' && summary.elapsedSeconds >= seconds && summary.elapsedSeconds >= 13 * 3600 &&
     summary.sessionExpiryObserved && summary.staleObserved && summary.freshnessRecovered &&
     summary.distinctAttempts >= 10 && summary.completedAttempts >= 10 && summary.reconnectChecks >= 10;
 } catch (error) {
-  summary.status = 'failed';
-  summary.failures.push({ at: new Date().toISOString(), error: String(error.message || error) });
+  summary.status = interrupted ? 'interrupted' : 'failed';
+  if (!interrupted) summary.failures.push({ at: new Date().toISOString(), error: String(error.message || error) });
 } finally {
   socket?.terminate();
-  child.kill('SIGTERM');
-  await Promise.race([new Promise(resolve => {
-    if (child.exitCode !== null || child.signalCode !== null) resolve(); else child.once('exit', resolve);
-  }), sleep(12000)]);
-  if (child.exitCode === null && child.signalCode === null) {
-    summary.failures.push({ error: 'Harness did not shut down within 12 seconds' });
-    summary.status = 'failed'; summary.qualified = false;
+  if (child?.pid && child.exitCode === null && child.signalCode === null) {
+    child.kill('SIGTERM');
+    await new Promise(resolve => {
+      const timer = setTimeout(resolve, 30000);
+      child.once('exit', () => { clearTimeout(timer); resolve(); });
+    });
+    if (child.exitCode === null && child.signalCode === null) {
+      // The harness owns its process group; kill only this invocation's descendants.
+      try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+      summary.failures.push({ error: 'Harness did not shut down within 30 seconds' });
+      summary.status = 'failed'; summary.qualified = false;
+    }
   }
+  if (interrupted) { summary.status = 'interrupted'; summary.qualified = false; }
   summary.finishedAt = new Date().toISOString();
   save('summary.json', summary);
   fs.closeSync(evidence);
   fs.closeSync(logs);
   console.log(JSON.stringify(summary, null, 2));
   if (summary.status === 'failed') process.exitCode = 1;
+  if (summary.status === 'interrupted') process.exitCode = 130;
 }

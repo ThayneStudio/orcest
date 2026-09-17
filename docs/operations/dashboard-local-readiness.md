@@ -47,6 +47,10 @@ See [local harness instructions](../dashboard-local-harness.md).
   existing task ownership, before any live rollout.
 
 The broader hardening goal remains incomplete until its required gates pass.
+Draft [PR #833](https://github.com/ThayneStudio/orcest/pull/833) contains this work.
+The first candidate passed required CI checks; review fixes need their own final
+CI result. The [local review report](dashboard-harness-review.md) records findings
+and verification. Automated GitHub review has not posted an approval.
 The local acceptance run uses a thirteen-hour, separately pinned harness so normal
 twelve-hour session expiry can be observed. The collector smoke passed 24 samples
 and 21 output cursor reconnect checks over two minutes with zero errors; it does

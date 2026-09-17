@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import math
 import os
 import secrets
 import shutil
@@ -281,8 +282,8 @@ def main():
         return
     if not owns:
         raise SystemExit("A harness already owns this state directory.")
-    if args.interval < 1 or not 0 <= args.port <= 65535:
-        raise SystemExit("Interval must be >= 1 second and port must be 0..65535.")
+    if not math.isfinite(args.interval) or args.interval < 1 or not 0 <= args.port <= 65535:
+        raise SystemExit("Interval must be finite and >= 1 second; port must be 0..65535.")
     if not (DASHBOARD / "build/server/index.js").exists():
         raise SystemExit("Build first: cd dashboard && npm ci && npm run build")
     node = shutil.which("node")
@@ -301,7 +302,7 @@ def main():
     config = root / "redis.conf"
     config.write_text(
         f"bind 127.0.0.1\nport {redis_port}\nrequirepass {password}\n"
-        f'dir "{data_dir}"\nsave ""\nappendonly yes\nappendfsync everysec\n'
+        'save ""\nappendonly yes\nappendfsync everysec\n'
     )
     config.chmod(0o600)
     # Stale commands from a crashed run must not affect a new invocation.
@@ -319,7 +320,9 @@ def main():
     )
 
     def start_redis():
-        processes["redis"] = subprocess.Popen([redis_binary, str(config)], stdout=log, stderr=log)
+        processes["redis"] = subprocess.Popen(
+            [redis_binary, str(config)], cwd=data_dir, stdout=log, stderr=log
+        )
         for _ in range(100):
             if processes["redis"].poll() is not None:
                 raise RuntimeError("Owned Redis failed to start; inspect processes.log")

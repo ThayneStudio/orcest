@@ -22,7 +22,7 @@ its store tests do not prove recovery of the currently deployed legacy queue.
 | Review findings | Every comment fixed or explicitly explained; review of final candidate | PR #817 approved with no blocking findings and merged; post-merge CI passed |
 | Supported runtime | Supported LTS Node, consistent build/deploy pins, type checks and image smoke | Node 24.20.0 passes local checks; candidate container authentication/assets/bundle smoke passed |
 | Dependency security | Audit locked dependencies; no unexplained high/critical findings | Updated lockfile reports zero npm advisories on 2026-09-05 |
-| Data correctness | Expiration, partial discovery, stale observations, completion evidence, account/worker distinction | Dashboard regression suite passes; local candidate reads live scoped data successfully |
+| Data correctness | Expiration, partial discovery, stale observations, completion evidence, account/worker distinction | Dashboard regression suite passes; previous candidate read live scoped data successfully; restored candidate awaits fleet connectivity |
 | Session/output behavior | Expiry, logout, token rotation, reconnect, bounded connections and output queues | Existing tests cover these boundaries; local process rehearsal passed |
 | Queue recovery | Crash before ACK, durable pending state, replay, ownership safety under concurrency | Existing unit and real-Redis tests identified; local process rehearsal passed; managed Redis integration/concurrency: 12 passed |
 | External outages | GitHub/Redis failures pause safely and recover without lost outcomes or repeated effects | Unit result-replay coverage passes; local process rehearsal passed |

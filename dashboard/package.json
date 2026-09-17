@@ -7,7 +7,7 @@
     "node": ">=24.20.0 <25"
   },
   "scripts": {
-    "harness": "${ORCEST_TEST_PYTHON:-../.venv/bin/python} scripts/local-harness.py",
+    "harness": "\"${ORCEST_TEST_PYTHON:-../.venv/bin/python}\" scripts/local-harness.py",
     "check:node": "node scripts/check-node-version.mjs",
     "check:bundle-runtime": "node scripts/check-bundle-runtime.mjs",
     "check:typecheck-coverage": "node scripts/check-typecheck-coverage.mjs",
