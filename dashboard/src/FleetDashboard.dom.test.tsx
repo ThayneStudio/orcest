@@ -286,3 +286,23 @@ it("does not show an unrelated snapshot when a new project filter fails", async 
   fireEvent.change(screen.getByLabelText("Project"), { target: { value: "" } });
   expect(await screen.findByRole("button", { name: "Open org/repo #2: Work 2" })).toBeTruthy();
 });
+
+it("opens live output from a worker outside the current work results and restores focus", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (input: string) => ({
+    ok: true,
+    status: 200,
+    json: async () => input.includes("/api/work/2") ? current : {
+      ...data, items: [],
+      workers: [{ id: "vm-1", prefix: "project-a", backend: "codex", revision: "test", ttl: 120, workId: "2" }],
+    },
+  })));
+  render(<FleetDashboard />);
+  await screen.findByRole("region", { name: "Upcoming" });
+  fireEvent.click(screen.getByRole("button", { name: "▤ Fleet" }));
+  const trigger = screen.getByRole("button", { name: "View work →" });
+  trigger.focus();
+  fireEvent.click(trigger);
+  expect(await screen.findByTestId("agent-output")).toHaveProperty("textContent", "attempt-new live");
+  fireEvent.click(screen.getByRole("button", { name: "Close detail" }));
+  expect(document.activeElement).toBe(trigger);
+});

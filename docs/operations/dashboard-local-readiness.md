@@ -61,7 +61,7 @@ record below. These items remain open until all required evidence is available.
 ## Restored remote validation — September 18, 2026 UTC
 
 The active goal now includes real-fleet validation through the restored management
-host connection. A separate candidate at `http://localhost:4319` reads the same
+host connection. The initial candidate at `http://localhost:4319` reads the same
 four-project scope as the deployed dashboard through a loopback SSH tunnel.
 Production containers, scheduling, worker VMs, and Cloudflare remain unchanged.
 Credentials stay in private local configuration outside this repository.
@@ -84,7 +84,7 @@ updating message, matching recovered results, and no unrelated cards during a
 filter change. The full dashboard suite now passes 807 tests; type checks and
 the production build also pass.
 
-Two independent, pinned observations are running, neither qualified yet:
+Initial observation record (superseded by the update below):
 
 - Synthetic: `local-soak-20260917-v2`, started September 17 at 21:56:35 UTC,
   planned thirteen hours. At September 18 02:15 UTC it had 260 samples, 211
@@ -99,3 +99,31 @@ Both runs pin `b64c619`; they do not silently adopt subsequent browser fixes.
 Audit their artifacts and revision coverage before attributing evidence to a
 final candidate. Preserve any restart or interruption as a separate interval.
 Required CI passed for `b64c619`; subsequent commits require fresh checks.
+
+
+### Current validation interval and worker detail fix
+
+The current real-data candidate is `http://localhost:4320`, pinned to `61f10be`.
+The first real interval was stopped to expand evidence collection. Its successor
+failed at the third sample because work coverage was incomplete; the exact cause
+was not captured. A subsequent five-minute diagnostic was healthy. Both intervals
+are retained and excluded from the fresh interval, `live-validation-20260918-v3`,
+which started September 18 at 02:43:23 UTC. At 03:08 UTC its 26 samples had no
+failures; new execution, incremental output and delivery were still unobserved.
+The synthetic interval continues independently: 313 samples, 251 reconnect checks
+and zero failures at 03:08 UTC. Neither interval qualifies until its full duration,
+session-expiry and workload requirements pass a separate audit.
+
+Current real-candidate browser QA confirmed the filter loading state, matching
+results, PR context and keyboard focus restoration. A further browser-path defect
+was found: a worker's **View work** link bypassed detail initialization when its
+work was outside the filtered results. The link now uses the normal initialization,
+opens Output for executing work, clears prior selection state, and restores focus
+when closed. A regression test failed before the fix and passed afterward. Browser
+QA with all work filtered out verified live simulated output and focus restoration.
+All 808 dashboard tests, type checks covering 102 files, and the production build
+pass. Required CI passed for `61f10be`; this additional fix requires fresh CI.
+
+The current browser fix does not change server code. Compare built server artifacts
+before carrying forward server-only endurance evidence; neither synthetic activity
+nor historical deliveries satisfy the fresh real-execution gate.

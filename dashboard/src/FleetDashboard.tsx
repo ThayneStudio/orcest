@@ -230,13 +230,16 @@ export default function FleetDashboard() {
     }
   }, [selected, attention]);
   function open(work: FleetWork) {
+    openWork(work.id, work);
+  }
+  function openWork(id: string, work: FleetWork | null) {
     returnFocus.current = document.activeElement as HTMLElement;
-    setSelected(work.id);
+    setSelected(id);
     setDetail(work);
     setDetailError("");
     setAttention(false);
     setAttemptId(null);
-    setTab(work.activity === "executing" ? "output" : "context");
+    setTab(!work || work.activity === "executing" ? "output" : "context");
   }
   function close() {
     setSelected(null);
@@ -578,12 +581,9 @@ export default function FleetDashboard() {
                     {w.workId ? (
                       <button
                         onClick={() => {
-                          const work = items.find((i) => i.id === w.workId);
-                          if (work) open(work);
-                          else {
-                            setSelected(w.workId);
-                            setDetail(null);
-                          }
+                          const workId = w.workId;
+                          if (!workId) return;
+                          openWork(workId, items.find((i) => i.id === workId) ?? null);
                         }}
                       >
                         View work →
