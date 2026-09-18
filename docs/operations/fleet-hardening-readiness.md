@@ -233,3 +233,17 @@ release, provider cooldown recovery, Redis unavailability/reconnection, dashboar
 restart/session invalidation, reset and logout. The dashboard suite now has 805
 passing tests, including the simulation label. Runtime setup and controls are
 repeatable from the documented harness command.
+
+
+## Remote access restored — September 18, 2026 UTC
+
+Read-only access is restored through `pve-test.lab.prefixa.net` to the
+orchestrator VM at `10.20.1.129`. The earlier DNS/connectivity failure above is
+historical. Live service health and revisions were read back before connecting
+the isolated localhost candidate. No fleet service was deployed or restarted.
+
+The new twenty-four-hour observation began at 02:11:26 UTC on September 18.
+Its artifacts are stored persistently under `live-validation-20260918`, separate
+from the thirteen-hour synthetic run. Neither interval is qualified while still
+running. See [current readiness evidence](dashboard-local-readiness.md) for
+browser checks, remaining gaps, and pinned-candidate limitations.

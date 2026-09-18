@@ -54,5 +54,48 @@ and verification. Automated GitHub review has not posted an approval.
 The local acceptance run uses a thirteen-hour, separately pinned harness so normal
 twelve-hour session expiry can be observed. The collector smoke passed 24 samples
 and 21 output cursor reconnect checks over two minutes with zero errors; it does
-not qualify the longer run. Interactive browser QA is awaiting macOS Computer
-Use permissions. These items remain open until evidence is available.
+not qualify the longer run. Browser control became available on September 18 UTC; see the validation
+record below. These items remain open until all required evidence is available.
+
+
+## Restored remote validation — September 18, 2026 UTC
+
+The active goal now includes real-fleet validation through the restored management
+host connection. A separate candidate at `http://localhost:4319` reads the same
+four-project scope as the deployed dashboard through a loopback SSH tunnel.
+Production containers, scheduling, worker VMs, and Cloudflare remain unchanged.
+Credentials stay in private local configuration outside this repository.
+
+Browser checks on candidate `b64c619` verified sign-in, sign-out, scoped project
+and search results, exceptional attention items, completed task context, attempt
+history and retained output. The fleet view distinguishes three configured
+provider accounts from the pool and four worker records. Missing provider usage
+is shown as **Not reported**. Fleet and task detail layouts were inspected at
+390 × 844 as well as desktop size. Synthetic incremental output also worked.
+Real incremental output still needs an active execution; the fleet was idle
+during these checks. Interactive Redis outage/recovery passed in the isolated harness; no outage was
+injected into the real fleet.
+
+A filter race found during browser QA is fixed in this PR: old cards are hidden
+while the selected project/search request is pending, and superseded responses
+cannot replace newer results. Regression tests cover delayed responses and failed
+project changes. Browser verification in the isolated harness confirmed the
+updating message, matching recovered results, and no unrelated cards during a
+filter change. The full dashboard suite now passes 807 tests; type checks and
+the production build also pass.
+
+Two independent, pinned observations are running, neither qualified yet:
+
+- Synthetic: `local-soak-20260917-v2`, started September 17 at 21:56:35 UTC,
+  planned thirteen hours. At September 18 02:15 UTC it had 260 samples, 211
+  reconnect checks, stale/recovery evidence and zero failures. Normal session
+  expiry had not yet occurred.
+- Real fleet: `live-validation-20260918/observation`, started September 18 at
+  02:11:26 UTC, planned twenty-four hours. Initial samples passed. New execution
+  and independently verified delivery are still required; idle elapsed time
+  cannot qualify this gate. The collector requires a separate evidence audit.
+
+Both runs pin `b64c619`; they do not silently adopt subsequent browser fixes.
+Audit their artifacts and revision coverage before attributing evidence to a
+final candidate. Preserve any restart or interruption as a separate interval.
+Required CI passed for `b64c619`; subsequent commits require fresh checks.

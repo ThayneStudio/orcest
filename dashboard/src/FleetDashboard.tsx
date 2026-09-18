@@ -115,6 +115,7 @@ export default function FleetDashboard() {
     [limit, setLimit] = useState(150),
     [selected, setSelected] = useState<string | null>(null),
     [attention, setAttention] = useState(false);
+  const [snapshotFilter, setSnapshotFilter] = useState({ project: "", query: "" });
   const [detail, setDetail] = useState<FleetWork | null>(null),
     [detailError, setDetailError] = useState(""),
     [tab, setTab] = useState("context"),
@@ -150,7 +151,9 @@ export default function FleetDashboard() {
           limit: String(limit),
         });
         const next = await readPages(params, limit, abort.signal);
+        if (abort.signal.aborted) return;
         setData(next);
+        setSnapshotFilter({ project, query });
         setError("");
       } catch (e) {
         if (!abort.signal.aborted) setError((e as Error).message);
@@ -158,6 +161,7 @@ export default function FleetDashboard() {
         if (!abort.signal.aborted) timer = setTimeout(poll, 3000);
       }
     }
+    setError("");
     void poll();
     return () => {
       abort.abort();
@@ -239,6 +243,9 @@ export default function FleetDashboard() {
     setAttention(false);
     setDetailError("");
   }
+  const filtersPending =
+    !!data &&
+    (snapshotFilter.project !== project || snapshotFilter.query !== query);
   const allocated = data?.pools.reduce((n, p) => n + p.active_count, 0) ?? 0;
   const warm = data?.pools.reduce((n, p) => n + p.idle_count, 0) ?? 0;
   const items = data?.items || [],
@@ -366,7 +373,8 @@ export default function FleetDashboard() {
         </div>
         {error && (
           <div className="fleet-warning" role="alert">
-            {error} {data ? "Showing the last successful snapshot." : ""}
+            {error}{" "}
+            {data && !filtersPending ? "Showing the last successful snapshot." : ""}
           </div>
         )}
         {data?.notices.map((n) => (
@@ -379,7 +387,12 @@ export default function FleetDashboard() {
             Loading fleet observations…
           </div>
         )}
-        {view === "board" && data && (
+        {view === "board" && filtersPending && !error && (
+          <div className="fleet-empty" role="status">
+            Updating work for the selected filters…
+          </div>
+        )}
+        {view === "board" && data && !filtersPending && (
           <>
             <div className="fleet-board">
               {stages.map((stage) => {

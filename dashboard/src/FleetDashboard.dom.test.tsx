@@ -1,5 +1,6 @@
 /** @vitest-environment happy-dom */
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -239,4 +240,49 @@ it("labels simulated fleet data without disguising it as a production feed", asy
   })));
   render(<FleetDashboard />);
   expect(await screen.findByText(/Local harness · Simulated fleet activity/)).toBeTruthy();
+});
+
+
+it("hides old cards during filter changes and ignores late superseded responses", async () => {
+  const pending = new Map<string, (value: WorkView) => void>();
+  vi.stubGlobal("fetch", vi.fn(async (input: string) => {
+    const query = new URL(input, window.location.origin).searchParams.get("q");
+    return {
+      ok: true, status: 200,
+      json: () => query
+        ? new Promise<WorkView>((resolve) => pending.set(query, resolve))
+        : Promise.resolve(data),
+    };
+  }));
+  render(<FleetDashboard />);
+  await screen.findByRole("button", { name: "Open org/repo #2: Work 2" });
+  fireEvent.change(screen.getByLabelText("Search work"), { target: { value: "first" } });
+  expect(screen.queryByRole("button", { name: "Open org/repo #2: Work 2" })).toBeNull();
+  expect(screen.getByRole("status").textContent).toContain("Updating work");
+  await waitFor(() => expect(pending.has("first")).toBe(true));
+  fireEvent.change(screen.getByLabelText("Search work"), { target: { value: "second" } });
+  await waitFor(() => expect(pending.has("second")).toBe(true));
+  await act(async () => pending.get("second")!({ ...data, items: [work("42")] }));
+  expect(await screen.findByRole("button", { name: "Open org/repo #42: Work 42" })).toBeTruthy();
+  await act(async () => pending.get("first")!({ ...data, items: [work("41")] }));
+  expect(screen.queryByRole("button", { name: "Open org/repo #41: Work 41" })).toBeNull();
+  expect(screen.getByRole("button", { name: "Open org/repo #42: Work 42" })).toBeTruthy();
+});
+
+it("does not show an unrelated snapshot when a new project filter fails", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (input: string) => ({
+    ok: !new URL(input, window.location.origin).searchParams.get("project"),
+    status: 503,
+    json: async () => data,
+  })));
+  render(<FleetDashboard />);
+  await screen.findByRole("button", { name: "Open org/repo #2: Work 2" });
+  fireEvent.change(screen.getByLabelText("Project"), { target: { value: "org/other" } });
+  const warning = await screen.findByRole("alert");
+  expect(warning.textContent).toContain("could not refresh");
+  expect(warning.textContent).not.toContain("Showing the last successful snapshot");
+  expect(screen.queryByRole("button", { name: "Open org/repo #2: Work 2" })).toBeNull();
+  expect(screen.queryByText("Updating work for the selected filters…")).toBeNull();
+  fireEvent.change(screen.getByLabelText("Project"), { target: { value: "" } });
+  expect(await screen.findByRole("button", { name: "Open org/repo #2: Work 2" })).toBeTruthy();
 });
