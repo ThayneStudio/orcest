@@ -95,6 +95,9 @@ These records may describe behavior that has since changed:
 - [Phase 2: full PR management](../plans/phase-2-full-pr-management.md)
 - [Phase 3: issue processing](../plans/phase-3-issue-processing.md)
 - [Phase 4: codebase improvement](../plans/phase-4-codebase-improvement.md)
+- [Archived local planning disposition](../superpowers/local-planning-archive-disposition.md) —
+  August incident and harness records, implementation mapping, and operational
+  evidence gaps.
 - [Superpowers plans and specs](../superpowers/)
 
 When historical text conflicts with current behavior,
