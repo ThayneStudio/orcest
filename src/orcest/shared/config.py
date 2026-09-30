@@ -4,8 +4,9 @@ Loads from YAML files with environment variable overrides for secrets
 and deployment-specific values.
 """
 
+import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,8 @@ import yaml
 
 from orcest.shared.models import is_claude_provider, require_valid_provider_name
 from orcest.shared.providers import ProviderEntry
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -778,11 +781,25 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     )
 
     # Labels
-    labels_raw = {k.replace("-", "_"): v for k, v in _safe_dict(raw, "labels").items()}
-    unsupported_label_keys = sorted(set(labels_raw) - {"needs_human", "ready"})
-    if unsupported_label_keys:
-        joined_keys = ", ".join(unsupported_label_keys)
-        raise ValueError(f"Unsupported labels config key(s): {joined_keys}")
+    #
+    # Unrecognized keys are ignored with a warning rather than rejected. Retired
+    # keys (`blocked`, `queued`, `in_progress`) still sit in hand-maintained
+    # orchestrator.yaml files, and `orcest orchestrate` runs under
+    # `restart: unless-stopped` against a read-only bind mount -- raising here
+    # turns a stale key into an unrecoverable restart loop. This also matches how
+    # every other section of this loader treats unknown keys.
+    labels_input = _safe_dict(raw, "labels")
+    known_label_keys = {f.name for f in fields(LabelConfig)}
+    unknown_label_keys = sorted(
+        key for key in labels_input if key.replace("-", "_") not in known_label_keys
+    )
+    if unknown_label_keys:
+        logger.warning(
+            "Ignoring unrecognized labels config key(s): %s (supported: %s)",
+            ", ".join(unknown_label_keys),
+            ", ".join(sorted(known_label_keys)),
+        )
+    labels_raw = {k.replace("-", "_"): v for k, v in labels_input.items()}
     labels_config = LabelConfig(
         needs_human=_safe_str(
             labels_raw.get("needs_human", "orcest:needs-human"), "labels.needs_human"
