@@ -766,8 +766,8 @@ real IP (or DNS name) in fleet config and retry.
 
 ## Further reading
 
-- [`docs/wiki/`](docs/wiki/) — current orchestration behavior and the proposed
-  workflow-control specification plan.
+- [`docs/wiki/`](docs/wiki/) — current orchestration behavior and the accepted
+  workflow-control specification, with implementation evidence.
 - [`docs/wiki/current-orchestrator-state-model.md`](docs/wiki/current-orchestrator-state-model.md) — currently implemented per-task state transitions.
 - [`docs/adding-a-provider.md`](docs/adding-a-provider.md) — end-to-end recipe for a new agent.
 - [`docs/rollout-multi-provider.md`](docs/rollout-multi-provider.md) — provider rollout playbook.

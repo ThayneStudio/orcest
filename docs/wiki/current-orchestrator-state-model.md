@@ -1,10 +1,10 @@
 # Current Orchestrator State Model
 
-> **Status:** This document describes the currently implemented orchestrator
-> behavior. It is not the proposed durable pre-PR workflow specification.
+> **Status:** This document describes the currently implemented legacy GitHub/Redis
+> orchestrator behavior. It is not the proposed durable pre-PR workflow specification.
 
 See the [wiki index](README.md) for the accepted workflow-control
-specification and its completed writing plan.
+specification, its completed writing plan, and current v1 implementation evidence.
 
 GitHub PRs and issues are the source of truth. Redis is coordination state:
 queues, locks, pending markers, cooldowns, and retry counters. Redis state may

@@ -6906,6 +6906,13 @@ locked, audited purge. No age-only or orphan rule applies to these rows.
 
 ## Evidence and migration
 
+The evidence below records the legacy GitHub/Redis implementation at the
+August 2026 specification baseline. It is historical migration context, not
+an inventory of the v1 components now present in `src/orcest/workflow_contract/`,
+`src/orcest/workflow_reducer/`, and `src/orcest/workflow_store/`. Implementation
+and production qualification are separate; consult the [wiki index](README.md)
+for current implementation evidence.
+
 The proposed store replaces several current Redis-authoritative workflow
 mechanisms while retaining their useful safety lessons:
 

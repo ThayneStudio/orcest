@@ -33,6 +33,21 @@ and `MAY` are normative only in an accepted specification page.
 - [Adding a provider](../adding-a-provider.md) — current provider integration
   contract.
 
+## Current v1 implementation evidence
+
+The accepted specification is accompanied by implementation modules in
+[`workflow_contract`](../../src/orcest/workflow_contract/),
+[`workflow_reducer`](../../src/orcest/workflow_reducer/), and
+[`workflow_store`](../../src/orcest/workflow_store/), with corresponding
+[contract](../../tests/workflow_contract/),
+[reducer](../../tests/workflow_reducer/), and
+[store](../../tests/workflow_store/) tests. These artifacts do not establish
+which components are deployed or whether a fleet has passed release gates.
+[Observability](../workflow-v1-observability.md) describes implemented v1
+release diagnostics. The evidence and migration sections of normative pages
+retain the August 2026 legacy baseline rather than tracking implementation
+progress.
+
 ## Accepted v1 specification
 
 The accepted design gives Orcest authority over work between forge intake and

@@ -698,6 +698,13 @@ Project.
 
 ## Evidence and migration
 
+The evidence below records the legacy GitHub/Redis implementation at the
+August 2026 specification baseline. It is historical migration context, not
+an inventory of the v1 components now present in `src/orcest/workflow_contract/`,
+`src/orcest/workflow_reducer/`, and `src/orcest/workflow_store/`. Implementation
+and production qualification are separate; consult the [wiki index](README.md)
+for current implementation evidence.
+
 Current evidence:
 
 - `src/orcest/fleet/config.py` stores organizations, raw credential material,
