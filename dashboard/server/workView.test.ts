@@ -83,6 +83,52 @@ const run: WorkAttempt = {
   outputPrefix: "project-a",
 };
 describe("work lifecycle projection", () => {
+  it("reports each physical project source's freshness without exposing account fields", async () => {
+    store.clear();
+    const now = Date.now() / 1000;
+    store.set("project-a:dashboard:project", {
+      repo: "org/repo",
+      prefix: "forged-prefix",
+      observed_at: String(now),
+      accounts: "[]",
+      credential: "fixture-secret",
+    });
+    store.set("project-b:dashboard:project", {
+      repo: "org/repo",
+      observed_at: String(now - 181),
+      accounts: "[]",
+    });
+    // A discovered source can disappear between SCAN and HGETALL. Retain its
+    // physical identity and report unavailable freshness instead of losing it.
+    store.set("project-c:dashboard:project", {});
+    const result = await fetchWorkView(message);
+    expect(result.sourceObservations).toEqual([
+      {
+        id: Buffer.from("project-a:dashboard:project").toString("base64url"),
+        prefix: "project-a",
+        project: "org/repo",
+        observedAt: now,
+        stale: false,
+      },
+      {
+        id: Buffer.from("project-b:dashboard:project").toString("base64url"),
+        prefix: "project-b",
+        project: "org/repo",
+        observedAt: now - 181,
+        stale: true,
+      },
+      {
+        id: Buffer.from("project-c:dashboard:project").toString("base64url"),
+        prefix: "project-c",
+        project: null,
+        observedAt: null,
+        stale: true,
+      },
+    ]);
+    expect(result.projects).toEqual(["org/repo"]);
+    expect(result.coverage).toBe("partial");
+    expect(JSON.stringify(result.sourceObservations)).not.toContain("fixture-secret");
+  });
   it("omits hashes that disappear after discovery without shifting another card's attempt", async () => {
     store.clear();
     const now = String(Date.now() / 1000);

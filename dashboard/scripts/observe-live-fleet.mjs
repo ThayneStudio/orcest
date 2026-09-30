@@ -8,7 +8,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { WebSocket } from 'ws';
-import { qualifies, freshAttempt, verifiedDelivery, observeCoverage } from './live-evidence.mjs';
+import { qualifies, freshAttempt, verifiedDelivery, observeCoverage, createCoverageHealth } from './live-evidence.mjs';
 
 const args = process.argv.slice(2);
 const option = (name, fallback) => {
@@ -18,6 +18,11 @@ const option = (name, fallback) => {
 const base = new URL(option('--url'));
 assert(base.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(base.hostname));
 assert(!base.username && !base.password && !base.search && base.pathname === '/');
+const projectOption = option('--projects');
+assert(projectOption, '--projects must list the independently intended owner/repo scope');
+const expectedProjects = projectOption.split(',').sort();
+assert(expectedProjects.length > 0 && new Set(expectedProjects).size === expectedProjects.length &&
+  expectedProjects.every(project => /^[^/\s]+\/[^/\s]+$/.test(project)), 'Invalid intended project scope');
 const revision = option('--revision');
 assert(/^[0-9a-f]{40}$/.test(revision || ''), '--revision must be a full commit SHA');
 const pid = Number(option('--pid'));
@@ -102,6 +107,8 @@ async function inventory() {
   let expectedTotal;
   const ids = new Set();
   const notices = new Set();
+  const sources = new Map();
+  let sourceIdentity;
   let partial = false;
   while (offset !== null) {
     const response = await request(`/api/work?limit=500&offset=${offset}`);
@@ -126,6 +133,19 @@ async function inventory() {
       assert(typeof item.id === 'string' && !ids.has(item.id), 'Duplicate or invalid work ID');
       ids.add(item.id);
     }
+    assert(Array.isArray(page.sourceObservations), 'Project source metadata required');
+    const pageIdentity = page.sourceObservations.map(source => ({id:source.id,prefix:source.prefix,project:source.project})).sort((a,b) => a.id.localeCompare(b.id));
+    if (sourceIdentity === undefined) sourceIdentity = pageIdentity;
+    else assert.deepEqual(pageIdentity, sourceIdentity, 'Source inventory changed during pagination');
+    const pageSourceIds = new Set();
+    for (const source of page.sourceObservations) {
+      assert(typeof source.id === 'string' && !pageSourceIds.has(source.id) && typeof source.stale === 'boolean', 'Invalid source metadata');
+      pageSourceIds.add(source.id);
+      const previous = sources.get(source.id);
+      // Pagination is not atomic. Preserve stale evidence from any page until
+      // the same source is explicitly fresh in a later complete sample.
+      if (!previous || source.stale) sources.set(source.id, source);
+    }
     for (const notice of page.notices) notices.add(notice);
     if (page.coverage === 'partial') partial = true;
     items.push(...page.items);
@@ -135,7 +155,7 @@ async function inventory() {
     offset = next;
   }
   assert.equal(items.length, expectedTotal, 'Inventory pages missing records');
-  const inventory = { ...result, items, notices:[...notices], coverage:partial ? 'partial' : 'complete' };
+  const inventory = { ...result, items, sourceObservations:[...sources.values()], notices:[...notices], coverage:partial ? 'partial' : 'complete' };
   summary.lastInventory = {coverage:inventory.coverage,total:inventory.total,notices:inventory.notices,
     staleItems:items.filter(item => item.stale).length};
   return inventory;
@@ -178,7 +198,7 @@ async function output(attempt, after) {
 }
 const summary = { synthetic: false, status: 'starting', qualified: false, plannedSeconds: seconds,
   cadenceSeconds: cadence, maximumPartialSeconds,
-  coverageHealth:{partialSince:null,completeSamples:0,partialSamples:0,recoveredEpisodes:0,maxPartialSeconds:0}, samples: 0, failures: [], outputAttempts: [], deliveries: [],
+  coverageHealth:createCoverageHealth([]), samples: 0, failures: [], outputAttempts: [], deliveries: [],
   sessionExpiryObserved: false, logoutVerified: false, elapsedSeconds: 0 };
 let phase = 'initialization';
 try {
@@ -196,7 +216,12 @@ try {
   await login();
   phase = 'initial inventory';
   const initial = await inventory();
-  const expectedProjects = initial.projects.slice().sort();
+  assert.deepEqual(initial.projects.slice().sort(), expectedProjects, 'Initial project scope differs from intended scope');
+  assert.deepEqual([...new Set(initial.sourceObservations.map(source => source.project).filter(Boolean))].sort(),
+    expectedProjects, 'Project freshness metadata does not cover intended projects');
+  const expectedSourceIds = initial.sourceObservations.map(source => source.id).sort();
+  assert(expectedSourceIds.length > 0, 'Expected nonempty source scope');
+  summary.coverageHealth = createCoverageHealth(expectedSourceIds);
   assert(expectedProjects.length > 0, 'Expected nonempty fleet project scope');
   const baseline = new Set(initial.items.map(item => item.latestAttempt?.taskId).filter(Boolean));
   const startedAt = Date.now();
@@ -204,7 +229,7 @@ try {
   summary.startedAt = new Date(startedAt).toISOString();
   summary.status = 'running';
   save('manifest.json', { artifacts, revision, pid, identity, url: base.origin,
-    expectedProjects, baselineTaskIds: [...baseline], startedAt: summary.startedAt, collectorPid: process.pid });
+    expectedProjects, expectedSourceIds, baselineTaskIds: [...baseline], startedAt: summary.startedAt, collectorPid: process.pid });
   const cursors = new Map();
   const delivered = new Set();
   let previousWall = startedAt;
@@ -236,8 +261,12 @@ try {
       phase = 'source coverage and recovery';
       observeCoverage(summary.coverageHealth, work, elapsed, maximumPartialSeconds);
       assert.deepEqual(work.projects.slice().sort(), expectedProjects, 'Project scope changed');
+      assert.deepEqual([...new Set(work.sourceObservations.map(source => source.project).filter(Boolean))].sort(),
+        expectedProjects, 'Project freshness metadata does not cover intended projects');
       assert.equal(work.counts.upcoming + work.counts.in_progress + work.counts.done + work.counts.unknown, work.total, 'Work accounting inconsistent');
       sample.coverage = work.coverage;
+      sample.sourceObservations = work.sourceObservations;
+      sample.staleWork = work.items.filter(item => item.stale).map(item => ({id:item.id,project:item.project,observedAt:item.observedAt}));
       sample.notices = work.notices;
       sample.counts = work.counts;
       sample.projects = work.projects;
@@ -260,6 +289,10 @@ try {
         }
         if (!item.stale && item.stage === 'done' && summary.outputAttempts.includes(attempt.taskId) && !delivered.has(attempt.taskId)) {
           phase = 'independent GitHub delivery';
+          if (typeof item.headSha !== 'string' || !/^[0-9a-f]{40}$/.test(item.headSha)) {
+            sample.pendingDeliveries = [...(sample.pendingDeliveries || []), {taskId:attempt.taskId,reason:'Observed publication head SHA is missing'}];
+            continue;
+          }
           const url = item.kind === 'pr' ? item.url : item.publicationUrl;
           if (!url) continue;
           assert(/^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+$/.test(url), 'Invalid delivery URL');

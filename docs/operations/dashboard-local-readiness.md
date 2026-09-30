@@ -148,8 +148,15 @@ A new thirteen-hour synthetic interval started at 2026-09-30T23:19:40Z.
 The reviewed `dashboard/scripts/observe-live-fleet.mjs` collector provides
 separate live qualification: pinned process/artifact identity, normal session
 expiry, logout, full project inventory, new execution with advancing output,
-and independently verified delivery for the same attempt. Known stale-source
-notices are recorded as degradation and must recover within ten minutes;
+and independently verified delivery for the same attempt and observed full
+publication head SHA. A missing head SHA stays pending until refreshed; it
+cannot establish delivery. Known stale-source
+notices are attributed to individual work IDs and physical project-source IDs.
+Each stale record must explicitly become fresh under the same ID within ten
+minutes; disappearing records never prove recovery. Overlapping episodes can
+keep the fleet-wide partial-coverage union open longer, and that duration is
+recorded only as a diagnostic. Qualification requires all episodes closed,
+at least one complete sample, and the independently intended project scope;
 unavailable feeds, unexplained notices, sampling gaps and process changes
 fail the interval. Idle uptime alone cannot qualify.
 
@@ -159,6 +166,7 @@ Run the live collector from `dashboard/`, with the pinned Node runtime:
 node scripts/observe-live-fleet.mjs \
   --url http://127.0.0.1:44319 --pid LOCAL_CANDIDATE_PID \
   --revision FULL_CANDIDATE_SHA --token-file PRIVATE_TOKEN_FILE \
+  --projects ThayneStudio/orcest,ThayneStudio/transit-platform,bluebamboollc/bbr-platform,dewdropsllc/asemly \
   --state-dir NEW_PERSISTENT_EVIDENCE_DIRECTORY
 node --test scripts/live-evidence.check.mjs
 ```
