@@ -1,11 +1,14 @@
 """Unit tests for orchestrator and worker config loading."""
 
+import logging
+from dataclasses import fields
 from pathlib import Path
 
 import pytest
 
 from orcest.shared.config import (
     _PROVIDER_ENV_CANDIDATES,
+    LabelConfig,
     ProjectConfig,
     RunnerConfig,
     build_redis_config,
@@ -1030,12 +1033,65 @@ def test_labels_hyphenated_yaml_keys_are_accepted(tmp_path: Path):
     assert config.labels.ready == "orcest:ready"
 
 
-def test_unsupported_label_config_key_is_rejected(tmp_path: Path):
-    cfg_file = tmp_path / "orcest.yaml"
-    cfg_file.write_text("github:\n  repo: acme/widgets\nlabels:\n  unsupported-key: custom:value\n")
+def test_retired_label_config_keys_do_not_break_config_load(tmp_path: Path):
+    """A config carrying retired label keys must still load.
 
-    with pytest.raises(ValueError, match=r"Unsupported labels config key.*unsupported_key"):
+    `blocked`, `queued` and `in_progress` were all removed from LabelConfig in
+    earlier releases and still sit in hand-maintained orchestrator.yaml files.
+    Raising on them turns `orcest orchestrate` into a restart loop against a
+    read-only bind-mounted config that cannot self-repair.
+    """
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n"
+        "  repo: acme/widgets\n"
+        "labels:\n"
+        "  blocked: orcest:blocked\n"
+        "  queued: orcest:queued\n"
+        "  in-progress: orcest:in-progress\n"
+        "  ready: custom:ready\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.labels.ready == "custom:ready"
+    assert config.labels.needs_human == "orcest:needs-human"
+
+
+def test_unrecognized_label_config_keys_are_warned_about(tmp_path: Path, caplog):
+    """Unknown keys are ignored, but must be surfaced so typos are findable.
+
+    The warning reports the operator's literal spelling (`in-progress`), not the
+    underscore-normalized form, so it can be grepped for in the YAML.
+    """
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\nlabels:\n  in-progress: orcest:in-progress\n"
+    )
+
+    with caplog.at_level(logging.WARNING):
         load_orchestrator_config(cfg_file)
+
+    assert "in-progress" in caplog.text
+    assert "in_progress" not in caplog.text
+
+
+def test_every_label_config_field_is_accepted_without_warning(tmp_path: Path, caplog):
+    """Every LabelConfig field must be accepted without editing a second list.
+
+    Guards against the known-key set drifting out of sync with the dataclass
+    when a label is added: a newly supported key must not warn.
+    """
+    cfg_file = tmp_path / "orcest.yaml"
+    field_lines = "".join(f"  {f.name}: custom:{f.name}\n" for f in fields(LabelConfig))
+    cfg_file.write_text(f"github:\n  repo: acme/widgets\nlabels:\n{field_lines}")
+
+    with caplog.at_level(logging.WARNING):
+        config = load_orchestrator_config(cfg_file)
+
+    for f in fields(LabelConfig):
+        assert getattr(config.labels, f.name) == f"custom:{f.name}"
+    assert "labels" not in caplog.text
 
 
 def test_runner_hyphenated_yaml_keys_are_accepted_orchestrator(tmp_path: Path):
