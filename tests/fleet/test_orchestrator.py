@@ -814,7 +814,8 @@ class TestRedisCliRoutedThroughDockerExec:
         assert result == "a" * 40
         cmd = ssh.call_args[0][1]
         assert "docker exec orcest-redis-redis-1" in cmd
-        assert "GET orcest:pool:current_template_revision" in cmd
+        assert "EVAL" in cmd
+        assert "orcest:pool:template_revision:" in cmd
 
     def test_get_current_template_revision_returns_none_when_unset(self, mocker):
         from orcest.fleet.orchestrator import get_current_template_revision
@@ -1661,3 +1662,109 @@ class TestRedisCliAuthenticates:
         )
         get_current_template_vmid("user@host")
         assert "--raw" in ssh.call_args[0][1]
+
+
+def test_frozen_source_archive_ignores_edits_after_revision_check(tmp_path, mocker):
+    """A checkout edit after preflight must never ship under the frozen SHA."""
+    import tarfile
+
+    from orcest.fleet import orchestrator as orch
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    files = {
+        "pyproject.toml": "[project]\nname='fixture'\n",
+        "requirements.lock": "pinned dependency\n",
+        "src/orcest/example.py": "original committed bytes\n",
+        "src/orcest/__init__.py": "",
+    }
+    layout = orch._resolve_source_layout(Path(__file__).resolve().parents[2])
+    for name in layout.deploy_files:
+        files.setdefault(
+            str(layout.deploy_files[name].relative_to(Path(__file__).resolve().parents[2])),
+            "fixture\n",
+        )
+    for name, content in files.items():
+        target = root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        cwd=root,
+        check=True,
+    )
+    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+    original_resolve = orch._resolve_deploy_revision
+
+    def edit_after_resolve(source_root):
+        resolved = original_resolve(source_root)
+        (root / "src/orcest/example.py").write_text("unreviewed concurrent edit\n")
+        return resolved
+
+    mocker.patch.object(orch, "_resolve_deploy_revision", side_effect=edit_after_resolve)
+    archive_path = orch.create_source_tarball(root, expected_revision=revision)
+    try:
+        with tarfile.open(archive_path) as archive:
+            source = archive.extractfile("src/orcest/example.py")
+            assert source is not None
+            assert source.read() == b"original committed bytes\n"
+            provenance = archive.extractfile(".orcest-revision")
+            assert provenance is not None
+            assert provenance.read().decode().strip() == revision
+    finally:
+        Path(archive_path).unlink()
+
+
+def test_frozen_source_archive_rejects_changed_checkout_before_upload(mocker):
+    from orcest.fleet import orchestrator as orch
+
+    mocker.patch.object(orch, "_resolve_deploy_revision", return_value="b" * 40)
+    ssh = mocker.patch.object(orch, "_ssh")
+    scp = mocker.patch.object(orch, "_scp")
+    with pytest.raises(RuntimeError, match="changed"):
+        orch.upload_source("user@host", expected_revision="a" * 40)
+    ssh.assert_not_called()
+    scp.assert_not_called()
+
+
+def test_template_revision_tracks_pointer_rollback_and_unknown_templates(mocker):
+    """Rollback must reveal the old template's SHA, not the last baked SHA."""
+    import shlex
+
+    import fakeredis
+
+    from orcest.fleet import orchestrator as orch
+
+    redis = fakeredis.FakeRedis(decode_responses=True)
+
+    def redis_ssh(_target, command):
+        # Run the actual emitted Redis operation, omitting the Docker/auth wrapper.
+        tokens = shlex.split(command)
+        if "MSET" in tokens:
+            index = tokens.index("MSET")
+            redis.execute_command(*tokens[index:])
+            output = "OK\n"
+        else:
+            index = tokens.index("EVAL")
+            output = redis.execute_command(*tokens[index:]) or ""
+        return subprocess.CompletedProcess([], 0, stdout=output, stderr="")
+
+    mocker.patch.object(orch, "_ssh", side_effect=redis_ssh)
+    orch.set_current_template_vmid("host", 9001, revision="a" * 40)
+    orch.set_current_template_vmid("host", 9002, revision="b" * 40)
+    assert orch.get_current_template_revision("host") == "b" * 40
+    redis.set("orcest:pool:current_template_vmid", 9001)
+    assert orch.get_current_template_revision("host") == "a" * 40
+    redis.set("orcest:pool:current_template_vmid", 9003)
+    assert orch.get_current_template_revision("host") is None

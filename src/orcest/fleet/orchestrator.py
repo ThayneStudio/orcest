@@ -7,6 +7,7 @@ host (where ``orcest fleet`` commands run) to the orchestrator VM.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -193,7 +194,12 @@ def image_exists(ssh_target: str, image: str = "orcest:latest") -> bool:
     return result.returncode == 0
 
 
-def upload_source(ssh_target: str, source_root: str | os.PathLike[str] | None = None) -> None:
+def upload_source(
+    ssh_target: str,
+    source_root: str | os.PathLike[str] | None = None,
+    *,
+    expected_revision: str | None = None,
+) -> None:
     """Create a source tarball locally and upload+extract it on the orchestrator.
 
     Assembles a Docker build context from the active source checkout when
@@ -203,7 +209,9 @@ def upload_source(ssh_target: str, source_root: str | os.PathLike[str] | None = 
     Extracts to /opt/orcest/ on the orchestrator VM.
     """
     logger.info("Uploading source to %s", ssh_target)
-    tarball_path = create_source_tarball(source_root=source_root)
+    tarball_path = create_source_tarball(
+        source_root=source_root, expected_revision=expected_revision
+    )
     remote_tarball: str | None = None
     try:
         # Use a unique, mode-0600 destination so concurrent deploy attempts
@@ -251,15 +259,31 @@ def upload_source(ssh_target: str, source_root: str | os.PathLike[str] | None = 
             pass
 
 
-def create_source_tarball(source_root: str | os.PathLike[str] | None = None) -> str:
+def create_source_tarball(
+    source_root: str | os.PathLike[str] | None = None,
+    *,
+    expected_revision: str | None = None,
+) -> str:
     """Package the active Orcest source tree into a deploy build-context tarball.
 
     The returned path is owned by the caller and must be deleted after use.
     """
     import shutil
 
-    layout = _resolve_source_layout(source_root)
+    root = _resolve_source_root(source_root)
     revision = _resolve_deploy_revision(source_root)
+    if expected_revision is not None and revision != expected_revision:
+        raise RuntimeError("Local source changed after deployment intent was frozen")
+    snapshot_root: str | None = None
+    if expected_revision is not None and root is not None and (root / ".git").exists():
+        from orcest.revision import revision_is_attested
+
+        if not revision_is_attested(revision):
+            raise RuntimeError("Cannot package dirty or unknown deployment source")
+        snapshot_root = _archive_source_revision(root, revision)
+        layout = _resolve_source_layout(snapshot_root)
+    else:
+        layout = _resolve_source_layout(source_root)
     staging = tempfile.mkdtemp(prefix="orcest-source-")
     try:
         for fname, src_path in layout.deploy_files.items():
@@ -295,6 +319,52 @@ def create_source_tarball(source_root: str | os.PathLike[str] | None = None) -> 
         return tarball_path
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+        if snapshot_root is not None:
+            shutil.rmtree(snapshot_root, ignore_errors=True)
+
+
+def _archive_source_revision(root: Path, revision: str) -> str:
+    """Materialize tracked source bytes from one immutable local Git object."""
+    import shutil
+
+    snapshot = tempfile.mkdtemp(prefix="orcest-source-revision-")
+    archive_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as archive:
+            archive_path = archive.name
+        try:
+            archived = subprocess.run(
+                ["git", "archive", "--format=tar", f"--output={archive_path}", revision],
+                cwd=root,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError("Failed to archive frozen deployment source") from exc
+        if archived.returncode != 0:
+            raise RuntimeError("Failed to archive frozen deployment source")
+        try:
+            extracted = subprocess.run(
+                ["tar", "xf", archive_path, "-C", snapshot],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError("Failed to extract frozen deployment source") from exc
+        if extracted.returncode != 0:
+            raise RuntimeError("Failed to extract frozen deployment source")
+        return snapshot
+    except BaseException:
+        shutil.rmtree(snapshot, ignore_errors=True)
+        raise
+    finally:
+        if archive_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(archive_path)
 
 
 def _resolve_deploy_revision(source_root: str | os.PathLike[str] | None = None) -> str:
@@ -856,31 +926,46 @@ def get_current_template_vmid(ssh_target: str) -> int | None:
         return None
 
 
-def set_current_template_vmid(ssh_target: str, vm_id: int) -> None:
+def set_current_template_vmid(ssh_target: str, vm_id: int, *, revision: str | None = None) -> None:
     """Atomically swap the active worker template pointer in Redis.
 
     Sets ``orcest:pool:current_template_vmid`` to *vm_id*. The pool manager
     picks this up on its next reconciliation cycle (~10s).
     """
-    result = _ssh(
-        ssh_target,
-        f"{_REDIS_CLI_PREFIX} SET orcest:pool:current_template_vmid {shlex.quote(str(vm_id))}",
-    )
+    if revision is None:
+        command = f"SET orcest:pool:current_template_vmid {shlex.quote(str(vm_id))}"
+    else:
+        from orcest.revision import revision_is_attested
+
+        if not revision_is_attested(revision):
+            raise ValueError("Template revision must be a clean attested revision")
+        command = (
+            f"MSET orcest:pool:current_template_vmid {vm_id} "
+            f"orcest:pool:template_revision:{vm_id} {shlex.quote(revision)} "
+            f"orcest:pool:current_template_revision {shlex.quote(revision)}"
+        )
+    result = _ssh(ssh_target, f"{_REDIS_CLI_PREFIX} {command}")
     _require_redis_cli_success(result, "Failed to set template pointer")
 
 
 def get_current_template_revision(ssh_target: str) -> str | None:
     """Return the active worker template's baked source revision, or ``None``.
 
-    Reads ``orcest:pool:current_template_revision`` -- set once by ``rebake``
-    from the exact revision installed into the template -- so the template's
-    revision remains visible for health reporting even while no worker VM
-    from it is currently running.
+    Reads the revision belonging to the active template VMID in one Redis
+    operation. Missing VMID-specific provenance remains unknown; an older
+    global revision is used only when no template pointer exists.
     """
     from orcest.revision import normalize_revision
 
+    script = (
+        "local id = redis.call('GET', KEYS[1]); "
+        "if id then return redis.call('GET', 'orcest:pool:template_revision:' .. id) end; "
+        "return redis.call('GET', KEYS[2])"
+    )
     result = _ssh(
-        ssh_target, f"{_REDIS_CLI_PREFIX} --raw GET orcest:pool:current_template_revision"
+        ssh_target,
+        f"{_REDIS_CLI_PREFIX} --raw EVAL {shlex.quote(script)} 2 "
+        "orcest:pool:current_template_vmid orcest:pool:current_template_revision",
     )
     _require_redis_cli_success(result, "Failed to read template revision")
     return normalize_revision(result.stdout.strip())

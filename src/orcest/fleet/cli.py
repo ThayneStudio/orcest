@@ -630,14 +630,16 @@ def _scp_to_vm(
     )
 
 
-def _install_source_on_worker_template(host: str, user: str, console: Console) -> str | None:
+def _install_source_on_worker_template(
+    host: str, user: str, console: Console, *, expected_revision: str | None = None
+) -> str | None:
     """Install the active Orcest source into the worker template venv.
 
     Returns the exact attested revision installed, or ``None`` on failure.
     """
     from orcest.fleet.orchestrator import create_source_tarball
 
-    tarball_path = create_source_tarball()
+    tarball_path = create_source_tarball(expected_revision=expected_revision)
     remote_tarball = "/tmp/orcest-source.tar.gz"
     try:
         copy = _scp_to_vm(host, user, tarball_path, remote_tarball)
@@ -671,6 +673,9 @@ def _install_source_on_worker_template(host: str, user: str, console: Console) -
         )
         if match is None:
             console.print("[red]failed[/red]: could not determine installed revision")
+            return None
+        if expected_revision is not None and match.group(1) != expected_revision:
+            console.print("[red]failed[/red]: installed revision differs from frozen source")
             return None
         console.print("[green]ok[/green]")
         return match.group(1)
@@ -1350,7 +1355,12 @@ def update(ctx: click.Context, config: str, skip_pool_manager: bool) -> None:
         from orcest.fleet.orchestrator import build_image, upload_source
 
         console.print("  Uploading fresh source...")
-        upload_source(ssh_target)
+        expected_revision = (
+            _resolve_frozen_desired_revision(cfg, ctx).sha
+            if cfg.desired_source.is_configured
+            else None
+        )
+        upload_source(ssh_target, expected_revision=expected_revision)
         console.print("  Upload [green]ok[/green]")
 
         console.print("  Rebuilding Docker image...")
@@ -1528,7 +1538,7 @@ def _collect_source_revision_surfaces(cfg: FleetConfig) -> list[Any]:
 
     surfaces: list[Any] = []
     if not cfg.orchestrator.host:
-        return surfaces
+        return [RuntimeRevision(surface="fleet", revision=None)]
     ssh_target = cfg.ssh_target()
 
     for project in cfg.projects:
@@ -1558,6 +1568,7 @@ def _collect_source_revision_surfaces(cfg: FleetConfig) -> list[Any]:
         heartbeats = get_worker_heartbeat_details(ssh_target)
     except Exception:
         heartbeats = {}
+        surfaces.append(RuntimeRevision(surface="worker-inventory", revision=None))
     for worker_id, record in sorted(heartbeats.items()):
         heartbeat_revision = record.get("revision")
         surfaces.append(
@@ -2436,6 +2447,7 @@ def _create_template_at_vmid(
     storage: str,
     snippet_storage: str,
     console: Console,
+    expected_revision: str | None = None,
 ) -> str:
     """Bake a worker template at *vm_id*: download image, provision, convert.
 
@@ -2552,7 +2564,9 @@ def _create_template_at_vmid(
     # for orchestrator deploys. Pool clones do not fetch GitHub at boot; they
     # inherit this verified template install.
     console.print("  Installing current orcest source into template...", end=" ")
-    installed_revision = _install_source_on_worker_template(vm_ip, cfg.orchestrator.user, console)
+    installed_revision = _install_source_on_worker_template(
+        vm_ip, cfg.orchestrator.user, console, expected_revision=expected_revision
+    )
     if installed_revision is None:
         console.print("[red]Source install failed. Template creation aborted.[/red]")
         _cleanup_vm()
@@ -2854,7 +2868,8 @@ def _allocate_template_vmid(
     show_default=True,
 )
 @_serialized_fleet_operation
-def rebake(image_url: str, storage: str | None, config: str) -> None:
+@click.pass_context
+def rebake(ctx: click.Context, image_url: str, storage: str | None, config: str) -> None:
     """Bake a new worker template and atomically swap the active pointer.
 
     Allocates the next free VMID from ``pool.template_vmid_range``, builds
@@ -2872,12 +2887,15 @@ def rebake(image_url: str, storage: str | None, config: str) -> None:
     from orcest.fleet.config import load_config
     from orcest.fleet.orchestrator import (
         _REDIS_CLI_PREFIX,
-        set_current_template_revision,
         set_current_template_vmid,
     )
 
     console = Console()
     cfg = load_config(config)
+    _validate_deploy_source_revision(console, cfg, ctx)
+    expected_revision = (
+        _resolve_frozen_desired_revision(cfg, ctx).sha if cfg.desired_source.is_configured else None
+    )
 
     if not cfg.proxmox.api_token_id or not cfg.proxmox.api_token_secret:
         console.print("[red]Proxmox API credentials not configured.[/red]")
@@ -2908,20 +2926,20 @@ def rebake(image_url: str, storage: str | None, config: str) -> None:
         storage=storage,
         snippet_storage=snippet_storage,
         console=console,
+        expected_revision=expected_revision,
     )
 
     # Atomic swap: pool manager picks up the new VMID on its next cycle.
     console.print("\n  Swapping active template pointer...", end=" ")
     try:
-        set_current_template_vmid(cfg.ssh_target(), new_vmid)
-        set_current_template_revision(cfg.ssh_target(), installed_revision)
+        set_current_template_vmid(cfg.ssh_target(), new_vmid, revision=installed_revision)
         console.print("[green]ok[/green]")
     except Exception as exc:
         console.print(f"[red]failed[/red]: {exc}")
         redis_set_cmd = (
-            f"{_REDIS_CLI_PREFIX} SET orcest:pool:current_template_vmid {new_vmid} && "
-            f"{_REDIS_CLI_PREFIX} SET orcest:pool:current_template_revision "
-            f"{shlex.quote(installed_revision)}"
+            f"{_REDIS_CLI_PREFIX} MSET orcest:pool:current_template_vmid {new_vmid} "
+            f"orcest:pool:template_revision:{new_vmid} {shlex.quote(installed_revision)} "
+            f"orcest:pool:current_template_revision {shlex.quote(installed_revision)}"
         )
         console.print(
             "  [yellow]New template VM "
@@ -4119,10 +4137,7 @@ def _validate_deploy_source_revision(
         return
     desired = _resolve_frozen_desired_revision(cfg, ctx)
     if not desired.resolved:
-        console.print(
-            f"[red]Could not resolve desired source revision {desired.repo}@{desired.ref}: "
-            f"{desired.error}[/red]"
-        )
+        console.print(f"[red]Could not resolve desired source revision: {desired.error}[/red]")
         raise SystemExit(1)
     if deploy_revision != desired.sha:
         console.print(
