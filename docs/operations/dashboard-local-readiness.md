@@ -127,3 +127,51 @@ pass. Required CI passed for `61f10be`; this additional fix requires fresh CI.
 The current browser fix does not change server code. Compare built server artifacts
 before carrying forward server-only endurance evidence; neither synthetic activity
 nor historical deliveries satisfy the fresh real-execution gate.
+
+
+## September 30 closeout
+
+PR #833 was independently reviewed by a Codex subagent and merged as
+`eeb9555b086d152fb5daec0040f2bae3360b6b52`. Fresh validation passed all
+808 dashboard tests, type checks, build, bundle runtime, isolated harness
+acceptance, and all five process recovery checks. Claude Code review is
+unavailable; its workflow conclusion is not review approval. Tooling and
+browser fixes are integrated separately from deployment qualification.
+
+The September 18 intervals have no recovered final qualification report on
+this Linux workstation or the inspected fleet host. They remain unqualified.
+The deployed dashboard still reports `bf6967085f6b64cd14ad0d884011ac08c7d6583e`;
+the localhost candidate reports `c021b2dc4cf5538de84b502bbb507fffb6cdc046` and
+reads the intended four projects through an SSH tunnel to `10.20.1.129`.
+
+A new thirteen-hour synthetic interval started at 2026-09-30T23:19:40Z.
+The reviewed `dashboard/scripts/observe-live-fleet.mjs` collector provides
+separate live qualification: pinned process/artifact identity, normal session
+expiry, logout, full project inventory, new execution with advancing output,
+and independently verified delivery for the same attempt and observed full
+publication head SHA. A missing head SHA stays pending until refreshed; it
+cannot establish delivery. Known stale-source
+notices are attributed to individual work IDs and physical project-source IDs.
+Each stale record must explicitly become fresh under the same ID within ten
+minutes; disappearing records never prove recovery. Overlapping episodes can
+keep the fleet-wide partial-coverage union open longer, and that duration is
+recorded only as a diagnostic. Qualification requires all episodes closed,
+at least one complete sample, and the independently intended project scope;
+unavailable feeds, unexplained notices, sampling gaps and process changes
+fail the interval. Idle uptime alone cannot qualify.
+
+Run the live collector from `dashboard/`, with the pinned Node runtime:
+
+```sh
+node scripts/observe-live-fleet.mjs \
+  --url http://127.0.0.1:44319 --pid LOCAL_CANDIDATE_PID \
+  --revision FULL_CANDIDATE_SHA --token-file PRIVATE_TOKEN_FILE \
+  --projects ThayneStudio/orcest,ThayneStudio/transit-platform,bluebamboollc/bbr-platform,dewdropsllc/asemly \
+  --state-dir NEW_PERSISTENT_EVIDENCE_DIRECTORY
+node --test scripts/live-evidence.check.mjs
+```
+
+The token file must contain only the candidate token and have private file
+permissions. The collector owns neither the dashboard nor its tunnel and
+never alters fleet state. Its evidence contains output metadata, not output
+text or credentials. Audit both completed intervals before deployment.

@@ -62,6 +62,13 @@ export interface FleetWorker {
 }
 export interface WorkView {
   environment?: "local-harness";
+  sourceObservations?: {
+    id: string;
+    prefix: string;
+    project: string | null;
+    observedAt: number | null;
+    stale: boolean;
+  }[];
   pools: WorkerPoolInfo[];
   version: 1;
   fetchedAt: number;
