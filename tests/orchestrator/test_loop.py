@@ -6,17 +6,24 @@ and fake_redis_client for result stream operations.
 
 import json
 import logging
+import os
+import shlex
 import time
+from pathlib import Path
 
 import pytest
 
+from orcest.orchestrator.gh import PRReviewSnapshot
 from orcest.orchestrator.issue_ops import (
+    IssueAction,
+    IssueState,
     get_attempt_count as get_issue_attempt_count,
     has_usage_exhausted_cooldown as has_issue_usage_exhausted_cooldown,
     increment_attempts as increment_issue_attempts,
 )
 from orcest.orchestrator.loop import (
     _MAX_REVIEW_RERUN_FAILURES,
+    _PROVIDER_EXHAUSTED_SKIP_KEY,
     _SHARED_CREDENTIAL_OVERRIDES_KEY,
     _TASK_PROVIDER_ACCOUNT_PREFIX,
     _TASK_PROVIDER_ACCOUNTS_KEY,
@@ -57,8 +64,12 @@ from orcest.shared.coordination import (
     increment_transient_failure_count,
     set_pending_task,
 )
-from orcest.shared.models import CONSUMER_GROUP, ResultStatus, TaskResult
+from orcest.shared.models import CONSUMER_GROUP, ResultStatus, TaskResult, task_stream_name
 from orcest.shared.redis_client import RedisClient
+from orcest.shared.result_stream_health import (
+    RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS,
+    result_consumer_heartbeat_key,
+)
 
 
 def _consume_results(config: OrchestratorConfig, redis, logger):
@@ -90,6 +101,140 @@ def _make_pr_state(
         ci_failures=ci_failures,
         review_threads=[],
         labels=[],
+    )
+
+
+def _seed_idle_provider_capacity(redis: RedisClient, provider: str) -> None:
+    """Install the live-worker/consumer-group evidence required for publication."""
+    redis.ensure_consumer_group(task_stream_name(provider), CONSUMER_GROUP)
+    redis.ensure_consumer_group(task_stream_name(provider, issue=True), CONSUMER_GROUP)
+    redis.set_ex(
+        f"workers:heartbeat:test-{provider}-worker",
+        json.dumps({"backend": provider, "revision": "test-revision"}),
+        ttl=150,
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "pr_action", "publisher_name"),
+    [
+        ("fix", PRAction.ENQUEUE_FIX, "publish_fix_task"),
+        ("followup", PRAction.ENQUEUE_FOLLOWUP, "publish_followup_task"),
+        ("rebase", PRAction.ENQUEUE_REBASE, "publish_rebase_task"),
+        ("issue", None, "publish_issue_task"),
+    ],
+)
+def test_every_legacy_publication_path_uses_the_same_capacity_choice(
+    path,
+    pr_action,
+    publisher_name,
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+) -> None:
+    """PR fixes/follow-ups/rebases and issue work all avoid a busy backend."""
+    from orcest.orchestrator.provider_pool import ProviderPool
+    from orcest.shared.providers import ProviderEntry
+
+    orchestrator_config.default_runner = "clauder"
+    project = orchestrator_config.projects[0]
+    clauder = ProviderEntry("clauder", "clauder-account")
+    codex = ProviderEntry("codex", "codex-account")
+    pool = ProviderPool([clauder, codex])
+    _seed_idle_provider_capacity(fake_redis_client, "clauder")
+    _seed_idle_provider_capacity(fake_redis_client, "codex")
+    fake_redis_client.xadd(task_stream_name("clauder"), {"id": "already-running"})
+    assert fake_redis_client.xreadgroup(
+        CONSUMER_GROUP,
+        "test-clauder-worker",
+        task_stream_name("clauder"),
+        block_ms=None,
+    )
+
+    if path == "issue":
+        mocker.patch("orcest.orchestrator.loop.discover_actionable_prs", return_value=[])
+        mocker.patch(
+            "orcest.orchestrator.loop.discover_actionable_issues",
+            return_value=[
+                IssueState(808, "Capacity route", "body", IssueAction.ENQUEUE_IMPLEMENT, [])
+            ],
+        )
+    else:
+        mocker.patch(
+            "orcest.orchestrator.loop.discover_actionable_prs",
+            return_value=[_make_pr_state(number=808, action=pr_action)],
+        )
+    mocker.patch("orcest.orchestrator.loop.rerun_all_transient_ci", return_value=False)
+    publishers = {
+        name: mocker.patch(f"orcest.orchestrator.loop.{name}")
+        for name in (
+            "publish_fix_task",
+            "publish_followup_task",
+            "publish_rebase_task",
+            "publish_issue_task",
+        )
+    }
+
+    _poll_project(
+        project,
+        fake_redis_client,
+        fake_redis_client,
+        orchestrator_config,
+        logging.getLogger("test.capacity-paths"),
+        3600,
+        token_pool=pool,
+        force_issue_discovery=True,
+    )
+
+    selected = publishers[publisher_name]
+    selected.assert_called_once()
+    assert selected.call_args.kwargs["provider"] == "codex"
+    assert selected.call_args.kwargs["provider_account"] == codex.account_key()
+
+
+def test_all_unknown_capacity_defers_without_pending_or_attempt_mutation(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+) -> None:
+    from orcest.orchestrator.provider_pool import ProviderPool
+    from orcest.shared.providers import ProviderEntry
+
+    entry = ProviderEntry("codex", "codex-account")
+    pool = ProviderPool([entry])
+    project = orchestrator_config.projects[0]
+    pr_state = _make_pr_state(number=809, action=PRAction.ENQUEUE_REBASE)
+    mocker.patch("orcest.orchestrator.loop.discover_actionable_prs", return_value=[pr_state])
+    publish = mocker.patch("orcest.orchestrator.loop.publish_rebase_task")
+    mocker.patch.object(
+        fake_redis_client,
+        "xgroup_pending_snapshot",
+        side_effect=RuntimeError("capacity metadata unavailable"),
+    )
+
+    _poll_project(
+        project,
+        fake_redis_client,
+        fake_redis_client,
+        orchestrator_config,
+        logging.getLogger("test.capacity-unknown"),
+        3600,
+        token_pool=pool,
+    )
+
+    publish.assert_not_called()
+    assert get_attempt_count(fake_redis_client, project.repo, 809, "abc123") == 0
+    assert fake_redis_client.get(f"pending:pr:{project.repo}:809") is None
+
+
+def _review_rerun_snapshot(head_sha: str) -> PRReviewSnapshot:
+    return PRReviewSnapshot(
+        head_sha=head_sha,
+        state="OPEN",
+        is_draft=False,
+        labels=("priority:high",),
+        review_decision="",
+        has_current_head_approval=False,
     )
 
 
@@ -176,6 +321,13 @@ def _mock_issue_discovery(mocker):
     mocker.patch("orcest.orchestrator.loop.discover_actionable_issues", return_value=[])
 
 
+@pytest.fixture(autouse=True)
+def _default_live_capacity(fake_redis_client):
+    """Legacy loop fixtures model one idle worker for each supported backend."""
+    for provider in ("claude", "clauder", "codex", "grok"):
+        _seed_idle_provider_capacity(fake_redis_client, provider)
+
+
 def test_poll_cycle_enqueues_tasks(mocker, fake_redis_client, orchestrator_config, gh_mock):
     """_poll_cycle calls publish_fix_task for PRs with ENQUEUE_FIX action."""
     pr_state = _make_pr_state(number=10, action=PRAction.ENQUEUE_FIX)
@@ -196,6 +348,141 @@ def test_poll_cycle_enqueues_tasks(mocker, fake_redis_client, orchestrator_confi
 
     mock_publish.assert_called_once()
     assert mock_publish.call_args.kwargs["pr_state"] is pr_state
+
+
+def test_poll_cycle_wires_v1_legacy_exclusion_lookup(
+    mocker, fake_redis_client, orchestrator_config, gh_mock
+):
+    orchestrator_config.workflow_state_root = "/var/lib/orcest/workflow"
+    discover = mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[],
+    )
+    lookup = mocker.patch(
+        "orcest.orchestrator.loop.load_legacy_change_request_exclusion_snapshot",
+    )
+    lookup.return_value.excludes.return_value = True
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    _poll_cycle(
+        orchestrator_config,
+        fake_redis_client,
+        fake_redis_client,
+        {},
+        logging.getLogger("test"),
+        3600,
+    )
+
+    predicate = discover.call_args.kwargs["legacy_exclusion_predicate"]
+    assert predicate(
+        change_request_external_id="776",
+        deterministic_ref="refs/heads/orcest/run/example",
+    )
+    lookup.assert_called_once_with(
+        "/var/lib/orcest/workflow",
+        repository_locator=orchestrator_config.github.repo,
+    )
+    lookup.return_value.excludes.assert_called_once_with(
+        change_request_external_id="776",
+        deterministic_ref="refs/heads/orcest/run/example",
+    )
+
+
+def test_poll_cycle_marks_v1_lookup_unavailable_once(
+    mocker, fake_redis_client, orchestrator_config, gh_mock, caplog
+):
+    orchestrator_config.workflow_state_root = "/var/lib/orcest/workflow"
+    discover = mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[],
+    )
+    lookup = mocker.patch(
+        "orcest.orchestrator.loop.load_legacy_change_request_exclusion_snapshot",
+        side_effect=OSError("database unavailable"),
+    )
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    _poll_cycle(
+        orchestrator_config,
+        fake_redis_client,
+        fake_redis_client,
+        {},
+        logging.getLogger("test"),
+        3600,
+    )
+
+    lookup.assert_called_once()
+    assert discover.call_args.kwargs["legacy_exclusion_predicate"] is None
+    assert discover.call_args.kwargs["legacy_exclusion_unavailable"] is True
+    assert "ownership snapshot" in caplog.text
+
+
+def test_poll_cycle_fails_closed_for_prs_when_rollout_controls_unavailable(
+    mocker, fake_redis_client, orchestrator_config, gh_mock
+):
+    orchestrator_config.workflow_state_root = "/var/lib/orcest/workflow"
+    discover = mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[],
+    )
+    mocker.patch(
+        "orcest.orchestrator.loop.load_legacy_change_request_exclusion_snapshot",
+    )
+    mocker.patch(
+        "orcest.orchestrator.loop.load_legacy_rollout_controls",
+        side_effect=OSError("database unavailable"),
+    )
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    _poll_cycle(
+        orchestrator_config,
+        fake_redis_client,
+        fake_redis_client,
+        {},
+        logging.getLogger("test"),
+        3600,
+    )
+
+    assert discover.call_args.kwargs["legacy_exclusion_unavailable"] is True
+
+
+def test_poll_cycle_handles_v1_lookup_unavailable_action(
+    mocker, fake_redis_client, orchestrator_config, gh_mock, caplog
+):
+    orchestrator_config.workflow_state_root = "/var/lib/orcest/workflow"
+    mocker.patch(
+        "orcest.orchestrator.loop.load_legacy_change_request_exclusion_snapshot",
+        side_effect=OSError("database unavailable"),
+    )
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[
+            PRState(
+                number=776,
+                title="workflow PR",
+                branch="orcest/run/example",
+                head_sha="a" * 40,
+                action=PRAction.SKIP_V1_LOOKUP_UNAVAILABLE,
+                ci_failures=[],
+                review_threads=[],
+                labels=[],
+            )
+        ],
+    )
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    with caplog.at_level(logging.DEBUG):
+        _poll_cycle(
+            orchestrator_config,
+            fake_redis_client,
+            fake_redis_client,
+            {},
+            logging.getLogger("test"),
+            3600,
+        )
+
+    assert "ownership lookup unavailable; fail-closed skip" in caplog.text
+    assert "unhandled action" not in caplog.text
 
 
 def test_poll_cycle_routes_legacy_claude_credentials_to_default_clauder(
@@ -224,6 +511,7 @@ def test_poll_cycle_routes_legacy_claude_credentials_to_default_clauder(
     mock_publish = mocker.patch("orcest.orchestrator.loop.publish_fix_task")
     mocker.patch("orcest.orchestrator.loop.publish_followup_task")
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    _seed_idle_provider_capacity(fake_redis_client, "clauder")
 
     project_key = orchestrator_config.projects[0].key_prefix
     logger = logging.getLogger("test")
@@ -262,6 +550,7 @@ def test_poll_cycle_routes_provider_pool_legacy_helper_to_default_clauder(
     mock_publish = mocker.patch("orcest.orchestrator.loop.publish_fix_task")
     mocker.patch("orcest.orchestrator.loop.publish_followup_task")
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    _seed_idle_provider_capacity(fake_redis_client, "clauder")
 
     project_key = orchestrator_config.projects[0].key_prefix
     logger = logging.getLogger("test")
@@ -317,6 +606,7 @@ def test_poll_project_routes_single_legacy_token_fallback_to_default_clauder(
     assert mock_publish.call_args.kwargs["provider"] == "clauder"
     assert mock_publish.call_args.kwargs["credential"] == "legacy-single-token"
     assert mock_publish.call_args.kwargs["claude_token"] == "legacy-single-token"
+    assert mock_publish.call_args.kwargs["capacity_reservation"].provider == "clauder"
 
 
 def test_poll_cycle_routes_explicit_claude_to_default_clauder(
@@ -346,6 +636,7 @@ def test_poll_cycle_routes_explicit_claude_to_default_clauder(
     mock_publish = mocker.patch("orcest.orchestrator.loop.publish_fix_task")
     mocker.patch("orcest.orchestrator.loop.publish_followup_task")
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    _seed_idle_provider_capacity(fake_redis_client, "clauder")
 
     project_key = orchestrator_config.projects[0].key_prefix
     logger = logging.getLogger("test")
@@ -386,6 +677,7 @@ def test_poll_cycle_preserves_explicit_clauder_when_default_runner_is_legacy_cla
     mock_publish = mocker.patch("orcest.orchestrator.loop.publish_fix_task")
     mocker.patch("orcest.orchestrator.loop.publish_followup_task")
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    _seed_idle_provider_capacity(fake_redis_client, "clauder")
 
     project_key = orchestrator_config.projects[0].key_prefix
     logger = logging.getLogger("test")
@@ -549,6 +841,14 @@ def test_poll_cycle_merges_pr(mocker, fake_redis_client, orchestrator_config, gh
     )
     mocker.patch("orcest.orchestrator.loop.publish_fix_task")
     mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    gh_mock.get_review_snapshot.return_value = PRReviewSnapshot(
+        head_sha=pr_state.head_sha,
+        state="OPEN",
+        is_draft=False,
+        labels=("priority:high",),
+        review_decision="APPROVED",
+        has_current_head_approval=True,
+    )
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
     # Pre-populate total_attempts so we can verify it is cleared on merge
     repo = orchestrator_config.github.repo
@@ -773,6 +1073,7 @@ def test_poll_cycle_provider_pool_wiring_registers_and_rolls_back_on_publish_non
     mocker.patch("orcest.orchestrator.loop.publish_rebase_task")
     mocker.patch("orcest.orchestrator.loop.publish_issue_task")
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    _seed_idle_provider_capacity(fake_redis_client, "claude")
 
     entry = ProviderEntry(provider="claude", credential="tok-wiring-test-42")
     pool = ProviderPool([entry])
@@ -800,6 +1101,9 @@ def test_poll_cycle_provider_pool_wiring_registers_and_rolls_back_on_publish_non
 
     # since publish returned None, _try_publish performed rollback
     assert comp_spy.call_count == 1
+    assert comp_spy.call_args.args[0] == reg_call[0]
+    assert pool.get_task_entry(reg_call[0]) is None
+    assert fake_redis_client.zcard("providers:capacity:reservations:claude") == 0
 
     mock_publish_fix.assert_called_once()
     assert mock_publish_fix.call_args.kwargs["pr_state"] is pr_state
@@ -1291,10 +1595,17 @@ def test_consume_results_completed_pr_attempt_guard_is_retry_budget_not_active_w
     assert results[0].action == PRAction.ENQUEUE_FIX
 
 
-def test_consume_results_completed_issue_clears_attempts(
+def test_consume_results_completed_issue_admits_verification_job(
     fake_redis_client, orchestrator_config, gh_mock
 ):
-    """Completed issue tasks keep the existing issue behavior."""
+    """Completed issue tasks admit a verification job and do not clear ready yet."""
+    from orcest.orchestrator.issue_delivery import (
+        VerificationState,
+        get_verification_job,
+        has_issue_dispatch_barrier,
+    )
+    from orcest.orchestrator.issue_publication import make_issue_dispatch_barrier_key
+
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     repo = orchestrator_config.github.repo
@@ -1312,8 +1623,145 @@ def test_consume_results_completed_issue_clears_attempts(
     logger = logging.getLogger("test")
     _consume_results(orchestrator_config, fake_redis_client, logger)
 
+    assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 1
+    gh_mock.remove_issue_label.assert_not_called()
+    job = get_verification_job(fake_redis_client, repo, issue_number, 0)
+    assert job is not None
+    assert job.state is VerificationState.PENDING
+    assert has_issue_dispatch_barrier(fake_redis_client, repo, issue_number)
+    assert fake_redis_client.exists(make_issue_dispatch_barrier_key(repo, issue_number))
+
+
+def test_consume_results_completed_issue_disabled_verifier_keeps_legacy_path(
+    fake_redis_client, orchestrator_config, gh_mock
+):
+    """enabled=false restores immediate ready-label removal."""
+    from orcest.shared.config import IssueDeliveryVerifierConfig
+
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    repo = orchestrator_config.github.repo
+    issue_number = 44
+    increment_issue_attempts(fake_redis_client, repo, issue_number)
+    result = _make_task_result(
+        status=ResultStatus.COMPLETED,
+        resource_type="issue",
+        resource_id=issue_number,
+        branch="issue-44-work",
+        snapshot_head_sha="a" * 40,
+    )
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    _consume_results_for_project(
+        orchestrator_config.projects[0],
+        fake_redis_client,
+        orchestrator_config.labels,
+        logging.getLogger("test"),
+        max_transient_failures=orchestrator_config.max_transient_failures,
+        issue_delivery_verifier=IssueDeliveryVerifierConfig(enabled=False),
+    )
+
     assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
     gh_mock.remove_issue_label.assert_called_once()
+
+
+def test_consume_results_completed_issue_absent_ready_label_still_acks(
+    fake_redis_client, orchestrator_config, mocker
+):
+    """Regression for issue #777.
+
+    gh now reports an already-absent label as ``gh: Label does not exist
+    (HTTP 404)`` instead of a message containing "not found". Before the
+    fix, `gh.remove_issue_label` (unmocked here, only its subprocess call is
+    stubbed) raised on that response, `_handle_result` re-raised
+    `_RetryableResultError`, and the completed result was never ACKed.
+    """
+    import subprocess
+
+    from orcest.shared.config import IssueDeliveryVerifierConfig
+
+    gh_run = mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["gh", "api"],
+            stderr="gh: Label does not exist (HTTP 404)",
+        ),
+    )
+
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    xack = mocker.spy(fake_redis_client, "xack")
+    repo = orchestrator_config.github.repo
+    issue_number = 45
+    increment_issue_attempts(fake_redis_client, repo, issue_number)
+    result = _make_task_result(
+        status=ResultStatus.COMPLETED,
+        resource_type="issue",
+        resource_id=issue_number,
+        branch="issue-45-work",
+        snapshot_head_sha="a" * 40,
+    )
+    set_pending_task(fake_redis_client, repo, "issue", issue_number, result.task_id)
+    provider_account_key = f"{_TASK_PROVIDER_ACCOUNT_PREFIX}{result.task_id}"
+    fake_redis_client.set_ex(provider_account_key, "codex:test-account", ttl=300)
+    fake_redis_client.hset(
+        _TASK_PROVIDER_ACCOUNTS_KEY,
+        result.task_id,
+        "codex:legacy-test-account",
+    )
+    first_entry_id = fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    _consume_results_for_project(
+        orchestrator_config.projects[0],
+        fake_redis_client,
+        orchestrator_config.labels,
+        logging.getLogger("test"),
+        max_transient_failures=orchestrator_config.max_transient_failures,
+        issue_delivery_verifier=IssueDeliveryVerifierConfig(enabled=False),
+    )
+
+    # The result was fully processed (not left pending/retried) ...
+    assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
+    assert fake_redis_client.xpending_count(RESULTS_STREAM, RESULTS_GROUP, first_entry_id) == 0
+    from orcest.orchestrator.loop import _make_result_side_effects_processed_key
+
+    side_effects_key = _make_result_side_effects_processed_key(result.task_id)
+    assert fake_redis_client.get(side_effects_key) == "1"
+    assert get_pending_task(fake_redis_client, repo, "issue", issue_number) is None
+    assert fake_redis_client.get(provider_account_key) is None
+    assert fake_redis_client.hget(_TASK_PROVIDER_ACCOUNTS_KEY, result.task_id) is None
+    assert gh_run.call_count == 1
+    xack.assert_called_once_with(RESULTS_STREAM, RESULTS_GROUP, first_entry_id)
+
+    # Redeliver the exact payload under a new stream ID. The durable task
+    # checkpoint must suppress a second GitHub call. Re-seed coordination that
+    # could survive a crash after checkpointing; the duplicate path must still
+    # clear it and ACK its own stream entry.
+    set_pending_task(fake_redis_client, repo, "issue", issue_number, result.task_id)
+    fake_redis_client.set_ex(provider_account_key, "codex:test-account", ttl=300)
+    fake_redis_client.hset(
+        _TASK_PROVIDER_ACCOUNTS_KEY,
+        result.task_id,
+        "codex:legacy-test-account",
+    )
+    duplicate_entry_id = fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+    _consume_results_for_project(
+        orchestrator_config.projects[0],
+        fake_redis_client,
+        orchestrator_config.labels,
+        logging.getLogger("test"),
+        max_transient_failures=orchestrator_config.max_transient_failures,
+        issue_delivery_verifier=IssueDeliveryVerifierConfig(enabled=False),
+    )
+    assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
+    assert fake_redis_client.xpending_count(RESULTS_STREAM, RESULTS_GROUP, duplicate_entry_id) == 0
+    assert fake_redis_client.get(side_effects_key) == "1"
+    assert get_pending_task(fake_redis_client, repo, "issue", issue_number) is None
+    assert fake_redis_client.get(provider_account_key) is None
+    assert fake_redis_client.hget(_TASK_PROVIDER_ACCOUNTS_KEY, result.task_id) is None
+    assert gh_run.call_count == 1
+    assert xack.call_count == 2
+    xack.assert_any_call(RESULTS_STREAM, RESULTS_GROUP, first_entry_id)
+    xack.assert_any_call(RESULTS_STREAM, RESULTS_GROUP, duplicate_entry_id)
 
 
 def test_consume_results_completed_does_not_clear_total_attempts(
@@ -1714,6 +2162,107 @@ def test_consume_results_usage_exhausted(fake_redis_client, orchestrator_config,
     assert 1700 <= fake_redis_client.ttl(f"pr:{repo}:{pr_number}:usage_cooldown") <= 1800
 
 
+@pytest.mark.integration
+def test_grok_402_usage_balance_result_benches_account_and_counts_skip(
+    tmp_path,
+    monkeypatch,
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """Live-shaped Grok 402 usage-balance output reaches provider cooldown telemetry."""
+    from orcest.orchestrator.provider_pool import ProviderPool
+    from orcest.shared.providers import ProviderEntry
+    from orcest.worker.grok_runner import GrokRunner
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    attempts = tmp_path / "attempts"
+    fixture = (
+        Path(__file__).parents[1]
+        / "worker"
+        / "fixtures"
+        / ("grok_usage_balance_exhausted_402.jsonl")
+    )
+    fake_grok = bin_dir / "grok"
+    fake_grok.write_text(
+        "#!/bin/sh\n"
+        f"count=$(cat {shlex.quote(str(attempts))} 2>/dev/null || echo 0)\n"
+        "count=$((count + 1))\n"
+        f'echo "$count" > {shlex.quote(str(attempts))}\n'
+        f"cat {shlex.quote(str(fixture))}\n"
+        "exit 1\n"
+    )
+    fake_grok.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+
+    entry = ProviderEntry(provider="grok", credential="xai-grok-test", model="grok-build")
+    pool = ProviderPool([entry])
+    task_id = "task-grok-402-usage-balance"
+    pool.register_task(task_id, entry)
+
+    runner_result = GrokRunner(max_retries=3, retry_backoff=0).run(
+        prompt="fix the issue",
+        work_dir=tmp_path,
+        token=orchestrator_config.github.token,
+        timeout=10,
+        provider="grok",
+        credential=entry.credential,
+        model=entry.model or "",
+        home_dir=tmp_path / "home",
+    )
+
+    assert attempts.read_text().strip() == "1"
+    assert runner_result.usage_exhausted is True
+    assert runner_result.transient is False
+
+    repo = orchestrator_config.github.repo
+    result = _make_task_result(
+        status=ResultStatus.USAGE_EXHAUSTED,
+        pr_number=778,
+        task_id=task_id,
+        summary=runner_result.summary,
+        rate_limit_resets_at=runner_result.rate_limit_resets_at,
+    )
+    result.provider_account = entry.account_key()
+
+    _handle_result(
+        orchestrator_config.projects[0],
+        orchestrator_config.labels,
+        fake_redis_client,
+        result,
+        logging.getLogger("test.grok-usage"),
+        token_pool=pool,
+    )
+
+    assert pool.available_count == 0
+    assert has_usage_exhausted_cooldown(fake_redis_client, repo, 778)
+    assert fake_redis_client.get(_USAGE_EXHAUSTED_RESULT_KEY) == "1"
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[_make_pr_state(number=779, action=PRAction.ENQUEUE_FIX)],
+    )
+    publish_mock = mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    project_key = orchestrator_config.projects[0].key_prefix
+    _poll_cycle(
+        orchestrator_config,
+        fake_redis_client,
+        fake_redis_client,
+        {project_key: pool},
+        logging.getLogger("test.grok-usage-poll"),
+        3600,
+    )
+
+    publish_mock.assert_not_called()
+    assert fake_redis_client.get(_PROVIDER_EXHAUSTED_SKIP_KEY) == "1"
+    assert fake_redis_client.get("providers:grok:exhausted_skip") == "1"
+
+
 def test_consume_results_usage_exhausted_pr_cooldown_ttl_uses_reset_time(
     fake_redis_client, orchestrator_config, gh_mock
 ):
@@ -1759,7 +2308,12 @@ def test_mark_usage_exhausted_queries_reset_time_for_clauder(mocker):
         logging.getLogger("test"),
     )
 
-    get_reset.assert_called_once_with("claude-oauth")
+    get_reset.assert_called_once_with("claude-oauth", observe=mocker.ANY)
+    get_reset.call_args.kwargs["observe"](
+        {"five_hour": {"utilization": 97, "resets_at": "2026-06-26T12:00:00Z"}}
+    )
+    quota = pool.dashboard_accounts()[0]["quota"]
+    assert quota["windows"][0]["used_percent"] == 97
 
 
 def test_consume_results_usage_exhausted_no_branch(
@@ -1894,6 +2448,32 @@ def test_consume_results_empty(fake_redis_client, orchestrator_config, gh_mock):
     gh_mock.post_comment.assert_not_called()
     gh_mock.add_label.assert_not_called()
     gh_mock.remove_label.assert_not_called()
+    assert fake_redis_client.get(result_consumer_heartbeat_key()) == "1"
+    assert (
+        0
+        < fake_redis_client.ttl(result_consumer_heartbeat_key())
+        <= (RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS)
+    )
+
+
+def test_consume_results_failure_does_not_record_live_heartbeat(
+    fake_redis_client, orchestrator_config, gh_mock, mocker
+):
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    mocker.patch.object(
+        fake_redis_client,
+        "xreadgroup",
+        side_effect=RuntimeError("secret read failure"),
+    )
+
+    with pytest.raises(RuntimeError, match="secret read failure"):
+        _consume_results(
+            orchestrator_config,
+            fake_redis_client,
+            logging.getLogger("test"),
+        )
+
+    assert fake_redis_client.get(result_consumer_heartbeat_key()) is None
 
 
 def test_consume_results_xack_failure_continues(
@@ -1921,40 +2501,6 @@ def test_consume_results_xack_failure_continues(
 
     # The result was still processed (completed = no comment posted)
     gh_mock.post_comment.assert_not_called()
-
-
-def test_consume_results_blocked_status_posts_comment(
-    fake_redis_client,
-    orchestrator_config,
-    gh_mock,
-):
-    """A result with BLOCKED status posts a comment and adds blocked label."""
-    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
-
-    result = _make_task_result(status=ResultStatus.BLOCKED, pr_number=71)
-    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
-
-    logger = logging.getLogger("test")
-    _consume_results(orchestrator_config, fake_redis_client, logger)
-
-    # Should post a comment with the fallback format (includes summary/duration/worker)
-    gh_mock.post_comment.assert_called_once()
-    comment_body = gh_mock.post_comment.call_args[0][2]
-    assert result.task_id in comment_body
-    assert "blocked" in comment_body
-    assert result.summary in comment_body
-    assert result.worker_id in comment_body
-
-    # No label removals
-    gh_mock.remove_label.assert_not_called()
-
-    # Should add blocked label, NOT needs-human
-    gh_mock.add_label.assert_called_once_with(
-        orchestrator_config.github.repo,
-        71,
-        orchestrator_config.labels.blocked,
-        orchestrator_config.github.token,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -2306,12 +2852,14 @@ def test_handle_result_post_comment_failure(
     gh_mock.post_comment.assert_called_once()
 
 
-def test_completed_issue_label_failure_stays_pending_then_retries(
+def test_completed_issue_does_not_call_github_during_result_admission(
     fake_redis_client,
     orchestrator_config,
     gh_mock,
-    mocker,
 ):
+    """Completed issue results ACK after job admission without mutating GitHub."""
+    from orcest.orchestrator.issue_delivery import get_verification_job
+
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
     repo = orchestrator_config.github.repo
     issue_number = 92
@@ -2324,29 +2872,61 @@ def test_completed_issue_label_failure_stays_pending_then_retries(
     )
     increment_issue_attempts(fake_redis_client, repo, issue_number)
     set_pending_task(fake_redis_client, repo, "issue", issue_number, result.task_id)
-    entry_id = fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
-    gh_mock.remove_issue_label.side_effect = [RuntimeError("GitHub down"), None]
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+    gh_mock.remove_issue_label.side_effect = RuntimeError("GitHub down")
 
     _consume_results(orchestrator_config, fake_redis_client, logging.getLogger("test"))
 
-    assert get_pending_task(fake_redis_client, repo, "issue", issue_number) == result.task_id
-    assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
+    assert get_pending_task(fake_redis_client, repo, "issue", issue_number) is None
+    assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 1
+    gh_mock.remove_issue_label.assert_not_called()
+    assert get_verification_job(fake_redis_client, repo, issue_number, 0) is not None
     assert (
         fake_redis_client.client.xpending(
             fake_redis_client._prefixed(RESULTS_STREAM), RESULTS_GROUP
         )["pending"]
-        == 1
+        == 0
     )
 
-    mocker.patch.object(
-        fake_redis_client,
-        "xreadgroup",
-        side_effect=[[(entry_id, result.to_dict())], [], []],
+
+def test_completed_issue_job_admission_mismatch_is_quarantined(
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """A pre-schema generation-0 job collision is alerted before ACK."""
+    from orcest.orchestrator.issue_delivery import (
+        get_verification_job,
+        list_quarantined_conflicts,
     )
+
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    repo = orchestrator_config.github.repo
+    issue_number = 93
+    first = _make_task_result(
+        status=ResultStatus.COMPLETED,
+        resource_type="issue",
+        resource_id=issue_number,
+        task_id="legacy-completed-1",
+        branch="",
+    )
+    second = _make_task_result(
+        status=ResultStatus.COMPLETED,
+        resource_type="issue",
+        resource_id=issue_number,
+        task_id="legacy-completed-2",
+        branch="",
+    )
+    fake_redis_client.xadd(RESULTS_STREAM, first.to_dict())
+    fake_redis_client.xadd(RESULTS_STREAM, second.to_dict())
+
     _consume_results(orchestrator_config, fake_redis_client, logging.getLogger("test"))
 
-    assert get_pending_task(fake_redis_client, repo, "issue", issue_number) is None
-    assert gh_mock.remove_issue_label.call_count == 2
+    assert get_verification_job(fake_redis_client, repo, issue_number, 0) is not None
+    items = list_quarantined_conflicts(fake_redis_client)
+    assert items[0]["task_id"] == "legacy-completed-2"
+    assert items[0]["reason"] == "verification_job_mismatch"
+    gh_mock.remove_issue_label.assert_not_called()
     assert (
         fake_redis_client.client.xpending(
             fake_redis_client._prefixed(RESULTS_STREAM), RESULTS_GROUP
@@ -2365,9 +2945,11 @@ def test_pending_marker_clear_failure_retries_without_duplicate_github_effects(
     repo = orchestrator_config.github.repo
     pr_number = 93
     result = _make_task_result(
-        status=ResultStatus.BLOCKED,
+        status=ResultStatus.FAILED,
         pr_number=pr_number,
         task_id="pending-clear-retry",
+        needs_human=True,
+        needs_human_reason="needs a product decision",
     )
     set_pending_task(fake_redis_client, repo, "pr", pr_number, result.task_id)
     entry_id = fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
@@ -2414,47 +2996,6 @@ def test_pending_marker_clear_failure_retries_without_duplicate_github_effects(
     )
     # The durable side-effect checkpoint bypasses already-completed GitHub work.
     gh_mock.add_label.assert_called_once()
-    gh_mock.post_comment.assert_called_once()
-
-
-def test_blocked_label_failure_stays_pending_then_retries(
-    fake_redis_client,
-    orchestrator_config,
-    gh_mock,
-    mocker,
-):
-    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
-    repo = orchestrator_config.github.repo
-    pr_number = 94
-    result = _make_task_result(
-        status=ResultStatus.BLOCKED,
-        pr_number=pr_number,
-        task_id="blocked-label-retry",
-    )
-    set_pending_task(fake_redis_client, repo, "pr", pr_number, result.task_id)
-    entry_id = fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
-    gh_mock.add_label.side_effect = [RuntimeError("GitHub down"), None]
-
-    _consume_results(orchestrator_config, fake_redis_client, logging.getLogger("test"))
-
-    assert get_pending_task(fake_redis_client, repo, "pr", pr_number) == result.task_id
-    assert (
-        fake_redis_client.client.xpending(
-            fake_redis_client._prefixed(RESULTS_STREAM), RESULTS_GROUP
-        )["pending"]
-        == 1
-    )
-    gh_mock.post_comment.assert_not_called()
-
-    mocker.patch.object(
-        fake_redis_client,
-        "xreadgroup",
-        side_effect=[[(entry_id, result.to_dict())], [], []],
-    )
-    _consume_results(orchestrator_config, fake_redis_client, logging.getLogger("test"))
-
-    assert get_pending_task(fake_redis_client, repo, "pr", pr_number) is None
-    assert gh_mock.add_label.call_count == 2
     gh_mock.post_comment.assert_called_once()
 
 
@@ -2529,6 +3070,7 @@ def test_poll_cycle_retrigger_review(mocker, fake_redis_client, orchestrator_con
     mocker.patch("orcest.orchestrator.loop.publish_fix_task")
     mocker.patch("orcest.orchestrator.loop.publish_followup_task")
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    gh_mock.get_review_snapshot.return_value = _review_rerun_snapshot("sha999")
 
     logger = logging.getLogger("test")
     _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
@@ -2569,6 +3111,7 @@ def test_poll_cycle_retrigger_review_failure_logged(
     mocker.patch("orcest.orchestrator.loop.publish_fix_task")
     mocker.patch("orcest.orchestrator.loop.publish_followup_task")
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    gh_mock.get_review_snapshot.return_value = _review_rerun_snapshot("sha000")
 
     gh_mock.rerun_workflow.side_effect = RuntimeError("GitHub API error")
 
@@ -2607,6 +3150,7 @@ def test_poll_cycle_retrigger_review_failure_cooldown_skips_next_poll(
     mocker.patch("orcest.orchestrator.loop.publish_fix_task")
     mocker.patch("orcest.orchestrator.loop.publish_followup_task")
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    gh_mock.get_review_snapshot.return_value = _review_rerun_snapshot("sha-cooldown")
     gh_mock.rerun_workflow.side_effect = RuntimeError("GitHub API error")
 
     logger = logging.getLogger("test")
@@ -2642,6 +3186,7 @@ def test_poll_cycle_retrigger_review_failures_back_off_after_limit(
     mocker.patch("orcest.orchestrator.loop.publish_fix_task")
     mocker.patch("orcest.orchestrator.loop.publish_followup_task")
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    gh_mock.get_review_snapshot.return_value = _review_rerun_snapshot("sha-escalate")
     gh_mock.rerun_workflow.side_effect = RuntimeError("GitHub API error")
 
     repo = orchestrator_config.github.repo
@@ -3739,6 +4284,78 @@ def _make_merge_pr_state(number: int = 42) -> PRState:
     )
 
 
+def test_merge_action_old_only_approval_skips_without_side_effects(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    pr_state = _make_merge_pr_state(number=649)
+    gh_mock.get_review_snapshot.return_value = PRReviewSnapshot(
+        head_sha=pr_state.head_sha,
+        state="OPEN",
+        is_draft=False,
+        labels=(),
+        review_decision="APPROVED",
+        has_current_head_approval=False,
+    )
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    _poll_cycle(
+        orchestrator_config,
+        fake_redis_client,
+        fake_redis_client,
+        {},
+        logging.getLogger("test"),
+        3600,
+    )
+
+    gh_mock.merge_pr.assert_not_called()
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
+    assert (
+        get_backoff_step(fake_redis_client, orchestrator_config.github.repo, pr_state.number)
+        is None
+    )
+
+
+def test_merge_action_unresolved_thread_appears_before_merge_skips(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    pr_state = _make_merge_pr_state(number=650)
+    gh_mock.get_unresolved_review_threads.return_value = [
+        {"id": "thread1", "path": "src/a.py", "line": 1, "comments": []}
+    ]
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    _poll_cycle(
+        orchestrator_config,
+        fake_redis_client,
+        fake_redis_client,
+        {},
+        logging.getLogger("test"),
+        3600,
+    )
+
+    gh_mock.merge_pr.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
+
+
 def test_merge_network_error_skips_needs_human(
     mocker,
     fake_redis_client,
@@ -4104,6 +4721,7 @@ def test_full_multi_provider_flow_exhaust_one_continue_on_other(
     mocker.patch("orcest.orchestrator.loop.publish_rebase_task")
     mocker.patch("orcest.orchestrator.loop.publish_issue_task")
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    _seed_idle_provider_capacity(fake_redis_client, "claude")
 
     # Mixed pool: 1 claude + 2 grok (so we can exhaust "the grok provider")
     c = ProviderEntry(provider="claude", credential="claude-flow-001")

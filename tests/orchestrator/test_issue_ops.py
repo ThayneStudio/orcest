@@ -82,6 +82,57 @@ def test_empty_issue_list(issue_gh_mock, fake_redis_client, label_config):
     assert results == []
 
 
+def test_skip_when_delivery_barrier_present(issue_gh_mock, fake_redis_client, label_config):
+    """A nonterminal verification job blocks rediscovery independent of pending TTL."""
+    from orcest.orchestrator.issue_publication import make_issue_dispatch_barrier_key
+
+    issue_number = 3
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=issue_number, labels=[{"name": label_config.ready}]),
+    ]
+    fake_redis_client.set_value(make_issue_dispatch_barrier_key(REPO, issue_number), "1|1")
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == IssueAction.SKIP_VERIFYING
+
+
+def test_skip_when_delivery_barrier_present_and_verifier_disabled(
+    issue_gh_mock, fake_redis_client, label_config, caplog
+):
+    """A dispatch barrier still blocks discovery when the verifier is disabled,
+    but a warning is logged so the stuck state is not silent."""
+    from orcest.orchestrator.issue_publication import make_issue_dispatch_barrier_key
+    from orcest.shared.config import IssueDeliveryVerifierConfig
+
+    issue_number = 4
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=issue_number, labels=[{"name": label_config.ready}]),
+    ]
+    fake_redis_client.set_value(make_issue_dispatch_barrier_key(REPO, issue_number), "1|1")
+
+    with caplog.at_level("WARNING"):
+        results = discover_actionable_issues(
+            repo=REPO,
+            token=TOKEN,
+            redis=fake_redis_client,
+            label_config=label_config,
+            issue_delivery_verifier=IssueDeliveryVerifierConfig(enabled=False),
+        )
+
+    assert len(results) == 1
+    assert results[0].action == IssueAction.SKIP_VERIFYING
+    assert any(
+        "issue_delivery_verifier.enabled is false" in record.message for record in caplog.records
+    )
+
+
 def test_skip_usage_cooldown_when_active(issue_gh_mock, fake_redis_client, label_config):
     """An issue with an active USAGE_EXHAUSTED cooldown is not re-enqueued."""
     issue_number = 2
@@ -122,29 +173,8 @@ def test_multiple_actionable_issues(issue_gh_mock, fake_redis_client, label_conf
 
 
 # ---------------------------------------------------------------------------
-# Terminal labels
+# Terminal label
 # ---------------------------------------------------------------------------
-
-
-def test_skip_blocked_label(issue_gh_mock, fake_redis_client, label_config):
-    """An issue with orcest:blocked is classified as SKIP_LABELED."""
-    issue_gh_mock.return_value = [
-        _make_issue_data(
-            number=5,
-            labels=[{"name": label_config.ready}, {"name": label_config.blocked}],
-        ),
-    ]
-
-    results = discover_actionable_issues(
-        repo=REPO,
-        token=TOKEN,
-        redis=fake_redis_client,
-        label_config=label_config,
-    )
-
-    assert len(results) == 1
-    assert results[0].action == IssueAction.SKIP_LABELED
-    assert results[0].number == 5
 
 
 def test_skip_needs_human_label(issue_gh_mock, fake_redis_client, label_config):
@@ -267,6 +297,99 @@ def test_orphaned_active_issue_clears_attempts_and_enqueues(
     assert get_attempt_count(fake_redis_client, REPO, 14) == 0
 
 
+def _seed_ineffective_generations(redis, issue_number: int, generations: int) -> None:
+    """Record durable INEFFECTIVE retry history without a live pending marker."""
+    from orcest.orchestrator.issue_publication import (
+        make_issue_generation_key,
+        make_issue_retry_record_key,
+    )
+
+    redis.set_value(make_issue_generation_key(REPO, issue_number), str(generations))
+    for gen in range(1, generations + 1):
+        redis.hset_mapping(
+            make_issue_retry_record_key(REPO, issue_number, gen),
+            {
+                "reason": "ineffective_delivery",
+                "generation": str(gen),
+                "task_id": f"task-{gen}",
+                "cooldown_until": "0",
+                "created_at": "0",
+            },
+        )
+
+
+def test_ineffective_history_preserves_attempt_budget(
+    issue_gh_mock, fake_redis_client, label_config
+):
+    """INEFFECTIVE history is not an orphaned counter; keep the attempt budget."""
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=16, labels=[]),
+    ]
+    increment_attempts(fake_redis_client, REPO, 16)
+    increment_attempts(fake_redis_client, REPO, 16)
+    _seed_ineffective_generations(fake_redis_client, 16, generations=1)
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+        max_attempts=3,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == IssueAction.ENQUEUE_IMPLEMENT
+    assert get_attempt_count(fake_redis_client, REPO, 16) == 2
+
+
+def test_prior_generation_ineffective_history_preserves_attempts(
+    issue_gh_mock, fake_redis_client, label_config
+):
+    """Retry records on older generations still prevent an attempt-budget reset."""
+    from orcest.orchestrator.issue_publication import make_issue_generation_key
+
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=17, labels=[]),
+    ]
+    increment_attempts(fake_redis_client, REPO, 17)
+    _seed_ineffective_generations(fake_redis_client, 17, generations=1)
+    # A later reservation that crashed after incrementing generation.
+    fake_redis_client.set_value(make_issue_generation_key(REPO, 17), "2")
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+        max_attempts=3,
+    )
+
+    assert results[0].action == IssueAction.ENQUEUE_IMPLEMENT
+    assert get_attempt_count(fake_redis_client, REPO, 17) == 1
+
+
+def test_ineffective_generations_exhaust_max_attempts_without_attempt_hash(
+    issue_gh_mock, fake_redis_client, label_config
+):
+    """Worker/admission clearing the attempts hash must not refresh max_attempts."""
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=18, labels=[]),
+    ]
+    _seed_ineffective_generations(fake_redis_client, 18, generations=3)
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+        max_attempts=3,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == IssueAction.SKIP_MAX_ATTEMPTS
+    assert get_attempt_count(fake_redis_client, REPO, 18) == 0
+
+
 def test_issue_without_attempts_or_pending_task_still_enqueues(
     issue_gh_mock, fake_redis_client, label_config
 ):
@@ -342,7 +465,7 @@ def test_terminal_label_checked_before_lock(issue_gh_mock, fake_redis_client, la
     issue_gh_mock.return_value = [
         _make_issue_data(
             number=11,
-            labels=[{"name": label_config.blocked}],
+            labels=[{"name": label_config.needs_human}],
         ),
     ]
     # Also set a lock — the label check should short-circuit first
@@ -873,3 +996,35 @@ def test_clear_attempts(fake_redis_client):
 
     clear_attempts(fake_redis_client, REPO, 200)
     assert get_attempt_count(fake_redis_client, REPO, 200) == 0
+
+
+def test_skip_v1_owned_project(issue_gh_mock, fake_redis_client, label_config):
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=1, labels=[{"name": label_config.ready}]),
+    ]
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+        v1_owned_project=True,
+    )
+
+    assert results[0].action == IssueAction.SKIP_V1_OWNED
+
+
+def test_skip_legacy_frozen_issues(issue_gh_mock, fake_redis_client, label_config):
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=1, labels=[{"name": label_config.ready}]),
+    ]
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+        legacy_admissions_frozen=True,
+    )
+
+    assert results[0].action == IssueAction.SKIP_LEGACY_FROZEN

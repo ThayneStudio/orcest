@@ -24,6 +24,7 @@ import yaml
 
 from orcest.orchestrator import gh
 from orcest.revision import get_build_revision
+from orcest.shared import work_observations as work_view
 from orcest.shared.config import WorkerConfig
 from orcest.shared.coordination import (
     RedisLock,
@@ -50,6 +51,7 @@ from orcest.shared.logging import setup_logging
 from orcest.shared.models import (
     CONSUMER_GROUP,
     DEAD_LETTER_STREAM,
+    RESULTS_STREAM,
     TRANSIENT_SUMMARY_PREFIX,
     ResultStatus,
     Task,
@@ -62,6 +64,7 @@ from orcest.shared.output_streams import (
     OUTPUT_STREAM_TTL_SECONDS as _OUTPUT_STREAM_TTL_SECONDS,
     iter_capped_output_fields,
 )
+from orcest.shared.provider_versions import collect_provider_cli_probe
 from orcest.shared.redis_client import RedisClient, is_redis_oom_error
 from orcest.worker._runner_base import _BaseCliRunner
 from orcest.worker.heartbeat import Heartbeat
@@ -71,12 +74,13 @@ from orcest.worker.runner import (
     Runner,
     RunnerResult,
     create_runner,
+    get_provider_recipe,
     get_unsupported_reason,
     prime_provider_binaries,
+    resolve_provider_binary,
 )
 from orcest.worker.workspace import Workspace, WorkspaceError
 
-RESULTS_STREAM = "results"
 HEARTBEAT_INTERVAL = 60  # seconds; heartbeat refresh cadence
 LOCK_TTL = 3 * HEARTBEAT_INTERVAL  # 180 s — crash orphaned-lock expires within 3 × heartbeat
 WORKER_LIVENESS_TTL = 150  # Covers two 60s task-heartbeat refresh intervals plus jitter.
@@ -92,11 +96,17 @@ _EPHEMERAL_RESULT_RETRY_SECONDS = 5
 
 
 def _refresh_worker_liveness(
-    redis: RedisClient, config: WorkerConfig, logger: logging.Logger
+    redis: RedisClient,
+    config: WorkerConfig,
+    logger: logging.Logger,
+    provider_cli: dict[str, Any] | None = None,
 ) -> None:
     """Publish an expiring, non-secret worker process/backend/revision heartbeat."""
+    heartbeat: dict[str, Any] = {"backend": config.backend, "revision": get_build_revision()}
+    if provider_cli is not None:
+        heartbeat["provider_cli"] = provider_cli
     payload = json.dumps(
-        {"backend": config.backend, "revision": get_build_revision()},
+        heartbeat,
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -1108,6 +1118,28 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         ", ".join(f"{name}={'ok' if path else 'MISSING'}" for name, path in sorted(baked.items()))
         or "none",
     )
+    recipe = get_provider_recipe(config.backend)
+    provider_cli = (
+        collect_provider_cli_probe(
+            config.backend,
+            binary=recipe.binary,
+            binary_path=resolve_provider_binary(recipe.binary) if recipe.binary else None,
+        ).to_heartbeat()
+        if recipe is not None
+        else collect_provider_cli_probe(
+            config.backend,
+            binary="",
+            binary_path=None,
+        ).to_heartbeat()
+    )
+    logger.info(
+        "Provider CLI version: provider=%s desired=%s template=%s observed=%s status=%s",
+        provider_cli.get("provider"),
+        provider_cli.get("desired_version"),
+        provider_cli.get("template_version"),
+        provider_cli.get("observed_version"),
+        provider_cli.get("status"),
+    )
     redis = RedisClient(config.redis)
     runner = create_runner(config.runner)
 
@@ -1201,7 +1233,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
     )
 
     while not shutdown and (stop_event is None or not stop_event.is_set()):
-        _refresh_worker_liveness(redis, config, logger)
+        _refresh_worker_liveness(redis, config, logger, provider_cli)
         try:
             if redis.sismember(_POOL_DRAINING_KEY, config.worker_id) is True:
                 logger.info(
@@ -1465,7 +1497,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             interval=HEARTBEAT_INTERVAL,
             logger=logger,
             on_lock_lost=lock_lost.set,
-            on_refreshed=lambda: _refresh_worker_liveness(redis, config, logger),
+            on_refreshed=lambda: _refresh_worker_liveness(redis, config, logger, provider_cli),
         )
         heartbeat.start()
 
@@ -2139,6 +2171,7 @@ def _task_result(
     needs_human_reason: str = "",
     credential_update: str = "",
     credential_update_minted_at: float = 0.0,
+    snapshot_head_sha: str | None = None,
 ) -> TaskResult:
     return TaskResult(
         task_id=task.id,
@@ -2151,7 +2184,9 @@ def _task_result(
         summary=summary,
         duration_seconds=duration_seconds,
         rate_limit_resets_at=rate_limit_resets_at,
-        snapshot_head_sha=task.snapshot_head_sha,
+        snapshot_head_sha=(
+            task.snapshot_head_sha if snapshot_head_sha is None else snapshot_head_sha
+        ),
         decision_reason=task.decision_reason,
         snapshot_failed_checks=task.snapshot_failed_checks,
         snapshot_review_thread_ids=task.snapshot_review_thread_ids,
@@ -2374,6 +2409,7 @@ def _execute_task(
             logger.warning("Failed to emit %s event", event_type, exc_info=True)
 
     def publish_task_end(status: ResultStatus, summary: str = "") -> None:
+        work_view.attempt_finished(event_redis, task, status.value)
         try:
             _publish_task_output(
                 redis,
@@ -2426,6 +2462,9 @@ def _execute_task(
             logger.warning("Failed to publish task_start marker to Redis", exc_info=True)
 
         _emit("net.orcest.task.started")
+        work_view.attempt_started(
+            event_redis, task, config.worker_id, worker_prefix=redis.key_prefix
+        )
 
         try:
             is_stale, stale_reason = _validate_pr_task_snapshot(task, logger)
@@ -2455,6 +2494,17 @@ def _execute_task(
 
         logger.info(f"Cloning {task.repo} (branch: {task.branch or 'default'})")
         work_dir = workspace.setup(task.repo, task.branch, task.token)
+        if task.resource_type == "issue" and task.expected_branch and task.branch is None:
+            owner, _sep, _name = task.repo.partition("/")
+            resumed = workspace.resume_expected_ref(
+                task.repo, owner, task.expected_branch, task.token
+            )
+            if resumed:
+                logger.info(
+                    "Resumed expected ref %s for issue task %s",
+                    task.expected_branch,
+                    task.id,
+                )
         if task.resource_type == "pr" and task.snapshot_head_sha:
             workspace_head_sha = workspace.current_head_sha()
             if workspace_head_sha != task.snapshot_head_sha:
@@ -2570,6 +2620,12 @@ def _execute_task(
         duration = int(time.monotonic() - start)
 
         if runner_result.needs_human:
+            work_view.human_reason(
+                event_redis,
+                task,
+                runner_result.needs_human_reason,
+                credential_update=runner_result.credential_update or "",
+            )
             # A worker-reported human-decision blocker is never a success: the
             # PR was not resolved. Force FAILED (even if the CLI exited 0) so
             # the orchestrator surfaces the signal instead of silently
@@ -2593,13 +2649,26 @@ def _execute_task(
         ):
             summary = f"{TRANSIENT_SUMMARY_PREFIX}{summary}"
 
+        result_branch = task.branch
+        result_head_sha = task.snapshot_head_sha
+        if status == ResultStatus.COMPLETED and task.resource_type == "issue":
+            result_branch = task.expected_branch or task.branch
+            try:
+                result_head_sha = workspace.current_head_sha()
+            except Exception:
+                logger.debug(
+                    "Could not capture final issue branch SHA for task %s",
+                    task.id,
+                    exc_info=True,
+                )
+
         publish_task_end(status, summary)
 
         return _task_result(
             task,
             config,
             status,
-            task.branch,
+            result_branch,
             summary,
             duration,
             rate_limit_resets_at=runner_result.rate_limit_resets_at,
@@ -2607,6 +2676,7 @@ def _execute_task(
             needs_human_reason=runner_result.needs_human_reason,
             credential_update=runner_result.credential_update or "",
             credential_update_minted_at=runner_result.credential_update_minted_at,
+            snapshot_head_sha=result_head_sha,
         )
 
     except Exception as e:

@@ -7,6 +7,7 @@ fake_redis_client (fakeredis-backed RedisClient).
 
 from datetime import datetime, timedelta, timezone
 
+from orcest.orchestrator.gh import GhCliError, GhStaleSnapshotError, PRReviewSnapshot
 from orcest.orchestrator.pr_ops import (
     PRAction,
     _check_stale_pending,
@@ -40,6 +41,7 @@ from orcest.shared.coordination import (
     set_backoff_cooldown,
     set_pending_task,
 )
+from orcest.workflow_contract.v1.publication import render_run_marker
 
 REPO = "test-org/test-repo"
 
@@ -50,11 +52,12 @@ def _make_pr_data(
     branch: str = "fix/widget",
     labels: list[dict] | None = None,
     review_decision: str = "",
-    head_sha: str = "",
+    head_sha: str = "abc123",
     is_draft: bool = False,
     mergeable: str = "MERGEABLE",
     base_branch: str = "main",
     merge_state_status: str = "CLEAN",
+    body: str = "",
 ) -> dict:
     """Build a PR dict matching the shape returned by gh.list_open_prs."""
     return {
@@ -68,7 +71,87 @@ def _make_pr_data(
         "reviewDecision": review_decision,
         "mergeable": mergeable,
         "mergeStateStatus": merge_state_status,
+        "body": body,
     }
+
+
+def test_skip_pr_reserved_by_v1_run_marker(gh_mock, fake_redis_client, label_config):
+    marker = render_run_marker(
+        run_id="11111111-1111-4111-8111-111111111111",
+        publication_id="22222222-2222-4222-8222-222222222222",
+    )
+    gh_mock.list_open_prs.return_value = [_make_pr_data(number=10, body=marker)]
+
+    results = discover_actionable_prs(
+        repo=REPO,
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert results[0].action == PRAction.SKIP_V1_OWNED
+    gh_mock.get_ci_status.assert_not_called()
+
+
+def test_skip_pr_reserved_by_v1_association(gh_mock, fake_redis_client, label_config):
+    gh_mock.list_open_prs.return_value = [_make_pr_data(number=10, branch="orcest/run/owned")]
+    seen: list[dict[str, str | None]] = []
+
+    def is_v1_owned(**identities: str | None) -> bool:
+        seen.append(identities)
+        return True
+
+    results = discover_actionable_prs(
+        repo=REPO,
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        legacy_exclusion_predicate=is_v1_owned,
+    )
+
+    assert seen == [
+        {
+            "change_request_external_id": "10",
+            "deterministic_ref": "refs/heads/orcest/run/owned",
+        }
+    ]
+    assert results[0].action == PRAction.SKIP_V1_OWNED
+    gh_mock.get_ci_status.assert_not_called()
+
+
+def test_v1_association_lookup_failure_excludes_for_current_poll(
+    gh_mock, fake_redis_client, label_config
+):
+    gh_mock.list_open_prs.return_value = [_make_pr_data(number=10)]
+
+    def unavailable(**_identities: str | None) -> bool:
+        raise OSError("workflow store unavailable")
+
+    results = discover_actionable_prs(
+        repo=REPO,
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        legacy_exclusion_predicate=unavailable,
+    )
+
+    assert results[0].action == PRAction.SKIP_V1_LOOKUP_UNAVAILABLE
+    gh_mock.get_ci_status.assert_not_called()
+
+
+def test_skip_pr_when_legacy_admissions_frozen(gh_mock, fake_redis_client, label_config):
+    gh_mock.list_open_prs.return_value = [_make_pr_data(number=10)]
+
+    results = discover_actionable_prs(
+        repo=REPO,
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        legacy_admissions_frozen=True,
+    )
+
+    assert results[0].action == PRAction.SKIP_LEGACY_FROZEN
+    gh_mock.get_ci_status.assert_not_called()
 
 
 def test_skip_labeled_pr(gh_mock, fake_redis_client, label_config):
@@ -76,7 +159,7 @@ def test_skip_labeled_pr(gh_mock, fake_redis_client, label_config):
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(
             number=10,
-            labels=[{"name": "orcest:blocked"}],
+            labels=[{"name": "orcest:needs-human"}],
         ),
     ]
 
@@ -254,6 +337,7 @@ def test_enqueue_review_feedback(gh_mock, fake_redis_client, label_config):
         "test-org/test-repo",
         60,
         "fake-token",
+        expected_head_sha="abc123",
     )
     assert pr.review_threads == threads
 
@@ -395,9 +479,9 @@ def test_review_feedback_respects_max_attempts(gh_mock, fake_redis_client, label
         _make_pr_data(number=pr_number, labels=[], review_decision="CHANGES_REQUESTED"),
     ]
 
-    # Seed Redis with attempts at the max (3), matching the default head_sha=""
+    # Seed Redis with attempts at the max (3), matching the default head_sha.
     for _ in range(3):
-        increment_attempts(fake_redis_client, REPO, pr_number, head_sha="")
+        increment_attempts(fake_redis_client, REPO, pr_number, head_sha="abc123")
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -648,7 +732,7 @@ def test_approved_thread_fetch_failure_skips_merge(gh_mock, fake_redis_client, l
     )
 
     assert len(results) == 1
-    assert results[0].action == PRAction.SKIP_GREEN
+    assert results[0].action == PRAction.SKIP_PENDING
     assert results[0].number == 150
 
 
@@ -754,7 +838,7 @@ def test_ci_failure_respects_max_attempts(gh_mock, fake_redis_client, label_conf
     ]
 
     for _ in range(3):
-        increment_attempts(fake_redis_client, REPO, pr_number, head_sha="")
+        increment_attempts(fake_redis_client, REPO, pr_number, head_sha="abc123")
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -777,7 +861,7 @@ def test_followup_respects_max_attempts(gh_mock, fake_redis_client, label_config
     ]
 
     for _ in range(3):
-        increment_attempts(fake_redis_client, REPO, pr_number, head_sha="")
+        increment_attempts(fake_redis_client, REPO, pr_number, head_sha="abc123")
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -925,10 +1009,9 @@ def test_clear_attempts_deletes_key(fake_redis_client):
 # ---------------------------------------------------------------------------
 
 
-def test_discover_skips_terminal_labels(gh_mock, fake_redis_client, label_config):
-    """PRs with terminal orcest labels (blocked/needs-human) are skipped as SKIP_LABELED."""
+def test_discover_skips_needs_human_label(gh_mock, fake_redis_client, label_config):
+    """PRs that need human intervention are skipped as SKIP_LABELED."""
     gh_mock.list_open_prs.return_value = [
-        _make_pr_data(number=302, labels=[{"name": "orcest:blocked"}]),
         _make_pr_data(number=303, labels=[{"name": "orcest:needs-human"}]),
     ]
 
@@ -939,7 +1022,7 @@ def test_discover_skips_terminal_labels(gh_mock, fake_redis_client, label_config
         label_config=label_config,
     )
 
-    assert len(results) == 2
+    assert len(results) == 1
     for pr in results:
         assert pr.action == PRAction.SKIP_LABELED
     # CI should never be fetched for any of these
@@ -982,7 +1065,7 @@ def test_discover_multiple_prs(gh_mock, fake_redis_client, label_config):
         _make_pr_data(number=311, labels=[], review_decision=""),
     ]
 
-    def ci_status_side_effect(repo, pr_number, token):
+    def ci_status_side_effect(repo, pr_number, token, **kwargs):
         if pr_number == 310:
             return [{"name": "tests", "conclusion": "failure", "detailsUrl": "x"}]
         return [{"name": "tests", "conclusion": "success"}]
@@ -1787,38 +1870,6 @@ def test_skip_labeled_needs_human_refreshes_exhausted_notified_ttl(
     assert ttl_after > 24 * 3600  # reset to ~30-day window, not just any increase
 
 
-def test_skip_labeled_blocked_does_not_refresh_exhausted_notified(
-    gh_mock, fake_redis_client, label_config
-):
-    """SKIP_LABELED with blocked label does NOT refresh exhausted_notified.
-
-    The TTL refresh is specific to the needs-human label, which is the recovery
-    signal. A blocked PR is in a different state; we should not touch the flag.
-    """
-    pr_number = 762
-    gh_mock.list_open_prs.return_value = [
-        _make_pr_data(number=pr_number, labels=[{"name": label_config.blocked}]),
-    ]
-    set_exhausted_notified(fake_redis_client, REPO, pr_number)
-
-    key = f"pr:{REPO}:{pr_number}:exhausted_notified"
-    fake_redis_client.expire(key, 60)
-    ttl_before = fake_redis_client.ttl(key)
-
-    results = discover_actionable_prs(
-        repo="test-org/test-repo",
-        token="fake-token",
-        redis=fake_redis_client,
-        label_config=label_config,
-    )
-
-    assert len(results) == 1
-    assert results[0].action == PRAction.SKIP_LABELED
-    # TTL must NOT have been refreshed.
-    ttl_after = fake_redis_client.ttl(key)
-    assert ttl_after <= ttl_before
-
-
 def test_max_total_attempts_hard_stop_ignores_exhausted_notified(
     gh_mock, fake_redis_client, label_config
 ):
@@ -1889,6 +1940,80 @@ def test_retrigger_review_when_claude_review_passed_no_formal_review(
     assert pr.action == PRAction.RETRIGGER_REVIEW
     assert pr.review_run_id == 55555
     assert pr.number == 800
+
+
+def test_pr330_shape_stale_aggregate_approval_retriggers_review(
+    gh_mock, fake_redis_client, label_config
+):
+    """Aggregate APPROVED with only old formal approval never emits MERGE."""
+    head_sha = "a5292b40"
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=330, labels=[], review_decision="APPROVED", head_sha=head_sha),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "lint", "conclusion": "success"},
+        _make_claude_review_check(run_id=330330),
+    ]
+    gh_mock.get_review_snapshot.return_value = PRReviewSnapshot(
+        head_sha=head_sha,
+        state="OPEN",
+        is_draft=False,
+        labels=(),
+        review_decision="APPROVED",
+        has_current_head_approval=False,
+    )
+    gh_mock.get_unresolved_review_threads.return_value = []
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.RETRIGGER_REVIEW
+    assert results[0].review_run_id == 330330
+    gh_mock.get_review_snapshot.assert_called_once_with(
+        "test-org/test-repo", 330, "fake-token", expected_head_sha=head_sha
+    )
+
+
+def test_approved_snapshot_fetch_error_never_merges(gh_mock, fake_redis_client, label_config):
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=331, labels=[], review_decision="APPROVED", head_sha="abc123"),
+    ]
+    gh_mock.get_ci_status.return_value = [{"name": "tests", "conclusion": "success"}]
+    gh_mock.get_review_snapshot.side_effect = GhCliError("malformed review evidence")
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_PENDING
+    gh_mock.get_unresolved_review_threads.assert_not_called()
+
+
+def test_ci_head_mismatch_cannot_select_action(gh_mock, fake_redis_client, label_config):
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=332, labels=[], review_decision="APPROVED", head_sha="abc123"),
+    ]
+    gh_mock.get_ci_status.side_effect = GhStaleSnapshotError("head changed")
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_PENDING
+    gh_mock.get_review_snapshot.assert_not_called()
 
 
 def test_retrigger_review_escalates_after_retrigger_exhausted(
@@ -2304,7 +2429,7 @@ def test_skip_pending_when_no_timestamp_first_seen_is_fresh(
 
     assert len(results) == 1
     assert results[0].action == PRAction.SKIP_PENDING
-    key = _make_pending_check_first_seen_key(REPO, 1002, "", check)
+    key = _make_pending_check_first_seen_key(REPO, 1002, "abc123", check)
     assert fake_redis_client.get(key) is not None
 
 

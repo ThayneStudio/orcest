@@ -934,3 +934,178 @@ class TestRestartRestore:
         manager._check_stream_health()
         assert _read_state(rc)["state"] == "healthy"
         assert reads["n"] == reads_after_give_up
+
+
+def _failing_snapshot_pipeline(manager, monkeypatch, fail: dict[str, bool] | None = None):
+    """Make stream-health snapshot pipeline reads raise while *fail* is true."""
+    original = manager._redis.client.pipeline
+    active = fail if fail is not None else {"value": True}
+
+    def _pipeline(*args, **kwargs):
+        if active["value"]:
+            raise ConnectionError("redis down")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(manager._redis.client, "pipeline", _pipeline)
+    return active
+
+
+def _snapshot_read_warnings(caplog, key: str | None = None):
+    records = [
+        record
+        for record in caplog.records
+        if record.levelname == "WARNING"
+        and "Failed to read stream health snapshot" in record.getMessage()
+    ]
+    if key is not None:
+        records = [record for record in records if key in record.getMessage()]
+    return records
+
+
+class TestRestoreReadFailureLogDecimation:
+    def test_ninety_consecutive_failures_warn_only_at_one_and_ten(
+        self, fake_redis_client, monkeypatch, caplog
+    ):
+        manager, _ = _build(fake_redis_client)
+        _failing_snapshot_pipeline(manager, monkeypatch)
+        key = stream_health_snapshot_key("claude")
+
+        with caplog.at_level("WARNING"):
+            for _ in range(90):
+                assert manager._read_stream_health_snapshot_record(key) is None
+
+        warnings = _snapshot_read_warnings(caplog, key)
+        assert len(warnings) == 2
+        assert "1 consecutive failures" in warnings[0].getMessage()
+        assert "10 consecutive failures" in warnings[1].getMessage()
+        assert all(record.exc_info for record in warnings)
+        assert manager._stream_health_restore_read_failures[key] == 90
+
+    def test_independent_snapshot_keys_have_independent_counters(
+        self, fake_redis_client, monkeypatch, caplog
+    ):
+        manager, _ = _build(fake_redis_client)
+        _failing_snapshot_pipeline(manager, monkeypatch)
+        pr_key = stream_health_snapshot_key("claude")
+        issue_key = stream_health_snapshot_key("claude", issue=True)
+
+        with caplog.at_level("WARNING"):
+            for _ in range(9):
+                assert manager._read_stream_health_snapshot_record(pr_key) is None
+            assert manager._read_stream_health_snapshot_record(issue_key) is None
+
+        pr_warnings = _snapshot_read_warnings(caplog, pr_key)
+        issue_warnings = _snapshot_read_warnings(caplog, issue_key)
+        assert len(pr_warnings) == 1
+        assert "1 consecutive failures" in pr_warnings[0].getMessage()
+        assert len(issue_warnings) == 1
+        assert "1 consecutive failures" in issue_warnings[0].getMessage()
+        assert manager._stream_health_restore_read_failures[pr_key] == 9
+        assert manager._stream_health_restore_read_failures[issue_key] == 1
+
+    def test_successful_read_resets_failure_counter(self, fake_redis_client, monkeypatch, caplog):
+        manager, _ = _build(fake_redis_client)
+        fail = _failing_snapshot_pipeline(manager, monkeypatch)
+        key = stream_health_snapshot_key("claude")
+
+        with caplog.at_level("WARNING"):
+            assert manager._read_stream_health_snapshot_record(key) is None
+        assert len(_snapshot_read_warnings(caplog, key)) == 1
+        assert manager._stream_health_restore_read_failures[key] == 1
+
+        fail["value"] = False
+        caplog.clear()
+        record = manager._read_stream_health_snapshot_record(key)
+        assert record is not None
+        assert key not in manager._stream_health_restore_read_failures
+        assert _snapshot_read_warnings(caplog, key) == []
+
+        fail["value"] = True
+        with caplog.at_level("WARNING"):
+            assert manager._read_stream_health_snapshot_record(key) is None
+        warnings = _snapshot_read_warnings(caplog, key)
+        assert len(warnings) == 1
+        assert "1 consecutive failures" in warnings[0].getMessage()
+        assert manager._stream_health_restore_read_failures[key] == 1
+
+    def test_deadline_abandonment_discards_failure_counter(
+        self, fake_redis_client, monkeypatch, caplog
+    ):
+        rc = fake_redis_client
+        _strand(rc, _WORKER_ID, issue=False)
+        now = 1_700_000_000.0
+        health = _stranded_snapshot(observed_at=now - 10, transitioned_at=now - 400)
+        _put_committed_snapshot(rc, health)
+
+        manager, _ = _build(rc, dwell_seconds=300)
+        _failing_snapshot_pipeline(manager, monkeypatch)
+        key = stream_health_snapshot_key("claude")
+        stream = "test:tasks:claude"
+
+        assert manager._restore_committed_stream_health("claude", stream, now, issue=False) is False
+        assert manager._stream_health_restore_read_failures[key] == 1
+
+        with caplog.at_level("WARNING"):
+            assert (
+                manager._restore_committed_stream_health(
+                    "claude", stream, now + _STREAM_HEALTH_TTL_SECONDS + 1, issue=False
+                )
+                is True
+            )
+        assert key not in manager._stream_health_restore_read_failures
+        assert any(
+            "Giving up stream health restore" in record.getMessage() for record in caplog.records
+        )
+
+    def test_failed_read_does_not_double_warn_in_caller(
+        self, fake_redis_client, monkeypatch, caplog
+    ):
+        manager, _ = _build(fake_redis_client)
+        _failing_snapshot_pipeline(manager, monkeypatch)
+        key = stream_health_snapshot_key("claude")
+
+        with caplog.at_level("WARNING"):
+            assert (
+                manager._restore_committed_stream_health(
+                    "claude", "test:tasks:claude", 1_700_000_000.0, issue=False
+                )
+                is False
+            )
+
+        failure_warnings = [
+            record
+            for record in caplog.records
+            if record.levelname == "WARNING" and "Failed to" in record.getMessage()
+        ]
+        assert len(failure_warnings) == 1
+        assert key in failure_warnings[0].getMessage()
+        assert "Failed to restore stream health" not in failure_warnings[0].getMessage()
+
+    def test_restore_keeps_retrying_during_decimated_failures(
+        self, fake_redis_client, monkeypatch, caplog
+    ):
+        rc = fake_redis_client
+        _strand(rc, _WORKER_ID, issue=False)
+        now = 1_700_000_000.0
+        health = _stranded_snapshot(observed_at=now - 10, transitioned_at=now - 400)
+        _put_committed_snapshot(rc, health)
+
+        manager, _ = _build(rc, dwell_seconds=300)
+        _failing_snapshot_pipeline(manager, monkeypatch)
+        stream = "test:tasks:claude"
+
+        with caplog.at_level("WARNING"):
+            for _ in range(90):
+                assert (
+                    manager._restore_committed_stream_health("claude", stream, now, issue=False)
+                    is False
+                )
+
+        assert _read_state(rc)["state"] == "stranded"
+        assert _read_state(rc)["transitioned_at"] == health.transitioned_at
+        assert manager._stream_health_tracker.has_state("claude", stream) is False
+        assert manager._restore_committed_stream_health("claude", stream, now, issue=False) is False
+        key = stream_health_snapshot_key("claude")
+        warnings = _snapshot_read_warnings(caplog, key)
+        assert len(warnings) == 2
+        assert manager._stream_health_restore_read_failures[key] == 91

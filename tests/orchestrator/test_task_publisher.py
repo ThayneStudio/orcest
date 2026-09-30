@@ -23,6 +23,7 @@ from orcest.orchestrator.pr_ops import (
     get_attempt_count,
     get_total_attempt_count,
 )
+from orcest.orchestrator.provider_capacity import CapacityReservation
 from orcest.orchestrator.task_publisher import (
     _render_rebase_prompt,
     publish_fix_task,
@@ -33,6 +34,11 @@ from orcest.orchestrator.task_publisher import (
 )
 from orcest.shared.models import Task, TaskType
 from orcest.shared.redis_client import RedisClient
+
+
+class _RejectedCapacityReservation:
+    def refresh(self) -> bool:
+        return False
 
 
 def _make_pr_state(
@@ -60,6 +66,64 @@ def _setup_gh_defaults(gh_mock):
     gh_mock.get_pr_diff.return_value = "diff --git a/foo.py b/foo.py\n+pass"
     gh_mock.get_unresolved_review_threads.return_value = []
     gh_mock.post_comment.return_value = None
+
+
+def test_expired_capacity_claim_defers_before_pending_or_attempt_mutation(
+    fake_redis_client,
+) -> None:
+    pr_state = _make_pr_state(number=808)
+
+    task = publish_rebase_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="codex",
+        provider="codex",
+        credential="redacted-credential",
+        task_id="capacity-expired",
+        capacity_reservation=_RejectedCapacityReservation(),
+    )
+
+    assert task is None
+    assert get_attempt_count(fake_redis_client, "test-org/test-repo", 808, "abc123") == 0
+    assert fake_redis_client.get("pending:pr:test-org/test-repo:808") is None
+    assert fake_redis_client.xlen("tasks:codex") == 0
+
+
+def test_capacity_transport_error_defers_without_leaking_exception_text(
+    fake_redis_client,
+    mocker,
+    caplog,
+) -> None:
+    secret = "credential-sentinel-must-not-leak"
+    reservation = CapacityReservation(
+        redis=fake_redis_client,
+        provider="codex",
+        task_id="capacity-transport-error",
+    )
+    mocker.patch(
+        "orcest.orchestrator.provider_capacity.RedisLock.acquire",
+        side_effect=RuntimeError(secret),
+    )
+
+    with caplog.at_level(logging.INFO):
+        task = publish_rebase_task(
+            pr_state=_make_pr_state(number=809),
+            repo="test-org/test-repo",
+            token="fake-token",
+            redis=fake_redis_client,
+            default_runner="codex",
+            provider="codex",
+            credential="redacted-credential",
+            task_id=reservation.task_id,
+            capacity_reservation=reservation,
+        )
+
+    assert task is None
+    assert secret not in caplog.text
+    assert get_attempt_count(fake_redis_client, "test-org/test-repo", 809, "abc123") == 0
+    assert fake_redis_client.get("pending:pr:test-org/test-repo:809") is None
 
 
 def test_publish_creates_task(gh_mock, fake_redis_client):
@@ -1979,3 +2043,80 @@ def test_publish_issue_xadd_failure_rolls_back_one_attempt_not_whole_budget(
 
     # Reservation incremented to 3 then rolled back exactly one -> 2.
     assert get_issue_attempt_count(fake_redis_client, repo, 555) == 2
+
+
+def test_publish_issue_task_no_warning_when_publication_cas_succeeds(
+    gh_mock,
+    fake_redis_client,
+    caplog,
+):
+    """A successful publication CAS emits no CAS-failure warning and the
+    task is still reported as published."""
+    _setup_gh_defaults(gh_mock)
+    issue_state = IssueState(
+        number=901,
+        title="Test issue",
+        body="Test issue body",
+        action=IssueAction.ENQUEUE_IMPLEMENT,
+        labels=[],
+    )
+
+    with caplog.at_level(logging.WARNING):
+        task = publish_issue_task(
+            issue_state=issue_state,
+            repo="test-org/test-repo",
+            token="fake-token",
+            redis=fake_redis_client,
+            default_runner="claude",
+        )
+
+    assert task is not None
+    assert not any("Publication CAS failed" in record.getMessage() for record in caplog.records)
+
+
+def test_publish_issue_task_warns_once_when_publication_cas_fails(
+    gh_mock,
+    fake_redis_client,
+    mocker,
+    caplog,
+):
+    """When mark_issue_published cannot move the durable record to
+    published, publish_issue_task still enqueues the task, still returns it,
+    and emits exactly one warning identifying the stale record -- without
+    logging the task payload or credentials."""
+    _setup_gh_defaults(gh_mock)
+    mocker.patch(
+        "orcest.orchestrator.task_publisher.mark_issue_published",
+        return_value=False,
+    )
+    issue_state = IssueState(
+        number=902,
+        title="Test issue",
+        body="Test issue body",
+        action=IssueAction.ENQUEUE_IMPLEMENT,
+        labels=[],
+    )
+
+    with caplog.at_level(logging.WARNING):
+        task = publish_issue_task(
+            issue_state=issue_state,
+            repo="test-org/test-repo",
+            token="fake-token",
+            redis=fake_redis_client,
+            default_runner="claude",
+        )
+
+    # The task was already appended to the stream, so publish_issue_task
+    # still reports success -- publication is observability-only.
+    assert task is not None
+
+    cas_warnings = [
+        record for record in caplog.records if "Publication CAS failed" in record.getMessage()
+    ]
+    assert len(cas_warnings) == 1
+    message = cas_warnings[0].getMessage()
+    assert "test-org/test-repo" in message
+    assert "902" in message
+    assert task.id in message
+    assert "fake-token" not in message
+    assert issue_state.body not in message

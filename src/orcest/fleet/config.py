@@ -251,8 +251,8 @@ class PoolConfig:
     # Image-integrity verification for the template cloud image (M5-infra).
     # By default the bake fetches the image's published ``SHA256SUMS`` +
     # ``SHA256SUMS.gpg``, GPG-verifies them against ``expected_image_gpg_key``,
-    # extracts the sha256 for the pinned image filename, and passes it to the
-    # Proxmox download so the node verifies the bytes. Set
+    # extracts the sha256 for the pinned image filename, then downloads and
+    # verifies one local byte stream before importing that exact path. Set
     # ``expected_image_sha256`` to a 64-hex digest to PIN it instead (offline /
     # air-gapped bakes) -- the digest is then used directly with no network
     # GPG fetch. Either way verification is fail-closed: an unresolvable /
@@ -428,6 +428,36 @@ class PoolConfig:
 
 
 @dataclass
+class DesiredSourceConfig:
+    """Declared desired Orcest source revision -- explicit operator policy.
+
+    Either ``ref`` (a fully qualified, possibly moving ref such as
+    ``refs/heads/master``) or ``sha`` (an immutable full 40-character commit
+    hash) may be set, never both. Neither is inferred from the ambient
+    checkout branch: an unset ``repo`` means no desired revision is declared
+    at all, and fleet health reporting must say so explicitly rather than
+    treating any deployed revision as current.
+    """
+
+    repo: str = ""
+    ref: str = ""
+    sha: str = ""
+
+    def __post_init__(self) -> None:
+        if self.ref and self.sha:
+            raise ValueError("desired_source: set only one of ref or sha, not both")
+        if (self.ref or self.sha) and not self.repo.strip():
+            raise ValueError("desired_source.repo is required when ref or sha is set")
+        if self.sha and not re.fullmatch(r"[0-9a-fA-F]{40}", self.sha.strip()):
+            raise ValueError("desired_source.sha must be a full 40-character commit hash")
+
+    @property
+    def is_configured(self) -> bool:
+        """Return whether a desired repo plus ref or sha has been declared."""
+        return bool(self.repo.strip() and (self.ref.strip() or self.sha.strip()))
+
+
+@dataclass
 class FleetConfig:
     """Top-level fleet configuration."""
 
@@ -436,12 +466,17 @@ class FleetConfig:
     orgs: dict[str, OrgEntry] = field(default_factory=dict)
     projects: list[ProjectEntry] = field(default_factory=list)
     pool: PoolConfig = field(default_factory=PoolConfig)
+    desired_source: DesiredSourceConfig = field(default_factory=DesiredSourceConfig)
     # Optional absolute path on the orchestrator VM where verbatim per-task
     # traces are archived. ``None`` disables archiving (orchestrator falls back
     # to today's Redis-only output stream). When set, ``generate_env_file``
     # emits ``ORCEST_TRACE_HOST_PATH`` and ``generate_orchestrator_config``
     # emits ``trace_archive_path`` per project.
     trace_archive_host_path: str | None = None
+    # Optional absolute path on the orchestrator VM containing the v1
+    # workflow.db. It is mounted read-only into each legacy orchestrator so
+    # the unconditional ownership fence can be evaluated per repository.
+    workflow_state_host_path: str | None = None
     # Optional shared monitor ingest wiring. The fleet config is already a
     # root-only credential store for provider/GitHub tokens; keeping the write
     # token here lets every regenerated per-project .env remain consistent
@@ -681,6 +716,12 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
     else:
         trace_archive_host_path = None
 
+    workflow_state_host_path_raw = data.get("workflow_state_host_path")
+    if isinstance(workflow_state_host_path_raw, str) and workflow_state_host_path_raw.strip():
+        workflow_state_host_path: str | None = workflow_state_host_path_raw.strip()
+    else:
+        workflow_state_host_path = None
+
     monitor_ingest_url_raw = data.get("monitor_ingest_url")
     if isinstance(monitor_ingest_url_raw, str) and monitor_ingest_url_raw.strip():
         monitor_ingest_url: str | None = monitor_ingest_url_raw.strip()
@@ -694,13 +735,24 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
     else:
         monitor_write_token = monitor_write_token_raw.strip()
 
+    ds = data.get("desired_source") or {}
+    if not isinstance(ds, dict):
+        raise ValueError("desired_source must be a mapping")
+    desired_source = DesiredSourceConfig(
+        repo=str(ds.get("repo", "") or ""),
+        ref=str(ds.get("ref", "") or ""),
+        sha=str(ds.get("sha", "") or ""),
+    )
+
     return FleetConfig(
         proxmox=proxmox,
         orchestrator=orchestrator,
         orgs=orgs,
         projects=projects,
         pool=pool,
+        desired_source=desired_source,
         trace_archive_host_path=trace_archive_host_path,
+        workflow_state_host_path=workflow_state_host_path,
         monitor_ingest_url=monitor_ingest_url,
         monitor_write_token=monitor_write_token,
     )
@@ -777,8 +829,16 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
         },
     }
 
+    if config.desired_source.is_configured:
+        data["desired_source"] = {
+            "repo": config.desired_source.repo,
+            "ref": config.desired_source.ref,
+            "sha": config.desired_source.sha,
+        }
     if config.trace_archive_host_path:
         data["trace_archive_host_path"] = config.trace_archive_host_path
+    if config.workflow_state_host_path:
+        data["workflow_state_host_path"] = config.workflow_state_host_path
     if config.monitor_ingest_url:
         data["monitor_ingest_url"] = config.monitor_ingest_url
     if config.monitor_write_token:

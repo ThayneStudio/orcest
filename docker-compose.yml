@@ -9,6 +9,9 @@ services:
         ORCEST_GID: ${ORCEST_GID:-1000}
     volumes:
       - ${ORCEST_CONFIG_DIR:-./config}:/home/orcest/app/config:ro
+      # Workflow-Control v1 ownership database used by the legacy selector.
+      # Configure workflow_state_root=/var/lib/orcest/workflow alongside this mount.
+      - ${ORCEST_WORKFLOW_STATE_HOST_PATH:-/dev/null}:/var/lib/orcest/workflow:ro
     environment:
       - GITHUB_TOKEN
       - GH_TOKEN=${GITHUB_TOKEN}

@@ -8,6 +8,7 @@ posting comments when tasks are queued.
 import json
 import logging
 import re
+from typing import Protocol
 from weakref import WeakKeyDictionary
 
 from orcest.orchestrator import gh
@@ -26,6 +27,12 @@ from orcest.orchestrator.issue_publication import (
     rollback_prepared_issue_publication,
     xadd_task_idempotent,
 )
+from orcest.orchestrator.issue_retry import (
+    IssueRetryContext,
+    load_latest_issue_retry_context,
+    render_issue_retry_prompt_section,
+    same_repo_expected_ref_allowed,
+)
 from orcest.orchestrator.pr_ops import (
     PRState,
     get_total_attempt_count,
@@ -41,7 +48,7 @@ from orcest.shared.coordination import (
     set_pending_task,
 )
 from orcest.shared.events import EventPublisher, make_event
-from orcest.shared.models import Task, TaskType, task_stream_name
+from orcest.shared.models import REDACTED_FIELDS, Task, TaskType, task_stream_name
 from orcest.shared.redis_client import RedisClient
 
 _RUN_ID_RE = re.compile(r"https://github\.com/[^/]+/[^/]+/actions/runs/(\d+)")
@@ -78,6 +85,12 @@ _LOG_ERROR_RE = re.compile(
 # RunnerConfig defaults.  Functions that have a live RunnerConfig available
 # should receive the TTL explicitly; this constant is used only as a fallback.
 _DEFAULT_PENDING_TASK_TTL: int = compute_pending_task_ttl(RunnerConfig())
+
+
+class PublicationCapacityReservation(Protocol):
+    """Minimal capacity-claim contract checked at the mutation boundary."""
+
+    def refresh(self) -> bool: ...
 
 
 def _resolve_task_provider(provider: str | None, default_runner: str) -> str:
@@ -461,6 +474,15 @@ def _emit_enqueued(redis: RedisClient, task: Task) -> None:
     )
 
 
+def _task_stream_payload(task: Task, *, omit_raw_credentials: bool) -> dict[str, str]:
+    payload = task.to_dict()
+    if omit_raw_credentials:
+        for field in REDACTED_FIELDS:
+            if field in payload:
+                payload[field] = ""
+    return payload
+
+
 def _publish_and_notify(
     task: Task,
     pr_state: PRState,
@@ -472,6 +494,8 @@ def _publish_and_notify(
     logger: logging.Logger | None = None,
     proactive: bool = False,
     task_redis: RedisClient | None = None,
+    capacity_reservation: PublicationCapacityReservation | None = None,
+    omit_raw_credentials: bool = False,
 ) -> bool:
     """Publish a task to Redis and update GitHub visibility.
 
@@ -493,6 +517,16 @@ def _publish_and_notify(
     """
     task_type = task.type
     _log = logger or logging.getLogger(__name__)
+
+    # Context collection may involve bounded GitHub retries. Revalidate the
+    # shared claim immediately before mutating pending/attempt state.
+    if capacity_reservation is not None and not capacity_reservation.refresh():
+        _log.info(
+            "Capacity reservation expired before publishing task %s for PR #%d; deferring",
+            task.id,
+            pr_state.number,
+        )
+        return False
 
     # Claim the pending-task slot atomically (SET NX EX). If another task
     # is already pending for this PR, skip publish to avoid duplicates.
@@ -548,7 +582,10 @@ def _publish_and_notify(
     stream_redis = task_redis or redis
     try:
         tasks_stream = task_stream_name(task.provider or default_runner)
-        stream_redis.xadd(tasks_stream, task.to_dict())
+        stream_redis.xadd(
+            tasks_stream,
+            _task_stream_payload(task, omit_raw_credentials=omit_raw_credentials),
+        )
     except Exception:
         _log.error(
             f"Failed to publish task {task.id} for PR #{pr_state.number} to Redis",
@@ -590,6 +627,8 @@ def publish_fix_task(
     # task_id for register-before-publish hardened failure handling (Task 5 wiring)
     task_id: str | None = None,
     provider_account: str = "",
+    capacity_reservation: PublicationCapacityReservation | None = None,
+    omit_raw_credentials: bool = False,
 ) -> Task | None:
     """Create and publish a fix task for a PR.
 
@@ -699,6 +738,8 @@ def publish_fix_task(
         pending_task_ttl=pending_task_ttl,
         logger=logger,
         task_redis=task_redis,
+        capacity_reservation=capacity_reservation,
+        omit_raw_credentials=omit_raw_credentials,
     )
 
     return task if published else None
@@ -722,6 +763,8 @@ def publish_followup_task(
     # task_id for register-before-publish hardened failure handling (Task 5 wiring)
     task_id: str | None = None,
     provider_account: str = "",
+    capacity_reservation: PublicationCapacityReservation | None = None,
+    omit_raw_credentials: bool = False,
 ) -> Task | None:
     """Create and publish a triage-followups task for a PR.
 
@@ -787,6 +830,8 @@ def publish_followup_task(
         pending_task_ttl=pending_task_ttl,
         logger=logger,
         task_redis=task_redis,
+        capacity_reservation=capacity_reservation,
+        omit_raw_credentials=omit_raw_credentials,
     )
 
     return task if published else None
@@ -812,6 +857,8 @@ def publish_rebase_task(
     # task_id for register-before-publish hardened failure handling (Task 5 wiring)
     task_id: str | None = None,
     provider_account: str = "",
+    capacity_reservation: PublicationCapacityReservation | None = None,
+    omit_raw_credentials: bool = False,
 ) -> Task | None:
     """Create and publish a rebase task for a PR.
 
@@ -866,6 +913,8 @@ def publish_rebase_task(
         logger=logger,
         proactive=proactive,
         task_redis=task_redis,
+        capacity_reservation=capacity_reservation,
+        omit_raw_credentials=omit_raw_credentials,
     )
 
     return task if published else None
@@ -889,6 +938,8 @@ def publish_issue_task(
     # task_id for register-before-publish hardened failure handling (Task 5 wiring)
     task_id: str | None = None,
     provider_account: str = "",
+    capacity_reservation: PublicationCapacityReservation | None = None,
+    omit_raw_credentials: bool = False,
 ) -> Task | None:
     """Create and publish an implementation task for a GitHub issue.
 
@@ -898,22 +949,34 @@ def publish_issue_task(
     3. Post comment on issue
     """
     expected_branch = expected_branch_name(issue_state.number, issue_state.title)
+    retry_context = load_latest_issue_retry_context(redis, repo, issue_state.number)
+    if retry_context is not None and same_repo_expected_ref_allowed(
+        repo, retry_context.expected_head_owner, retry_context.expected_ref
+    ):
+        expected_branch = retry_context.expected_ref
+    else:
+        retry_context = None
     prompt = _render_issue_prompt(
         issue_number=issue_state.number,
         issue_title=issue_state.title,
         issue_body=issue_state.body,
         repo=repo,
         expected_branch=expected_branch,
+        retry_context=retry_context,
     )
 
     resolved_provider = _resolve_task_provider(provider, default_runner)
     head_owner = expected_head_owner(repo)
+    retry_json = ""
+    if retry_context is not None:
+        retry_json = retry_context.to_canonical_json()
     prompt_hash = hash_prompt_inputs(
         repo=repo,
         issue_number=issue_state.number,
         issue_title=issue_state.title,
         issue_body=issue_state.body,
         expected_branch=expected_branch,
+        retry_context_json=retry_json,
     )
 
     task = Task.create(
@@ -947,6 +1010,8 @@ def publish_issue_task(
         prompt_input_hash=prompt_hash,
         expected_head_owner=head_owner,
         expected_branch=expected_branch,
+        capacity_reservation=capacity_reservation,
+        omit_raw_credentials=omit_raw_credentials,
     )
 
     return task if published else None
@@ -965,6 +1030,8 @@ def _publish_issue_and_notify(
     prompt_input_hash: str = "",
     expected_head_owner: str = "",
     expected_branch: str = "",
+    capacity_reservation: PublicationCapacityReservation | None = None,
+    omit_raw_credentials: bool = False,
 ) -> bool:
     """Publish a task to Redis and update GitHub visibility on the issue.
 
@@ -978,6 +1045,14 @@ def _publish_issue_and_notify(
     """
     task_type = task.type
     _log = logger or logging.getLogger(__name__)
+
+    if capacity_reservation is not None and not capacity_reservation.refresh():
+        _log.info(
+            "Capacity reservation expired before publishing task %s for issue #%d; deferring",
+            task.id,
+            issue_state.number,
+        )
+        return False
 
     try:
         reservation = reserve_issue_publication(
@@ -1010,7 +1085,12 @@ def _publish_issue_and_notify(
     stream_redis = task_redis or redis
     tasks_stream = task_stream_name(task.provider or default_runner, issue=True)
     try:
-        stream_id = xadd_task_idempotent(stream_redis, tasks_stream, task.to_dict(), task.id)
+        stream_id = xadd_task_idempotent(
+            stream_redis,
+            tasks_stream,
+            _task_stream_payload(task, omit_raw_credentials=omit_raw_credentials),
+            task.id,
+        )
     except AmbiguousTaskPublishError:
         _log.error(
             f"Ambiguous publication outcome for task {task.id} "
@@ -1037,7 +1117,7 @@ def _publish_issue_and_notify(
             )
         raise
 
-    mark_issue_published(
+    publication_confirmed = mark_issue_published(
         redis,
         repo,
         issue_state.number,
@@ -1045,6 +1125,17 @@ def _publish_issue_and_notify(
         tasks_stream,
         stream_id,
     )
+    if not publication_confirmed:
+        _log.warning(
+            "Publication CAS failed for issue %s#%d generation %d task %s "
+            "(stream %s, stream_id %s); durable record was not moved to published",
+            repo,
+            issue_state.number,
+            reservation.generation,
+            task.id,
+            tasks_stream,
+            stream_id,
+        )
     _emit_enqueued(redis, task)
 
     _log.info(f"Published {task_type.value} task {task.id} for issue #{issue_state.number}")
@@ -1057,38 +1148,87 @@ def _render_issue_prompt(
     issue_body: str,
     repo: str,
     expected_branch: str | None = None,
+    retry_context: IssueRetryContext | None = None,
 ) -> str:
     """Render the prompt for implementing a GitHub issue."""
     branch_name = expected_branch or expected_branch_name(issue_number, issue_title)
+    if retry_context is not None and retry_context.remote_ref_exists:
+        checkout_instruction = (
+            f"2. Resume the authoritative same-repository ref `{branch_name}` "
+            "by continuing on the checked-out expected branch. Do not create a "
+            "different branch and do not trust a provider-claimed name. Run "
+            "`git branch --show-current` to confirm: if it reports the default "
+            f"branch instead of `{branch_name}` (the expected ref was deleted "
+            "after this task was queued), create it fresh instead: "
+            f"`git checkout -b {branch_name}`."
+        )
+    elif retry_context is not None:
+        checkout_instruction = (
+            f"2. Create the snapshotted expected branch: `git checkout -b {branch_name}`. "
+            "No authoritative expected remote ref exists; do not trust a previous "
+            "provider-claimed branch name."
+        )
+    else:
+        checkout_instruction = f"2. Create a new branch: `git checkout -b {branch_name}`"
+
+    if retry_context is not None and retry_context.pr_number is not None:
+        pr_instruction = (
+            f"8. Continue the existing pull request `{retry_context.pr_url}` "
+            f"(#{retry_context.pr_number}) with `--head {branch_name}`. Do not open "
+            f"another PR. Ensure it canonically closes this issue (`Closes #{issue_number}`). "
+            "If you must pass `--title`, write a concise title yourself; do not copy "
+            "the issue title verbatim."
+        )
+    else:
+        pr_instruction = (
+            f"8. Open a PR with `gh pr create --repo {repo} --head {branch_name} "
+            f'--body "Closes #{issue_number}"`. Choose a concise PR title that '
+            f"describes your change and pass it with `--title` (write the title "
+            f"yourself; do not copy the issue title verbatim)."
+        )
+
+    if retry_context is not None and retry_context.remote_ref_exists:
+        workspace_line = (
+            "You start on the default branch. Resume only the authoritative "
+            f"same-repository expected ref `{branch_name}` if the worker was "
+            "able to check it out; if the ref was deleted after this task was "
+            "queued, you will still be on the default branch and should "
+            "create it fresh instead (see below)."
+        )
+    else:
+        workspace_line = "You are on the default branch."
 
     sections: list[str] = [
         f"# Implement Issue #{issue_number}: {issue_title}",
         "",
-        "You are on the default branch.",
+        workspace_line,
         "",
         "## Issue Description",
         "",
         issue_body or "(No description provided.)",
         "",
-        "## Instructions",
-        "",
-        "1. Read the issue description carefully.",
-        f"2. Create a new branch: `git checkout -b {branch_name}`",
-        "3. Read the repo's CLAUDE.md (if it exists) for project conventions.",
-        "4. Implement the requested changes.",
-        "5. Run the project's linter and tests to verify your changes.",
-        "6. Commit your changes with a descriptive message referencing the issue.",
-        f"7. Push the branch: `git push -u origin {branch_name}`",
-        f"8. Open a PR with `gh pr create --repo {repo} --head {branch_name} "
-        f'--body "Closes #{issue_number}"`. Choose a concise PR title that '
-        f"describes your change and pass it with `--title` (write the title "
-        f"yourself; do not copy the issue title verbatim).",
-        "",
-        "Important:",
-        "- Make minimal, focused changes.",
-        "- Do NOT close the issue directly -- the PR will close it on merge.",
-        "- Do NOT call `gh pr review` -- you are not authorized to change review status.",
     ]
+    if retry_context is not None:
+        sections.extend([render_issue_retry_prompt_section(retry_context), ""])
+    sections.extend(
+        [
+            "## Instructions",
+            "",
+            "1. Read the issue description carefully.",
+            checkout_instruction,
+            "3. Read the repo's CLAUDE.md (if it exists) for project conventions.",
+            "4. Implement the requested changes.",
+            "5. Run the project's linter and tests to verify your changes.",
+            "6. Commit your changes with a descriptive message referencing the issue.",
+            f"7. Push the branch: `git push -u origin {branch_name}`",
+            pr_instruction,
+            "",
+            "Important:",
+            "- Make minimal, focused changes.",
+            "- Do NOT close the issue directly -- the PR will close it on merge.",
+            "- Do NOT call `gh pr review` -- you are not authorized to change review status.",
+        ]
+    )
 
     return "\n".join(sections)
 

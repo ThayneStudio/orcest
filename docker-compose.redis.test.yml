@@ -1,0 +1,37 @@
+# Invocation-scoped Redis for integration/stress tests.
+# Started only by tests/harness/supervisor.py with a unique -p project.
+# Do not merge this into docker-compose.redis.yml.
+services:
+  redis:
+    image: redis:7-alpine
+    labels:
+      com.orcest.test.harness: "1"
+      com.orcest.test.nonce: "${ORCEST_TEST_REDIS_NONCE:-}"
+      com.orcest.test.project: "${ORCEST_TEST_REDIS_PROJECT:-}"
+    ports:
+      - "127.0.0.1::6379"
+    # Anonymous /data volume so `compose down --volumes` can collect image VOLUME leftovers.
+    volumes:
+      - type: volume
+        target: /data
+        volume:
+          labels:
+            com.orcest.test.harness: "1"
+            com.orcest.test.nonce: "${ORCEST_TEST_REDIS_NONCE:-}"
+            com.orcest.test.project: "${ORCEST_TEST_REDIS_PROJECT:-}"
+    command: redis-server --save "" --appendonly no
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+      start_period: 1s
+    mem_limit: 256m
+
+networks:
+  default:
+    labels:
+      com.orcest.test.harness: "1"
+      com.orcest.test.nonce: "${ORCEST_TEST_REDIS_NONCE:-}"
+      com.orcest.test.project: "${ORCEST_TEST_REDIS_PROJECT:-}"

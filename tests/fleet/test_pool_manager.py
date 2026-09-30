@@ -260,6 +260,18 @@ class TestTaskStreams:
         assert "orcest:tasks:metadata" not in streams
         assert "orcest:tasks:grok" in streams
 
+    def test_v1_offer_streams_are_excluded_from_legacy_pel(self):
+        manager, _proxmox, redis = _make_manager()
+        redis.scan_iter.return_value = ["tasks:activity:v1:default", "tasks:grok"]
+        redis.client.type.return_value = "stream"
+
+        streams, complete = manager._task_streams_with_discovery_status()
+
+        assert complete is True
+        assert "orcest:tasks:activity:v1:default" not in streams
+        assert "orcest:tasks:grok" in streams
+        assert manager._safe_xack("orcest:tasks:activity:v1:default", "1-0") is False
+
     def test_dynamic_type_failure_marks_discovery_incomplete(self):
         manager, _proxmox, redis = _make_manager()
         redis.scan_iter.return_value = ["tasks:metadata"]

@@ -35,7 +35,6 @@ export function statusColor(status: string): string {
   switch (status.trim().toLowerCase()) {
     case "completed": return "bg-emerald-500/20 text-emerald-400";
     case "failed": return "bg-red-500/20 text-red-400";
-    case "blocked": return "bg-yellow-500/20 text-yellow-400";
     case "usage_exhausted": return "bg-purple-500/20 text-purple-400";
     case "stale": return "bg-zinc-500/20 text-zinc-400";
     default: return "bg-zinc-500/20 text-zinc-400";

@@ -21,21 +21,23 @@ from orcest.fleet.cloud_init import (
 pytestmark = pytest.mark.unit
 
 
+def test_provider_cli_bump_comments_point_to_canonical_desired_manifest() -> None:
+    source = Path(__file__).resolve().parents[2] / "src" / "orcest" / "fleet" / "cloud_init.py"
+    text = source.read_text(encoding="utf-8")
+
+    assert "shared/provider_versions.py:PROVIDER_CLI_DESIRED_VERSIONS" in text
+    assert "Change the canonical desired-version manifest on bump" in text
+
+
 def test_manual_setup_codex_pin_matches_cloud_init() -> None:
     """Shell and Python Codex pins must stay identical; silent drift would
     ship a CLI the parser fixtures were not validated against."""
     repo = Path(__file__).resolve().parents[2]
     script = (repo / "provision" / "setup-worker.sh").read_text()
-    cloud_init = (repo / "src" / "orcest" / "fleet" / "cloud_init.py").read_text()
 
     sh_match = re.search(r'^CODEX_VERSION="([^"]+)"', script, re.MULTILINE)
-    py_match = re.search(r'^_CODEX_VERSION = "([^"]+)"', cloud_init, re.MULTILINE)
     assert sh_match is not None, "provision/setup-worker.sh is missing CODEX_VERSION"
-    assert py_match is not None, "cloud_init.py is missing _CODEX_VERSION"
-    assert sh_match.group(1) == py_match.group(1), (
-        f"Codex pins diverged: setup-worker.sh={sh_match.group(1)!r} "
-        f"cloud_init.py={py_match.group(1)!r}"
-    )
+    assert sh_match.group(1) == _CODEX_VERSION
     assert sh_match.group(1) == "0.149.1"
     assert _CODEX_VERSION == "0.149.1"
 

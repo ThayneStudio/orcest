@@ -655,8 +655,21 @@ def ensure_pool_manager(
         " -c 'test -r /home/orcest/app/config/fleet.yaml &&"
         " test -r /home/orcest/.ssh && test -x /home/orcest/.ssh &&"
         " test -f /home/orcest/.ssh/id_ed25519 &&"
-        " test -r /home/orcest/.ssh/id_ed25519' &&"
-        f" FLEET_CONFIG={quoted_path} docker compose"
+        " test -r /home/orcest/.ssh/id_ed25519 &&"
+        " (command -v ssh >/dev/null 2>&1 ||"
+        ' { echo "pool-manager prerequisite failed: ssh client executable not found" >&2;'
+        " exit 1; }) &&"
+        " (ssh -V >/dev/null 2>&1 ||"
+        ' { echo "pool-manager prerequisite failed: ssh client executable is unusable" >&2;'
+        " exit 1; })'",
+    )
+    if result.returncode != 0:
+        logger.error("Pool manager failed: %s", result.stderr.strip())
+        raise RuntimeError(f"Failed to start pool manager: {result.stderr.strip()}")
+
+    result = _ssh(
+        ssh_target,
+        f"cd /opt/orcest && FLEET_CONFIG={quoted_path} docker compose"
         f" --env-file {REDIS_ENV_PATH} -f docker-compose.pool.yml -p orcest-pool"
         " up -d --force-recreate pool-manager && sleep 2 &&"
         f" cid=$(FLEET_CONFIG={quoted_path} docker compose"
@@ -856,6 +869,81 @@ def set_current_template_vmid(ssh_target: str, vm_id: int) -> None:
     _require_redis_cli_success(result, "Failed to set template pointer")
 
 
+def get_current_template_revision(ssh_target: str) -> str | None:
+    """Return the active worker template's baked source revision, or ``None``.
+
+    Reads ``orcest:pool:current_template_revision`` -- set once by ``rebake``
+    from the exact revision installed into the template -- so the template's
+    revision remains visible for health reporting even while no worker VM
+    from it is currently running.
+    """
+    from orcest.revision import normalize_revision
+
+    result = _ssh(
+        ssh_target, f"{_REDIS_CLI_PREFIX} --raw GET orcest:pool:current_template_revision"
+    )
+    _require_redis_cli_success(result, "Failed to read template revision")
+    return normalize_revision(result.stdout.strip())
+
+
+def set_current_template_revision(ssh_target: str, revision: str) -> None:
+    """Persist the active worker template's baked source revision in Redis."""
+    from orcest.revision import normalize_revision
+
+    normalized = normalize_revision(revision)
+    if normalized is None or normalized.endswith("-dirty"):
+        raise ValueError(f"Refusing to persist a non-attested template revision: {revision!r}")
+    result = _ssh(
+        ssh_target,
+        f"{_REDIS_CLI_PREFIX} SET orcest:pool:current_template_revision {shlex.quote(normalized)}",
+    )
+    _require_redis_cli_success(result, "Failed to set template revision")
+
+
+def get_container_revision(ssh_target: str, compose_project: str, service: str) -> str | None:
+    """Return the source revision baked into a running compose service's image.
+
+    Reads the ``org.opencontainers.image.revision`` OCI label off the
+    container's own image (not the ``orcest:latest`` tag, which may have
+    moved since the container was created), so a coherent-but-not-yet
+    recreated container reports the revision it is actually running rather
+    than whatever was most recently built. Returns ``None`` when the service
+    has no running container or the label is missing/unattested.
+    """
+    from orcest.revision import normalize_revision
+
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", compose_project):
+        raise ValueError(f"Invalid compose project name: {compose_project!r}")
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", service):
+        raise ValueError(f"Invalid compose service name: {service!r}")
+    result = _ssh(
+        ssh_target,
+        f"cid=$(docker compose -p {shlex.quote(compose_project)} ps -q {shlex.quote(service)}) && "
+        '[ -n "$cid" ] && docker inspect "$cid" '
+        "--format '{{index .Config.Labels \"org.opencontainers.image.revision\"}}'",
+    )
+    if result.returncode != 0:
+        return None
+    return normalize_revision(result.stdout.strip())
+
+
+def get_project_orchestrator_revision(ssh_target: str, project_name: str) -> str | None:
+    """Return a project orchestrator container's baked source revision."""
+    return get_container_revision(ssh_target, f"orcest-{project_name}", "orchestrator")
+
+
+def get_pool_manager_revision(ssh_target: str) -> str | None:
+    """Return the pool manager container's baked source revision."""
+    return get_container_revision(ssh_target, "orcest-pool", "pool-manager")
+
+
+def get_draining_worker_ids(ssh_target: str) -> set[str]:
+    """Return worker IDs currently marked draining (retained for drain grace)."""
+    result = _ssh(ssh_target, f"{_REDIS_CLI_PREFIX} --raw SMEMBERS orcest:pool:draining")
+    _require_redis_cli_success(result, "Failed to read pool draining set")
+    return {line.strip() for line in result.stdout.strip().splitlines() if line.strip()}
+
+
 def clean_pool_redis(ssh_target: str, vm_ids: list[str]) -> None:
     """Remove destroyed VM generations and verify lifecycle markers are gone."""
     if not vm_ids:
@@ -920,8 +1008,8 @@ def set_workers_draining(
         raise RuntimeError(f"Failed to {action} worker drain state: {failure}")
 
 
-def get_worker_heartbeats(ssh_target: str) -> dict[str, tuple[str, str]]:
-    """Return live ``worker_id -> (backend, revision)`` heartbeat records."""
+def get_worker_heartbeat_details(ssh_target: str) -> dict[str, dict[str, object]]:
+    """Return live worker heartbeat records with bounded provider CLI metadata."""
     pattern = "orcest:workers:heartbeat:*"
     result = _ssh(
         ssh_target,
@@ -929,7 +1017,7 @@ def get_worker_heartbeats(ssh_target: str) -> dict[str, tuple[str, str]]:
     )
     _require_redis_cli_success(result, "Failed to scan worker heartbeats")
     keys = sorted(line.strip() for line in result.stdout.splitlines() if line.strip())
-    heartbeats: dict[str, tuple[str, str]] = {}
+    heartbeats: dict[str, dict[str, object]] = {}
     for key in keys:
         if not key.startswith("orcest:workers:heartbeat:"):
             raise RuntimeError("Worker heartbeat scan returned an unexpected key")
@@ -954,8 +1042,22 @@ def get_worker_heartbeats(ssh_target: str) -> dict[str, tuple[str, str]]:
         worker_id = key.removeprefix("orcest:workers:heartbeat:")
         if not worker_id:
             raise RuntimeError("Worker heartbeat is missing its worker ID")
-        heartbeats[worker_id] = (backend, revision)
+        provider_cli = payload.get("provider_cli")
+        heartbeats[worker_id] = {
+            "backend": backend,
+            "revision": revision,
+            "provider_cli": provider_cli if isinstance(provider_cli, dict) else None,
+        }
     return heartbeats
+
+
+def get_worker_heartbeats(ssh_target: str) -> dict[str, tuple[str, str]]:
+    """Return live ``worker_id -> (backend, revision)`` heartbeat records."""
+    details = get_worker_heartbeat_details(ssh_target)
+    return {
+        worker_id: (str(record["backend"]), str(record["revision"]))
+        for worker_id, record in details.items()
+    }
 
 
 def clean_pending_tasks(ssh_target: str) -> int:
@@ -1161,6 +1263,7 @@ def generate_env_file(
     claude_token: str = "",
     provider_credentials: dict[str, list[str]] | None = None,
     trace_archive_host_path: str | None = None,
+    workflow_state_host_path: str | None = None,
     redis_password: str = "",
     monitor_write_token: str = "",
 ) -> str:
@@ -1218,6 +1321,14 @@ def generate_env_file(
         # is the canonical location on the orchestrator VM (already populated
         # by ``upload_fleet_config`` for the pool manager).
         lines.append("ORCEST_FLEET_CONFIG_PATH='/etc/orcest/config.yaml'")
+    if workflow_state_host_path:
+        _validate_env_value(workflow_state_host_path, "workflow_state_host_path")
+        if not workflow_state_host_path.startswith("/"):
+            raise ValueError(
+                "workflow_state_host_path must be an absolute path "
+                f"(got {workflow_state_host_path!r})"
+            )
+        lines.append(f"ORCEST_WORKFLOW_STATE_HOST_PATH='{workflow_state_host_path}'")
 
     # Build a unified map: provider -> list of credentials
     creds: dict[str, list[str]] = {}
@@ -1264,6 +1375,7 @@ def generate_orchestrator_config(
     extra_providers: list[str] | None = None,
     default_runner: str | None = None,
     trace_archive_enabled: bool = False,
+    workflow_state_enabled: bool = False,
     monitor_ingest_url: str | None = None,
 ) -> str:
     """Generate orchestrator.yaml content for a project.
@@ -1301,6 +1413,8 @@ def generate_orchestrator_config(
         # In-container path; the operator bind-mounts whatever filesystem they
         # want at ORCEST_TRACE_HOST_PATH on the host side (see docker-compose.yml).
         config["trace_archive_path"] = "/var/lib/orcest/traces"
+    if workflow_state_enabled:
+        config["workflow_state_root"] = "/var/lib/orcest/workflow"
     if monitor_ingest_url:
         config["monitor_ingest_url"] = monitor_ingest_url
         config["monitor_write_token_env"] = "MONITOR_WRITE_TOKEN"

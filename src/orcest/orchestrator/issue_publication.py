@@ -4,8 +4,8 @@ Issue publication spans project Redis (generation, pending marker, attempt
 counter, expected outcome) and the shared task-stream Redis (XADD). A lost
 XADD reply must not roll back reserved state or append a duplicate entry.
 
-This module owns the publication and expected-outcome contract. Completion
-handling and ``orcest:ready`` removal are intentionally unchanged.
+This module owns the publication and expected-outcome contract. Issue
+completion is gated by durable delivery verification (``issue_delivery``).
 """
 
 from __future__ import annotations
@@ -237,6 +237,26 @@ def make_issue_retry_record_key(repo: str, issue_number: int, generation: int) -
     return f"issue:{repo}:{issue_number}:retry:{generation}"
 
 
+def make_issue_retry_latest_key(repo: str, issue_number: int) -> str:
+    """Pointer to the newest retry-record generation for an issue."""
+    return f"issue:{repo}:{issue_number}:retry-latest"
+
+
+def make_issue_admission_key(task_id: str) -> str:
+    """Per-task first-payload CAS ledger for issue results."""
+    return f"issue:admission:{task_id}"
+
+
+def make_issue_dispatch_barrier_key(repo: str, issue_number: int) -> str:
+    """Issue-level dispatch barrier independent of pending-marker TTL."""
+    return f"issue:{repo}:{issue_number}:dispatch-barrier"
+
+
+def make_issue_delivery_cooldown_key(repo: str, issue_number: int) -> str:
+    """Cooldown after ineffective delivery before the next generation may dispatch."""
+    return f"issue:{repo}:{issue_number}:delivery_cooldown"
+
+
 def expected_head_owner(repo: str) -> str:
     """Return the same-repository head owner for an ``owner/repo`` string."""
     owner, sep, name = repo.partition("/")
@@ -259,21 +279,25 @@ def hash_prompt_inputs(
     issue_title: str,
     issue_body: str,
     expected_branch: str,
+    retry_context_json: str = "",
 ) -> str:
     """Stable SHA-256 of the inputs that produced the issue prompt and branch."""
-    payload = json.dumps(
-        {
-            "body": issue_body,
-            "expected_branch": expected_branch,
-            "number": issue_number,
-            "repo": repo,
-            "title": issue_title,
-        },
+    payload: dict[str, object] = {
+        "body": issue_body,
+        "expected_branch": expected_branch,
+        "number": issue_number,
+        "repo": repo,
+        "title": issue_title,
+    }
+    if retry_context_json:
+        payload["retry_context"] = retry_context_json
+    encoded = json.dumps(
+        payload,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def get_issue_generation(redis: RedisClient, repo: str, issue_number: int) -> int:

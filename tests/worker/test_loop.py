@@ -61,6 +61,7 @@ from orcest.worker.loop import (
     _make_abort_event,
     _publish_result_with_retry,
     _publish_task_output,
+    _refresh_worker_liveness,
     _runner_for_task,
     _signal_ephemeral_done,
     _stream_handoff_state,
@@ -196,6 +197,36 @@ def test_wait_for_redis_aborts_during_backoff():
 
     assert _wait_for_redis(redis, logging.getLogger("test.redis-wait"), abort) is False
     redis.health_check.assert_called_once()
+
+
+@pytest.mark.unit
+def test_worker_liveness_heartbeat_includes_bounded_provider_cli(local_worker_config, mocker):
+    revision = "a" * 40
+    mocker.patch("orcest.worker.loop.get_build_revision", return_value=revision)
+    redis = MagicMock()
+    provider_cli = {
+        "schema": 1,
+        "provider": "codex",
+        "desired_version": "0.149.1",
+        "template_version": "0.149.1",
+        "observed_version": "0.149.1",
+        "status": "ok",
+    }
+    local_worker_config.backend = "codex"
+
+    _refresh_worker_liveness(redis, local_worker_config, logging.getLogger("test"), provider_cli)
+
+    redis.set_ex.assert_called_once()
+    key, payload = redis.set_ex.call_args.args[:2]
+    assert key == f"workers:heartbeat:{local_worker_config.worker_id}"
+    heartbeat = json.loads(payload)
+    assert heartbeat == {
+        "backend": "codex",
+        "revision": revision,
+        "provider_cli": provider_cli,
+    }
+    assert "credential" not in payload.lower()
+    assert "home" not in payload.lower()
 
 
 @pytest.mark.unit
@@ -385,6 +416,43 @@ class TestExecuteTask:
             sample_task.repo, sample_task.branch, sample_task.token
         )
         mock_workspace.cleanup.assert_called_once()
+
+    def test_completed_issue_result_reports_expected_branch_and_final_sha(
+        self, local_worker_config, mock_workspace
+    ):
+        """Issue completion metadata gives the orchestrator an exact verifier boundary."""
+        task = Task.create(
+            task_type=TaskType.IMPLEMENT_ISSUE,
+            repo="owner/repo",
+            token="test-token-loop",
+            resource_type="issue",
+            resource_id=657,
+            prompt="Implement issue",
+            branch=None,
+            expected_branch="issue-657-work",
+        )
+        mock_workspace.current_head_sha.return_value = "f" * 40
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = _success_runner_result()
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+
+        result = _execute_task(
+            task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
+        )
+
+        assert result.status == ResultStatus.COMPLETED
+        assert result.branch == "issue-657-work"
+        assert result.snapshot_head_sha == "f" * 40
+        mock_workspace.setup.assert_called_once_with(task.repo, None, task.token)
+        mock_workspace.resume_expected_ref.assert_called_once_with(
+            task.repo, "owner", "issue-657-work", task.token
+        )
 
     def test_worker_handles_runner_failure(self, local_worker_config, sample_task, mock_workspace):
         """_execute_task returns a FAILED TaskResult when the runner fails."""
@@ -1862,6 +1930,31 @@ class TestRunWorker:
         assert "lost the Redis lock" in published.summary
         assert published.credential_update == rotated
         assert published.credential_update_minted_at == 1_700_000_000_000_000.0
+
+    def test_human_blocker_observation_redacts_rotated_credential(
+        self, mocker, worker_config, sample_task
+    ):
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        rotated = '{"refresh_token":"private-new-token"}'
+        result = _success_runner_result()
+        result.needs_human = True
+        result.needs_human_reason = f"Access failed: {rotated}"
+        result.credential_update = rotated
+        mocks["runner"].run.return_value = result
+        self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
+        handoff = mocker.patch("orcest.worker.loop._handoff_result_until_terminal")
+        handoff.return_value.terminal = True
+        handoff.return_value.publish_outcome = ResultPublishOutcome.PUBLISHED
+
+        run_worker(worker_config)
+
+        reasons = [
+            call.args[1]["human_reason"]
+            for call in mock_redis.hset_mapping.call_args_list
+            if "human_reason" in call.args[1]
+        ]
+        assert reasons == ["Access failed: [REDACTED]"]
 
     def test_worker_skips_locked_task(self, mocker, worker_config, sample_task):
         """When the lock is already held, the runner is NOT called and the

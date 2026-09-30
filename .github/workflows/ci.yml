@@ -41,11 +41,12 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml', 'requirements.lock', 'requirements-dev.lock', 'requirements-dev-toolchain.txt') }}
           restore-keys: ${{ runner.os }}-pip-
-      - run: pip install -e ".[dev]"
-      - run: ruff check src/ tests/
-      - run: ruff format --check src/ tests/
+      - run: pip install -r requirements-dev.lock
+      - run: pip install --no-deps --no-build-isolation -e .
+      - run: make check-lock-dev
+      - run: make lint-check
 
   typecheck:
     runs-on: [self-hosted, linux]
@@ -66,10 +67,11 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml', 'requirements.lock', 'requirements-dev.lock', 'requirements-dev-toolchain.txt') }}
           restore-keys: ${{ runner.os }}-pip-
-      - run: pip install -e ".[dev]"
-      - run: mypy src/
+      - run: pip install -r requirements-dev.lock
+      - run: pip install --no-deps --no-build-isolation -e .
+      - run: make typecheck
 
   test:
     runs-on: [self-hosted, linux]
@@ -90,13 +92,16 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml', 'requirements.lock', 'requirements-dev.lock', 'requirements-dev-toolchain.txt') }}
           restore-keys: ${{ runner.os }}-pip-
-      - run: pip install -e ".[dev]"
-      - run: pytest tests/ --ignore=tests/integration --ignore=tests/stress -m unit -x --cov=src/orcest --cov-report=term-missing
+      - run: pip install -r requirements-dev.lock
+      - run: pip install --no-deps --no-build-isolation -e .
+      - run: make test-unit
 
   dashboard:
     runs-on: [self-hosted, linux]
+    env:
+      DASHBOARD_CLEAN_COPY_RUNNER: native
     steps:
       - name: Checkout repository
         run: |
@@ -138,16 +143,6 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'schedule' ||
       (github.event_name == 'push' && github.ref == 'refs/heads/master')
-    services:
-      redis:
-        image: redis:7
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 5
     steps:
       - name: Checkout repository
         run: |
@@ -165,10 +160,11 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml', 'requirements.lock', 'requirements-dev.lock', 'requirements-dev-toolchain.txt') }}
           restore-keys: ${{ runner.os }}-pip-
-      - run: pip install -e ".[dev]"
-      - run: pytest tests/integration -x
+      - run: pip install -r requirements-dev.lock
+      - run: pip install --no-deps --no-build-isolation -e .
+      - run: make test-integration
 
   docker:
     runs-on: [self-hosted, linux]

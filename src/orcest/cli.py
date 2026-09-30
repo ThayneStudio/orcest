@@ -14,6 +14,7 @@ import redis as redis_lib
 from rich.console import Console
 from rich.table import Table
 
+from orcest.cli_project import project as project_cli
 from orcest.dashboard import fetch_snapshot, truncate
 from orcest.fleet.cli import fleet
 from orcest.shared.models import (
@@ -22,6 +23,10 @@ from orcest.shared.models import (
     REDACTED_FIELDS,
 )
 from orcest.shared.provider_stream_health import StreamHealthState
+from orcest.shared.result_stream_health import (
+    format_result_stream_metrics,
+    format_result_stream_warning,
+)
 
 if TYPE_CHECKING:
     from orcest.shared.config import RedisConfig
@@ -475,14 +480,33 @@ def _status_once(redis: RedisClient) -> None:
 
     table = Table(title="Queue Depths")
     table.add_column("Stream", style="cyan")
-    table.add_column("Pending", style="yellow")
+    table.add_column("Work", style="yellow")
+    table.add_column("Retained XLEN", style="yellow")
     for stream_key, depth in sorted(snapshot.queue_depths.items()):
-        table.add_row(str(stream_key), str(depth))
+        table.add_row(str(stream_key), str(depth), "--")
     if not snapshot.queue_depths:
-        table.add_row("tasks:*", "0")
-    table.add_row("results", str(snapshot.results_depth))
-    table.add_row(DEAD_LETTER_STREAM, str(snapshot.dead_letter_count))
+        table.add_row("tasks:*", "0", "--")
+    result_health = snapshot.result_stream_health
+    result_work = result_health.work
+    table.add_row("results work", str(result_work), "--")
+    table.add_row("results retained", "--", str(snapshot.results_depth))
+    table.add_row(
+        DEAD_LETTER_STREAM,
+        str(snapshot.dead_letter_count),
+        str(snapshot.dead_letter_count),
+    )
     console.print(table)
+
+    result_table = Table(title="Result Stream Health")
+    result_table.add_column("Metric")
+    result_table.add_column("Value")
+    for metric, value in format_result_stream_metrics(result_health):
+        result_table.add_row(metric, value)
+    console.print(result_table)
+
+    result_warning = format_result_stream_warning(result_health)
+    if result_warning:
+        console.print(f"[bold red]{result_warning}[/bold red]")
 
     if snapshot.dead_letter_entries:
         dl_detail_table = Table(
@@ -1122,7 +1146,6 @@ def init_labels(config: str) -> None:
     cfg = load_orchestrator_config(config)
     console = Console()
     label_defs = [
-        (cfg.labels.blocked, "d93f0b", "Blocked — waiting for dependency"),
         (cfg.labels.needs_human, "b60205", "Orcest failed — needs manual review"),
         (cfg.labels.ready, "0e8a16", "Issue is ready for orcest to implement"),
     ]
@@ -1411,6 +1434,7 @@ def monitor_cmd(config_path: str) -> None:
 
 
 main.add_command(fleet)
+main.add_command(project_cli)
 
 
 # ── check commands ──────────────────────────────────────────

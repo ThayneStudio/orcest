@@ -1,7 +1,12 @@
 """Tests for orcest.fleet.cli."""
 
+import hashlib
+import os
 import subprocess
+import sys
 import time
+from contextlib import contextmanager
+from io import StringIO
 from pathlib import Path
 
 import click
@@ -15,6 +20,7 @@ from orcest.fleet.cli import (
     fleet,
 )
 from orcest.fleet.config import (
+    DesiredSourceConfig,
     FleetConfig,
     OrchestratorConfig,
     OrgEntry,
@@ -27,6 +33,89 @@ from orcest.fleet.config import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_provider_cli_status_renderer_accepts_only_canonical_vocabulary():
+    from orcest.fleet.cli import _safe_provider_cli_status
+    from orcest.shared.provider_versions import PROVIDER_CLI_PROBE_STATUSES
+
+    for status in PROVIDER_CLI_PROBE_STATUSES:
+        rendered = _safe_provider_cli_status(status, has_payload=True)
+        assert rendered.plain == status
+        assert rendered.style == ("green" if status == "ok" else "red")
+
+    assert _safe_provider_cli_status("anything-else", has_payload=True).plain == "invalid"
+    assert _safe_provider_cli_status(["ok"], has_payload=True).plain == "invalid"
+    assert _safe_provider_cli_status(None, has_payload=False).plain == "legacy"
+
+
+def test_provider_cli_heartbeat_table_does_not_render_untrusted_status_markup(mocker):
+    from rich.console import Console
+
+    from orcest.fleet.cli import _print_worker_provider_cli_heartbeats
+
+    malicious = "[bold red]forged[/bold red]"
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_worker_heartbeat_details",
+        return_value={
+            "orcest-worker-300": {
+                "backend": "codex",
+                "revision": "a" * 40,
+                "provider_cli": {
+                    "desired_version": "0.149.1",
+                    "template_version": "0.149.1",
+                    "observed_version": "0.149.1",
+                    "status": malicious,
+                },
+            }
+        },
+    )
+    output = StringIO()
+
+    _print_worker_provider_cli_heartbeats(
+        Console(file=output, force_terminal=False, color_system=None),
+        "orcest@example.test",
+    )
+
+    rendered = output.getvalue()
+    assert "invalid" in rendered
+    assert "forged" not in rendered
+
+
+def test_provider_cli_heartbeat_table_does_not_render_untrusted_column_markup(mocker):
+    from rich.console import Console
+
+    from orcest.fleet.cli import _print_worker_provider_cli_heartbeats
+
+    malicious = "[red]A[/red]"
+    assert len(malicious) == 12
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_worker_heartbeat_details",
+        return_value={
+            malicious: {
+                "backend": malicious,
+                "revision": malicious,
+                "provider_cli": {
+                    "desired_version": "0.149.1",
+                    "template_version": "0.149.1",
+                    "observed_version": "0.149.1",
+                    "status": "ok",
+                },
+            }
+        },
+    )
+    output = StringIO()
+
+    _print_worker_provider_cli_heartbeats(
+        Console(file=output, force_terminal=False, color_system=None, width=200),
+        "orcest@example.test",
+    )
+
+    rendered = output.getvalue()
+    # If worker_id/backend/revision were rendered as plain str, Rich would
+    # interpret the brackets as markup and the literal tag text would not
+    # survive intact in the output.
+    assert rendered.count(malicious) == 3
 
 
 @pytest.fixture
@@ -103,6 +192,7 @@ def _no_pending_workers_by_default(mocker, tmp_path):
         str(tmp_path / "fleet-operation.lock"),
     )
     mocker.patch("orcest.fleet.orchestrator.get_workers_with_pending_tasks", return_value=set())
+    mocker.patch("orcest.fleet.orchestrator.get_worker_heartbeat_details", return_value={})
     mocker.patch("orcest.fleet.orchestrator.set_workers_draining")
     mocker.patch("orcest.fleet.orchestrator.get_deployed_pool_backend", return_value=None)
     mocker.patch("orcest.fleet.orchestrator.get_deployed_pool_vmid_range", return_value=None)
@@ -140,6 +230,235 @@ def test_status_shows_projects(runner, cfg_path):
     assert result.exit_code == 0
     assert "alpha" in result.output
     assert "Org/alpha" in result.output
+
+
+def _mock_source_revision_surfaces(mocker, *, orchestrator=None, pool_manager=None, template=None):
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_container_revision",
+        side_effect=lambda _ssh, project, service: (
+            pool_manager if service == "pool-manager" else orchestrator
+        ),
+    )
+    mocker.patch("orcest.fleet.orchestrator.get_current_template_revision", return_value=template)
+    mocker.patch("orcest.fleet.orchestrator.get_draining_worker_ids", return_value=set())
+
+
+class TestSourceHealth:
+    """fleet source-health: read-only desired-vs-deployed source revision gate."""
+
+    def _base_cfg(self, **overrides):
+        defaults = dict(
+            orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+            projects=[ProjectEntry(name="alpha", repo="Org/alpha")],
+            desired_source=DesiredSourceConfig(repo="org/orcest", sha="a" * 40),
+        )
+        defaults.update(overrides)
+        return FleetConfig(**defaults)
+
+    def test_healthy_fleet_exits_zero(self, runner, cfg_path, mocker):
+        cfg = self._base_cfg()
+        _save(cfg, cfg_path)
+        sha = "a" * 40
+        _mock_source_revision_surfaces(mocker, orchestrator=sha, pool_manager=sha, template=sha)
+        mocker.patch(
+            "orcest.fleet.orchestrator.get_worker_heartbeat_details",
+            return_value={"orcest-worker-300": {"backend": "claude", "revision": sha}},
+        )
+
+        result = runner.invoke(fleet, ["source-health", "--config", cfg_path])
+
+        assert result.exit_code == 0, result.output
+        assert "coherent and current" in result.output
+
+    def test_coherent_stale_fleet_exits_nonzero_and_names_both_revisions(
+        self, runner, cfg_path, mocker
+    ):
+        """The pve-test incident: four workers coherently report an older SHA."""
+        cfg = self._base_cfg()
+        _save(cfg, cfg_path)
+        desired_sha = "a" * 40
+        stale_sha = "b" * 40
+        _mock_source_revision_surfaces(
+            mocker, orchestrator=stale_sha, pool_manager=stale_sha, template=stale_sha
+        )
+        mocker.patch(
+            "orcest.fleet.orchestrator.get_worker_heartbeat_details",
+            return_value={
+                f"orcest-worker-{i}": {"backend": "claude", "revision": stale_sha}
+                for i in range(300, 304)
+            },
+        )
+
+        result = runner.invoke(fleet, ["source-health", "--config", cfg_path])
+
+        assert result.exit_code != 0
+        assert desired_sha[:12] in result.output
+        assert stale_sha[:12] in result.output
+
+    def test_orchestrator_stale_worker_current_is_flagged(self, runner, cfg_path, mocker):
+        cfg = self._base_cfg()
+        _save(cfg, cfg_path)
+        sha = "a" * 40
+        stale = "b" * 40
+        _mock_source_revision_surfaces(mocker, orchestrator=stale, pool_manager=sha, template=sha)
+        mocker.patch(
+            "orcest.fleet.orchestrator.get_worker_heartbeat_details",
+            return_value={"orcest-worker-300": {"backend": "claude", "revision": sha}},
+        )
+
+        result = runner.invoke(fleet, ["source-health", "--config", cfg_path])
+
+        assert result.exit_code != 0
+        assert "orchestrator:alpha" in result.output
+
+    def test_worker_surface_does_not_render_untrusted_heartbeat_markup(
+        self, runner, cfg_path, mocker
+    ):
+        cfg = self._base_cfg()
+        _save(cfg, cfg_path)
+        sha = "a" * 40
+        malicious = "[red]A[/red]"
+        assert len(malicious) == 12
+        _mock_source_revision_surfaces(mocker, orchestrator=sha, pool_manager=sha, template=sha)
+        mocker.patch(
+            "orcest.fleet.orchestrator.get_worker_heartbeat_details",
+            return_value={malicious: {"backend": "claude", "revision": malicious}},
+        )
+
+        result = runner.invoke(fleet, ["source-health", "--config", cfg_path])
+
+        assert f"worker:{malicious}" in result.output
+        assert malicious in result.output
+
+    def test_pool_manager_stale_is_flagged(self, runner, cfg_path, mocker):
+        cfg = self._base_cfg()
+        _save(cfg, cfg_path)
+        sha = "a" * 40
+        stale = "b" * 40
+        _mock_source_revision_surfaces(mocker, orchestrator=sha, pool_manager=stale, template=sha)
+        mocker.patch("orcest.fleet.orchestrator.get_worker_heartbeat_details", return_value={})
+
+        result = runner.invoke(fleet, ["source-health", "--config", cfg_path])
+
+        assert result.exit_code != 0
+        assert "pool-manager" in result.output
+
+    def test_stale_template_with_no_live_workers_is_flagged(self, runner, cfg_path, mocker):
+        cfg = self._base_cfg()
+        _save(cfg, cfg_path)
+        sha = "a" * 40
+        stale = "b" * 40
+        _mock_source_revision_surfaces(mocker, orchestrator=sha, pool_manager=sha, template=stale)
+        mocker.patch("orcest.fleet.orchestrator.get_worker_heartbeat_details", return_value={})
+
+        result = runner.invoke(fleet, ["source-health", "--config", cfg_path])
+
+        assert result.exit_code != 0
+        assert "template" in result.output
+
+    def test_mixed_rolling_generation_flagged_but_busy_worker_visible(
+        self, runner, cfg_path, mocker
+    ):
+        cfg = self._base_cfg()
+        _save(cfg, cfg_path)
+        sha = "a" * 40
+        stale = "b" * 40
+        _mock_source_revision_surfaces(mocker, orchestrator=sha, pool_manager=sha, template=sha)
+        mocker.patch(
+            "orcest.fleet.orchestrator.get_draining_worker_ids",
+            return_value={"orcest-worker-old"},
+        )
+        mocker.patch(
+            "orcest.fleet.orchestrator.get_worker_heartbeat_details",
+            return_value={
+                "orcest-worker-new": {"backend": "claude", "revision": sha},
+                "orcest-worker-old": {"backend": "claude", "revision": stale},
+            },
+        )
+
+        result = runner.invoke(fleet, ["source-health", "--config", cfg_path])
+
+        assert result.exit_code != 0
+        assert "orcest-worker-old" in result.output  # busy old worker stays visible
+
+    def test_unconfigured_desired_revision_is_explicit_and_nonzero(self, runner, cfg_path, mocker):
+        cfg = self._base_cfg(desired_source=DesiredSourceConfig())
+        _save(cfg, cfg_path)
+        sha = "a" * 40
+        _mock_source_revision_surfaces(mocker, orchestrator=sha, pool_manager=sha, template=sha)
+        mocker.patch("orcest.fleet.orchestrator.get_worker_heartbeat_details", return_value={})
+
+        result = runner.invoke(fleet, ["source-health", "--config", cfg_path])
+
+        assert result.exit_code != 0
+        assert "unconfigured" in result.output
+
+    def test_json_output_is_machine_readable(self, runner, cfg_path, mocker):
+        cfg = self._base_cfg()
+        _save(cfg, cfg_path)
+        sha = "a" * 40
+        _mock_source_revision_surfaces(mocker, orchestrator=sha, pool_manager=sha, template=sha)
+        mocker.patch("orcest.fleet.orchestrator.get_worker_heartbeat_details", return_value={})
+
+        result = runner.invoke(fleet, ["source-health", "--config", cfg_path, "--json"])
+
+        assert result.exit_code == 0, result.output
+        import json
+
+        payload = json.loads(result.output)
+        assert payload["healthy"] is True
+        assert payload["desired"]["sha"] == sha
+
+    def test_never_calls_deployment_or_vm_mutation_methods(self, runner, cfg_path, mocker):
+        cfg = self._base_cfg()
+        _save(cfg, cfg_path)
+        sha = "a" * 40
+        _mock_source_revision_surfaces(mocker, orchestrator=sha, pool_manager=sha, template=sha)
+        mocker.patch("orcest.fleet.orchestrator.get_worker_heartbeat_details", return_value={})
+        mutating = [
+            "build_image",
+            "upload_source",
+            "stop_stack",
+            "restart_stack",
+            "stop_pool_manager",
+            "ensure_pool_manager",
+            "set_current_template_vmid",
+            "set_current_template_revision",
+            "clean_pool_redis",
+            "clean_pending_tasks",
+        ]
+        mocks = {name: mocker.patch(f"orcest.fleet.orchestrator.{name}") for name in mutating}
+
+        result = runner.invoke(fleet, ["source-health", "--config", cfg_path])
+
+        assert result.exit_code == 0, result.output
+        for name, mock in mocks.items():
+            assert not mock.called, f"source-health must never call {name}()"
+
+    def test_secrets_never_appear_in_output(self, runner, cfg_path, mocker):
+        cfg = self._base_cfg(desired_source=DesiredSourceConfig(repo="org/orcest", ref="master"))
+        _save(cfg, cfg_path)
+        mocker.patch(
+            "orcest.fleet.source_revision._run_ls_remote",
+            return_value=subprocess.CompletedProcess(
+                [],
+                128,
+                stdout="",
+                stderr=(
+                    "fatal: could not read Username for "
+                    "'https://x-access-token:s3cr3t-token@github.com/org/orcest': "
+                    "terminal prompts disabled"
+                ),
+            ),
+        )
+        _mock_source_revision_surfaces(mocker, orchestrator=None, pool_manager=None, template=None)
+        mocker.patch("orcest.fleet.orchestrator.get_worker_heartbeat_details", return_value={})
+
+        result = runner.invoke(fleet, ["source-health", "--config", cfg_path])
+
+        assert result.exit_code != 0
+        assert "s3cr3t-token" not in result.output
+        assert "x-access-token" not in result.output
 
 
 def test_onboard_creates_project(runner, cfg_path, mocker):
@@ -714,6 +1033,7 @@ def test_update_regenerates_project_files_with_current_pool_backend(runner, cfg_
         orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
         pool=PoolConfig(worker_backend="clauder"),
         trace_archive_host_path="/mnt/orcest/traces",
+        workflow_state_host_path="/mnt/orcest/workflow",
         orgs={
             "Org": OrgEntry(
                 github_token="ghp_fake",
@@ -745,6 +1065,7 @@ def test_update_regenerates_project_files_with_current_pool_backend(runner, cfg_
         "claude_tokens": ["sk-claude"],
         "provider_credentials": {},
         "trace_archive_host_path": "/mnt/orcest/traces",
+        "workflow_state_host_path": "/mnt/orcest/workflow",
         "redis_password": "redis-pw",
         "monitor_write_token": "",
     }
@@ -754,6 +1075,7 @@ def test_update_regenerates_project_files_with_current_pool_backend(runner, cfg_
         "extra_providers": [],
         "default_runner": "clauder",
         "trace_archive_enabled": True,
+        "workflow_state_enabled": True,
         "monitor_ingest_url": None,
     }
     write_files.assert_called_once_with("orcest@10.20.0.23", "alpha", "env", "yaml")
@@ -1018,7 +1340,7 @@ def test_create_template_success(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
-    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=True)
+    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value="a" * 40)
     mocker.patch(
         "orcest.fleet.cli._ssh_run",
         side_effect=_successful_provider_cli_probe,
@@ -1055,7 +1377,7 @@ def test_create_template_prompts_for_vm_id(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
-    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=True)
+    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value="a" * 40)
     mocker.patch(
         "orcest.fleet.cli._ssh_run",
         side_effect=_successful_provider_cli_probe,
@@ -1078,7 +1400,7 @@ def _mock_successful_template_bake(mocker):
     mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
-    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=True)
+    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value="a" * 40)
     mocker.patch("orcest.fleet.cli._ssh_run", side_effect=_successful_provider_cli_probe)
 
 
@@ -1296,7 +1618,7 @@ def test_create_template_disable_cloud_init_failure(runner, cfg_path, mocker):
     # *cloud-init clean* step (step 7) failing -- the smoke-check shares the
     # _ssh_run mock and would otherwise abort first.
     mocker.patch("orcest.fleet.cli._verify_provider_clis", return_value=True)
-    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=True)
+    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value="a" * 40)
     mocker.patch(
         "orcest.fleet.cli._ssh_run",
         return_value=mocker.MagicMock(returncode=1, stderr="permission denied"),
@@ -1322,7 +1644,7 @@ def test_create_template_stop_timeout_cleans_up(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
-    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=True)
+    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value="a" * 40)
     mocker.patch(
         "orcest.fleet.cli._ssh_run",
         side_effect=_successful_provider_cli_probe,
@@ -1435,7 +1757,7 @@ def test_create_template_fails_when_source_install_fails(runner, cfg_path, mocke
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
     mocker.patch("orcest.fleet.cli._verify_provider_clis", return_value=True)
-    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=False)
+    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=None)
 
     result = runner.invoke(
         fleet,
@@ -1461,12 +1783,17 @@ def test_install_source_on_worker_template_uses_local_tarball(mocker, tmp_path):
         "orcest.fleet.cli._scp_to_vm",
         return_value=mocker.MagicMock(returncode=0, stderr=""),
     )
+    installed_revision = "a" * 40
     ssh = mocker.patch(
         "orcest.fleet.cli._ssh_run",
-        return_value=mocker.MagicMock(returncode=0, stderr=""),
+        return_value=mocker.MagicMock(
+            returncode=0, stderr="", stdout=f"orcest-template-revision={installed_revision}\n"
+        ),
     )
 
-    assert _install_source_on_worker_template("10.20.0.50", "orcest", Console()) is True
+    assert (
+        _install_source_on_worker_template("10.20.0.50", "orcest", Console()) == installed_revision
+    )
 
     scp.assert_called_once_with(
         "10.20.0.50",
@@ -1618,24 +1945,46 @@ class TestVerifyProviderClis:
 # ── image-digest verification wiring tests (M5-infra repair 3) ──
 
 
-def test_create_vm_from_cloud_image_passes_verified_checksum(mocker):
-    """M5-infra (repair 3): the sole download caller must resolve a verified
-    sha256 and forward it to download_image (checksum + algorithm), so the
-    Proxmox node actually verifies the cloud image. Round 1 passed nothing,
-    so download_image never verified.
-    """
+def test_create_vm_from_cloud_image_imports_exact_verified_temp_path_and_cleans(mocker, tmp_path):
     from rich.console import Console
 
-    from orcest.fleet.cli import _create_vm_from_cloud_image
+    from orcest.fleet.cli import _CLOUD_IMAGE_MAX_BYTES, _create_vm_from_cloud_image
 
-    cfg = _proxmox_cfg()
-    mock_px = mocker.MagicMock()
-    # The resolver returns a verified digest (GPG-checked SHA256SUMS upstream).
-    mocker.patch(
-        "orcest.fleet.cli._resolve_image_checksum",
-        return_value="deadbeef" * 8,
+    image = b"verified cloud image bytes"
+    cfg = _proxmox_cfg(
+        pool=PoolConfig(
+            storage="ssd-pool",
+            expected_image_sha256=hashlib.sha256(image).hexdigest(),
+        )
     )
-    mocker.patch("orcest.fleet.cli.subprocess.run", return_value=mocker.MagicMock(returncode=0))
+    mock_px = mocker.MagicMock()
+    workspace = tmp_path / "image-workspace"
+    mocker.patch(
+        "orcest.fleet.cli.tempfile.mkdtemp",
+        side_effect=lambda **_kwargs: workspace.mkdir() or str(workspace),
+    )
+    fetched_paths: list[Path] = []
+
+    def fetch(_url, destination, **kwargs):
+        assert kwargs["phase"] == "image"
+        assert kwargs["max_bytes"] == _CLOUD_IMAGE_MAX_BYTES
+        destination.write_bytes(image)
+        fetched_paths.append(destination)
+
+    mocker.patch("orcest.fleet.cli._fetch_cloud_image_file", side_effect=fetch)
+    imported_paths: list[Path] = []
+
+    def run_image(command, **kwargs):
+        assert command[:2] == ["qm", "set"]
+        import_arg = next(item for item in command if "import-from=" in item)
+        imported = Path(import_arg.split("import-from=", 1)[1].split(",", 1)[0])
+        assert imported == fetched_paths[0]
+        assert imported.read_bytes() == image
+        assert kwargs["termination_grace_seconds"] == 30
+        imported_paths.append(imported)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    mocker.patch("orcest.fleet.cli._run_image_command", side_effect=run_image)
 
     _create_vm_from_cloud_image(
         mock_px,
@@ -1647,28 +1996,34 @@ def test_create_vm_from_cloud_image_passes_verified_checksum(mocker):
         snippet_storage="local",
     )
 
-    mock_px.download_image.assert_called_once()
-    kwargs = mock_px.download_image.call_args.kwargs
-    assert kwargs.get("checksum") == "deadbeef" * 8
-    assert kwargs.get("checksum_algorithm") == "sha256"
+    assert imported_paths == fetched_paths
+    assert not workspace.exists()
+    assert not imported_paths[0].exists()
+    assert mock_px.create_vm.call_args.kwargs["name"].startswith("orcest-worker-template-build-")
+    mock_px.download_image.assert_not_called()
 
 
-def test_create_vm_from_cloud_image_aborts_when_checksum_unresolvable(mocker):
+def test_create_vm_from_cloud_image_aborts_when_checksum_unresolvable(mocker, tmp_path):
     """M5-infra (repair 3): verification is FAIL-CLOSED. If the digest cannot
     be resolved/verified, the bake must raise -- never download unverified.
     """
     from rich.console import Console
 
-    from orcest.fleet.cli import _create_vm_from_cloud_image
+    from orcest.fleet.cli import _CloudImageError, _create_vm_from_cloud_image
 
     cfg = _proxmox_cfg()
     mock_px = mocker.MagicMock()
+    workspace = tmp_path / "failed-workspace"
     mocker.patch(
+        "orcest.fleet.cli.tempfile.mkdtemp",
+        side_effect=lambda **_kwargs: workspace.mkdir() or str(workspace),
+    )
+    resolve = mocker.patch(
         "orcest.fleet.cli._resolve_image_checksum",
-        side_effect=RuntimeError("GPG signature verification failed"),
+        side_effect=_CloudImageError("signature failure", "manifest signature invalid"),
     )
 
-    with pytest.raises(RuntimeError, match="GPG signature verification failed"):
+    with pytest.raises(RuntimeError, match="cloud image signature failure"):
         _create_vm_from_cloud_image(
             mock_px,
             cfg,
@@ -1679,6 +2034,9 @@ def test_create_vm_from_cloud_image_aborts_when_checksum_unresolvable(mocker):
             snippet_storage="local",
         )
     mock_px.download_image.assert_not_called()
+    mock_px.create_vm.assert_not_called()
+    resolve.assert_called_once()
+    assert not workspace.exists()
 
 
 class TestResolveImageChecksum:
@@ -1694,7 +2052,8 @@ class TestResolveImageChecksum:
         from orcest.fleet.cli import _resolve_image_checksum
 
         cfg = _proxmox_cfg(pool=PoolConfig(expected_image_sha256="f" * 64))
-        run = mocker.patch("orcest.fleet.cli.subprocess.run")
+        run = mocker.patch("orcest.fleet.cli._run_image_command")
+        fetch = mocker.patch("orcest.fleet.cli._fetch_cloud_image_file")
         digest = _resolve_image_checksum(
             "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
             cfg,
@@ -1702,6 +2061,7 @@ class TestResolveImageChecksum:
         )
         assert digest == "f" * 64
         run.assert_not_called()
+        fetch.assert_not_called()
 
     def test_gpg_verifies_and_extracts_sha_for_filename(self, mocker, tmp_path):
         """Without a pinned digest: fetch SHA256SUMS + .gpg, GPG-verify against
@@ -1720,29 +2080,27 @@ class TestResolveImageChecksum:
             "ffff000000000000000000000000000000000000000000000000000000000000 *other.img\n"
         )
 
-        # Sequence of subprocess.run calls inside the resolver:
-        #   1. fetch SHA256SUMS, 2. fetch SHA256SUMS.gpg,
-        #   3. gpg --recv-keys (import), 4. gpg --verify (VALIDSIG present)
-        def fake_run(cmd, *args, **kwargs):
-            joined = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
-            if "curl" in joined and "-o" in cmd:
-                # curl -f -o <path> writes the file on success. The .gpg
-                # detached signature content is opaque to the resolver.
-                out = cmd[cmd.index("-o") + 1]
-                Path(out).write_text(sums if out.endswith("SHA256SUMS") else "SIG")
-                return mocker.MagicMock(returncode=0, stdout="", stderr="")
-            if "--recv-keys" in joined or "--list-keys" in joined:
-                return mocker.MagicMock(returncode=0, stdout="", stderr="")
-            if "--verify" in joined:
-                return mocker.MagicMock(
-                    returncode=0,
-                    stdout="[GNUPG:] VALIDSIG X D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81\n",
-                    stderr="",
-                )
-            return mocker.MagicMock(returncode=0, stdout="", stderr="")
+        fetch_calls = []
 
-        mocker.patch("orcest.fleet.cli.subprocess.run", side_effect=fake_run)
-        mocker.patch("orcest.fleet.cli.tempfile.mkdtemp", return_value=str(tmp_path))
+        def fake_fetch(_url, destination, **kwargs):
+            destination.write_text(sums if destination.name == "SHA256SUMS" else "SIG")
+            fetch_calls.append((destination, kwargs))
+
+        mocker.patch("orcest.fleet.cli._fetch_cloud_image_file", side_effect=fake_fetch)
+        command_calls = []
+
+        def fake_command(command, **kwargs):
+            command_calls.append(command)
+            stdout = ""
+            if "--verify" in command:
+                stdout = (
+                    "[GNUPG:] VALIDSIG "
+                    f"{'B' * 40} 20260905 0 0 4 0 1 10 00 "
+                    "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81\n"
+                )
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        mocker.patch("orcest.fleet.cli._run_image_command", side_effect=fake_command)
 
         digest = _resolve_image_checksum(
             "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
@@ -1750,6 +2108,9 @@ class TestResolveImageChecksum:
             Console(),
         )
         assert digest == target_sha
+        assert fetch_calls[0][1]["max_bytes"] > len(sums)
+        assert fetch_calls[1][1]["max_bytes"] > len("SIG")
+        assert any(command[0] == "gpgconf" for command in command_calls)
 
     def test_raises_when_gpg_signature_invalid(self, mocker, tmp_path):
         """Fail-closed: a bad/missing GPG signature must raise, never return a
@@ -1763,21 +2124,20 @@ class TestResolveImageChecksum:
             pool=PoolConfig(expected_image_gpg_key="D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81")
         )
 
-        def fake_run(cmd, *args, **kwargs):
-            joined = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
-            if "SHA256SUMS" in joined and "curl" in joined and "-o" in cmd:
-                out = cmd[cmd.index("-o") + 1]
-                Path(out).write_text("deadbeef *noble-server-cloudimg-amd64.img\n")
-                return mocker.MagicMock(returncode=0, stdout="", stderr="")
-            if "--verify" in joined:
-                # No VALIDSIG line / non-zero => signature failed.
-                return mocker.MagicMock(returncode=1, stdout="", stderr="BADSIG")
-            return mocker.MagicMock(returncode=0, stdout="", stderr="")
+        def fake_fetch(_url, destination, **_kwargs):
+            destination.write_text(
+                f"{'a' * 64} *noble-server-cloudimg-amd64.img\n"
+                if destination.name == "SHA256SUMS"
+                else "SIG"
+            )
 
-        mocker.patch("orcest.fleet.cli.subprocess.run", side_effect=fake_run)
-        mocker.patch("orcest.fleet.cli.tempfile.mkdtemp", return_value=str(tmp_path))
+        mocker.patch("orcest.fleet.cli._fetch_cloud_image_file", side_effect=fake_fetch)
+        mocker.patch(
+            "orcest.fleet.cli._run_image_command",
+            return_value=subprocess.CompletedProcess(["gpg"], 0, "[GNUPG:] BADSIG\n", ""),
+        )
 
-        with pytest.raises(RuntimeError, match="GPG"):
+        with pytest.raises(RuntimeError, match="cloud image signature failure"):
             _resolve_image_checksum(
                 "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
                 cfg,
@@ -1796,29 +2156,475 @@ class TestResolveImageChecksum:
             pool=PoolConfig(expected_image_gpg_key="D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81")
         )
 
-        def fake_run(cmd, *args, **kwargs):
-            joined = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
-            if "SHA256SUMS" in joined and "curl" in joined and "-o" in cmd:
-                out = cmd[cmd.index("-o") + 1]
-                Path(out).write_text("aaaa *some-other-image.img\n")
-                return mocker.MagicMock(returncode=0, stdout="", stderr="")
-            if "--verify" in joined:
-                return mocker.MagicMock(
-                    returncode=0,
-                    stdout="[GNUPG:] VALIDSIG X D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81\n",
-                    stderr="",
-                )
-            return mocker.MagicMock(returncode=0, stdout="", stderr="")
+        def fake_fetch(_url, destination, **_kwargs):
+            destination.write_text(
+                f"{'a' * 64} *some-other-image.img\n" if destination.name == "SHA256SUMS" else "SIG"
+            )
 
-        mocker.patch("orcest.fleet.cli.subprocess.run", side_effect=fake_run)
-        mocker.patch("orcest.fleet.cli.tempfile.mkdtemp", return_value=str(tmp_path))
+        mocker.patch("orcest.fleet.cli._fetch_cloud_image_file", side_effect=fake_fetch)
+        fingerprint = "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81"
+        mocker.patch(
+            "orcest.fleet.cli._run_image_command",
+            return_value=subprocess.CompletedProcess(
+                ["gpg"],
+                0,
+                f"[GNUPG:] VALIDSIG {fingerprint}\n",
+                "",
+            ),
+        )
 
-        with pytest.raises(RuntimeError, match="noble-server-cloudimg-amd64.img"):
+        with pytest.raises(RuntimeError, match="malformed manifest"):
             _resolve_image_checksum(
                 "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
                 cfg,
                 Console(),
             )
+
+    @pytest.mark.parametrize("fingerprint", ["DEADBEEF", "G" * 40])
+    def test_rejects_non_full_gpg_fingerprint_before_network(self, mocker, fingerprint):
+        from rich.console import Console
+
+        from orcest.fleet.cli import _resolve_image_checksum
+
+        cfg = _proxmox_cfg(pool=PoolConfig(expected_image_gpg_key=fingerprint))
+        fetch = mocker.patch("orcest.fleet.cli._fetch_cloud_image_file")
+
+        with pytest.raises(RuntimeError, match="full 40- or 64-hex fingerprint"):
+            _resolve_image_checksum(
+                "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
+                cfg,
+                Console(),
+            )
+
+        fetch.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("phase", "category", "detail"),
+    [
+        ("manifest", "malformed manifest", "SHA256SUMS exceeded its limit"),
+        ("manifest signature", "signature failure", "signature exceeded its limit"),
+        ("image", "storage failure", "image exceeded its safe size limit"),
+    ],
+)
+def test_fetch_cloud_image_file_enforces_in_flight_size_cap(
+    mocker, tmp_path, phase, category, detail
+):
+    from orcest.fleet.cli import _CloudImageError, _fetch_cloud_image_file
+
+    destination = tmp_path / "partial"
+
+    def oversized(command, **_kwargs):
+        assert command[command.index("--max-filesize") + 1] == "32"
+        destination.write_bytes(b"x" * 33)
+        return subprocess.CompletedProcess(command, 63)
+
+    mocker.patch("orcest.fleet.cli.subprocess.run", side_effect=oversized)
+
+    with pytest.raises(_CloudImageError) as raised:
+        _fetch_cloud_image_file(
+            "https://example.invalid/artifact",
+            destination,
+            phase=phase,
+            max_bytes=32,
+            oversized_category=category,
+            oversized_detail=detail,
+        )
+
+    assert raised.value.category == category
+    assert detail in str(raised.value)
+    assert len(str(raised.value)) <= 240
+
+
+@pytest.mark.parametrize(
+    ("returncode", "category"),
+    [(22, "transport failure"), (23, "storage failure")],
+)
+def test_fetch_cloud_image_file_keeps_transport_and_storage_failures_distinct(
+    mocker, tmp_path, returncode, category
+):
+    from orcest.fleet.cli import _CloudImageError, _fetch_cloud_image_file
+
+    mocker.patch(
+        "orcest.fleet.cli.subprocess.run",
+        return_value=subprocess.CompletedProcess(["curl"], returncode),
+    )
+
+    with pytest.raises(_CloudImageError) as raised:
+        _fetch_cloud_image_file(
+            "https://user:secret@example.invalid/image",
+            tmp_path / "partial",
+            phase="image",
+        )
+
+    assert raised.value.category == category
+    assert "secret" not in str(raised.value)
+
+
+def test_run_image_command_bounds_gpg_status_and_reaps_process(mocker):
+    from orcest.fleet.cli import _CloudImageError, _run_image_command
+
+    popen = mocker.spy(subprocess, "Popen")
+    with pytest.raises(_CloudImageError, match="GPG status output exceeded"):
+        _run_image_command(
+            [
+                sys.executable,
+                "-c",
+                "import os, time; os.write(1, b'x' * 33); time.sleep(30)",
+            ],
+            category="signature failure",
+            detail="signature verification failed",
+            stdout_limit=32,
+            oversized_detail="GPG status output exceeded its limit",
+            timeout_seconds=2,
+        )
+
+    process = popen.spy_return
+    assert process.returncode is not None
+    with pytest.raises(ChildProcessError):
+        os.waitpid(process.pid, os.WNOHANG)
+
+
+def test_run_image_command_accepts_exact_status_limit():
+    from orcest.fleet.cli import _run_image_command
+
+    result = _run_image_command(
+        [sys.executable, "-c", "import os; os.write(1, b'x' * 32)"],
+        category="signature failure",
+        detail="signature verification failed",
+        stdout_limit=32,
+        timeout_seconds=2,
+    )
+
+    assert result.stdout == "x" * 32
+
+
+def test_run_image_command_forwards_qm_grace_when_timeout_requires_cleanup(mocker):
+    from orcest.fleet.cli import _CloudImageError, _run_image_command
+
+    process = mocker.MagicMock(pid=1234, returncode=None)
+    process.wait.side_effect = subprocess.TimeoutExpired(["qm"], 1)
+    mocker.patch("orcest.fleet.cli.subprocess.Popen", return_value=process)
+    terminate = mocker.patch("orcest.fleet.cli._terminate_and_reap_image_command")
+
+    with pytest.raises(_CloudImageError, match="provisioning failure"):
+        _run_image_command(
+            ["qm", "set", "9001"],
+            category="provisioning failure",
+            detail="boot-disk import failed",
+            timeout_seconds=1,
+            termination_grace_seconds=30,
+        )
+
+    terminate.assert_called_once_with(process, grace_seconds=30)
+
+
+def test_set_vm_cloud_init_uses_bounded_qm_process_group(mocker):
+    from orcest.fleet.cli import _set_vm_cloud_init
+
+    mocker.patch("pathlib.Path.mkdir")
+    write = mocker.patch("pathlib.Path.write_text")
+    run = mocker.patch("orcest.fleet.cli._run_image_command")
+
+    _set_vm_cloud_init(mocker.MagicMock(), 9001, "#cloud-config", "local")
+
+    write.assert_called_once_with("#cloud-config")
+    command = run.call_args.args[0]
+    assert command == [
+        "qm",
+        "set",
+        "9001",
+        "--cicustom",
+        "user=local:snippets/orcest-template-9001-user.yaml",
+    ]
+    assert run.call_args.kwargs["timeout_seconds"] == 120
+    assert run.call_args.kwargs["termination_grace_seconds"] == 30
+
+
+def test_cloud_image_error_categories_and_messages_are_fixed_and_bounded():
+    from orcest.fleet.cli import _CLOUD_IMAGE_ERROR_CATEGORIES, _CloudImageError
+
+    error = _CloudImageError("transport failure", "x" * 10_000)
+
+    assert error.category in _CLOUD_IMAGE_ERROR_CATEGORIES
+    assert len(str(error)) == 240
+    with pytest.raises(ValueError, match="unsupported cloud-image error category"):
+        _CloudImageError("unknown", "detail")  # type: ignore[arg-type]
+
+
+def test_verified_cloud_image_refetches_manifest_and_image_per_attempt(mocker, tmp_path):
+    from rich.console import Console
+
+    from orcest.fleet.cli import _verified_cloud_image
+
+    generation_a = b"generation-a"
+    generation_b = b"generation-b"
+    cfg = _proxmox_cfg(pool=PoolConfig(expected_image_gpg_key="A" * 40))
+    resolve = mocker.patch(
+        "orcest.fleet.cli._resolve_image_checksum",
+        side_effect=[
+            hashlib.sha256(generation_a).hexdigest(),
+            hashlib.sha256(generation_b).hexdigest(),
+        ],
+    )
+    fetched_paths: list[Path] = []
+
+    def fetch(_url, destination, **kwargs):
+        assert kwargs["phase"] == "image"
+        if fetched_paths:
+            assert not fetched_paths[-1].parent.exists()
+        destination.write_bytes(generation_b)
+        fetched_paths.append(destination)
+
+    mocker.patch("orcest.fleet.cli._fetch_cloud_image_file", side_effect=fetch)
+    workspace = tmp_path / "retry-workspace"
+    mocker.patch(
+        "orcest.fleet.cli.tempfile.mkdtemp",
+        side_effect=lambda **_kwargs: workspace.mkdir() or str(workspace),
+    )
+
+    with _verified_cloud_image("https://example.invalid/current/image.img", cfg, Console()) as path:
+        assert path == fetched_paths[1]
+        assert path.read_bytes() == generation_b
+
+    assert resolve.call_count == 2
+    assert [call.kwargs["deadline"] for call in resolve.call_args_list] == [
+        resolve.call_args_list[0].kwargs["deadline"],
+        resolve.call_args_list[0].kwargs["deadline"],
+    ]
+    assert len(set(fetched_paths)) == 2
+    assert not workspace.exists()
+
+
+def test_verified_cloud_image_permanent_skew_fails_closed_and_cleans(mocker, tmp_path):
+    from rich.console import Console
+
+    from orcest.fleet.cli import (
+        _IMAGE_CONVERGENCE_ATTEMPTS,
+        _CloudImageError,
+        _verified_cloud_image,
+    )
+
+    cfg = _proxmox_cfg(pool=PoolConfig(expected_image_gpg_key="A" * 40))
+    resolve = mocker.patch(
+        "orcest.fleet.cli._resolve_image_checksum",
+        return_value=hashlib.sha256(b"generation-a").hexdigest(),
+    )
+    fetched_paths: list[Path] = []
+
+    def fetch(_url, destination, **_kwargs):
+        destination.write_bytes(b"generation-b")
+        fetched_paths.append(destination)
+
+    mocker.patch("orcest.fleet.cli._fetch_cloud_image_file", side_effect=fetch)
+    workspace = tmp_path / "skew-workspace"
+    mocker.patch(
+        "orcest.fleet.cli.tempfile.mkdtemp",
+        side_effect=lambda **_kwargs: workspace.mkdir() or str(workspace),
+    )
+
+    with pytest.raises(_CloudImageError) as raised:
+        with _verified_cloud_image("https://example.invalid/current/image.img", cfg, Console()):
+            pytest.fail("permanently mismatched bytes must not be yielded")
+
+    assert raised.value.category == "manifest/image generation skew"
+    assert resolve.call_count == _IMAGE_CONVERGENCE_ATTEMPTS
+    assert len(fetched_paths) == _IMAGE_CONVERGENCE_ATTEMPTS
+    assert all(not path.exists() for path in fetched_paths)
+    assert not workspace.exists()
+
+
+def test_verified_cloud_image_pinned_mismatch_is_local_checksum_failure(mocker, tmp_path):
+    from rich.console import Console
+
+    from orcest.fleet.cli import _CloudImageError, _verified_cloud_image
+
+    cfg = _proxmox_cfg(pool=PoolConfig(expected_image_sha256="a" * 64))
+    mocker.patch(
+        "orcest.fleet.cli._fetch_cloud_image_file",
+        side_effect=lambda _url, destination, **_kwargs: destination.write_bytes(b"wrong"),
+    )
+    workspace = tmp_path / "pinned-workspace"
+    mocker.patch(
+        "orcest.fleet.cli.tempfile.mkdtemp",
+        side_effect=lambda **_kwargs: workspace.mkdir() or str(workspace),
+    )
+
+    with pytest.raises(_CloudImageError) as raised:
+        with _verified_cloud_image("https://example.invalid/current/image.img", cfg, Console()):
+            pytest.fail("bad pinned bytes must not be yielded")
+
+    assert raised.value.category == "local checksum failure"
+    assert not workspace.exists()
+
+
+def test_verification_budget_exhaustion_after_mismatch_reports_timeout(mocker, tmp_path):
+    from rich.console import Console
+
+    from orcest.fleet.cli import _CloudImageError, _verified_cloud_image
+
+    cfg = _proxmox_cfg(pool=PoolConfig(expected_image_gpg_key="A" * 40))
+    resolve = mocker.patch(
+        "orcest.fleet.cli._resolve_image_checksum",
+        return_value=hashlib.sha256(b"generation-a").hexdigest(),
+    )
+    mocker.patch(
+        "orcest.fleet.cli._fetch_cloud_image_file",
+        side_effect=lambda _url, destination, **_kwargs: destination.write_bytes(b"generation-b"),
+    )
+    mocker.patch("orcest.fleet.cli.time.monotonic", side_effect=[0, 1, 2, 601])
+
+    with pytest.raises(_CloudImageError) as raised:
+        with _verified_cloud_image("https://example.invalid/current/image.img", cfg, Console()):
+            pytest.fail("mismatched bytes must not be yielded")
+
+    assert raised.value.category == "verification timeout"
+    assert "after a generation mismatch" in str(raised.value)
+    assert resolve.call_count == 1
+
+
+def test_create_vm_timeout_cleans_only_exact_marker_owned_vm(mocker, tmp_path):
+    from rich.console import Console
+
+    from orcest.fleet.cli import _create_vm_from_cloud_image, _OwnedTemplateVmCreationError
+
+    image_path = tmp_path / "verified.img"
+    image_path.write_bytes(b"verified")
+
+    @contextmanager
+    def verified(*_args, **_kwargs):
+        yield image_path
+
+    mocker.patch("orcest.fleet.cli._verified_cloud_image", side_effect=verified)
+    mock_px = mocker.MagicMock()
+
+    def ambiguous_create(**kwargs):
+        mock_px.list_vms.return_value = [{"vmid": 200, "name": kwargs["name"]}]
+        raise TimeoutError("API response lost")
+
+    mock_px.create_vm.side_effect = ambiguous_create
+
+    with pytest.raises(_OwnedTemplateVmCreationError):
+        _create_vm_from_cloud_image(
+            mock_px,
+            _proxmox_cfg(),
+            200,
+            "https://example.invalid/current/image.img",
+            Console(),
+        )
+
+
+def test_create_vm_timeout_does_not_claim_foreign_vmid(mocker, tmp_path):
+    from rich.console import Console
+
+    from orcest.fleet.cli import (
+        _CloudImageError,
+        _create_vm_from_cloud_image,
+        _OwnedTemplateVmCreationError,
+    )
+
+    image_path = tmp_path / "verified.img"
+    image_path.write_bytes(b"verified")
+
+    @contextmanager
+    def verified(*_args, **_kwargs):
+        yield image_path
+
+    mocker.patch("orcest.fleet.cli._verified_cloud_image", side_effect=verified)
+    mock_px = mocker.MagicMock()
+    mock_px.create_vm.side_effect = TimeoutError("API response lost")
+    mock_px.list_vms.return_value = [{"vmid": 200, "name": "foreign-vm"}]
+
+    with pytest.raises(_CloudImageError) as raised:
+        _create_vm_from_cloud_image(
+            mock_px,
+            _proxmox_cfg(),
+            200,
+            "https://example.invalid/current/image.img",
+            Console(),
+        )
+
+    assert not isinstance(raised.value, _OwnedTemplateVmCreationError)
+
+
+def test_import_failure_is_owned_and_cleans_verified_artifact(mocker, tmp_path):
+    from rich.console import Console
+
+    from orcest.fleet.cli import (
+        _CloudImageError,
+        _create_vm_from_cloud_image,
+        _OwnedTemplateVmCreationError,
+    )
+
+    image_path = tmp_path / "verified.img"
+
+    @contextmanager
+    def verified(*_args, **_kwargs):
+        image_path.write_bytes(b"verified")
+        try:
+            yield image_path
+        finally:
+            image_path.unlink(missing_ok=True)
+
+    mocker.patch("orcest.fleet.cli._verified_cloud_image", side_effect=verified)
+    mocker.patch(
+        "orcest.fleet.cli._run_image_command",
+        side_effect=_CloudImageError("provisioning failure", "boot-disk import failed"),
+    )
+    mock_px = mocker.MagicMock()
+
+    with pytest.raises(_OwnedTemplateVmCreationError, match="boot-disk import failed"):
+        _create_vm_from_cloud_image(
+            mock_px,
+            _proxmox_cfg(),
+            200,
+            "https://example.invalid/current/image.img",
+            Console(),
+        )
+
+    mock_px.create_vm.assert_called_once()
+    assert not image_path.exists()
+
+
+def test_rebake_service_timeout_covers_bounded_bake_and_cleanup_budget():
+    from orcest.fleet.cli import (
+        _IMAGE_FETCH_TIMEOUT_SECONDS,
+        _IMAGE_VERIFICATION_TIMEOUT_SECONDS,
+    )
+
+    service = (
+        Path(__file__).resolve().parents[2] / "provision/systemd/orcest-rebake-template.service"
+    ).read_text(encoding="utf-8")
+    timeout = int(
+        next(
+            line.split("=", 1)[1]
+            for line in service.splitlines()
+            if line.startswith("TimeoutStartSec=")
+        )
+    )
+    known_phase_budget = (
+        _IMAGE_VERIFICATION_TIMEOUT_SECONDS
+        + _IMAGE_FETCH_TIMEOUT_SECONDS  # qm import
+        + 30  # qm TERM grace
+        + 300  # Proxmox create task
+        + 120  # cloud-init attachment
+        + 30  # GPG helper shutdowns
+        + 30  # disk-resize API
+        + 300  # VM-start API/task allowance
+        + 600  # IP discovery
+        + 300  # initial SSH
+        + 695  # cloud-init plus bounded final status read
+        + 180  # three provider probes
+        + 420  # source copy and install
+        + 240  # final guest commands
+        + 60  # shutdown
+        + 300  # template conversion
+        + 600  # cleanup headroom
+        + 1200  # bounded allowance for the service's two GC passes
+    )
+
+    assert timeout == 7200
+    assert timeout >= known_phase_budget
 
 
 # ── rebake / destroy-template / gc-templates tests ──────────
@@ -1835,7 +2641,7 @@ def _patch_template_bake(mocker):
     mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
-    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=True)
+    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value="a" * 40)
     mocker.patch(
         "orcest.fleet.cli._ssh_run",
         side_effect=_successful_provider_cli_probe,
@@ -1862,6 +2668,7 @@ def test_rebake_allocates_next_free_vmid_and_swaps_pointer(runner, cfg_path, moc
     ]
     _patch_template_bake(mocker)
     mock_set = mocker.patch("orcest.fleet.orchestrator.set_current_template_vmid")
+    mock_set_revision = mocker.patch("orcest.fleet.orchestrator.set_current_template_revision")
 
     result = runner.invoke(fleet, ["rebake", "--config", cfg_path])
 
@@ -1869,6 +2676,7 @@ def test_rebake_allocates_next_free_vmid_and_swaps_pointer(runner, cfg_path, moc
     assert "Rebake complete" in result.output
     mock_px.convert_to_template.assert_called_once_with(9001)
     mock_set.assert_called_once_with("orcest@10.20.0.1", 9001)
+    mock_set_revision.assert_called_once_with("orcest@10.20.0.1", "a" * 40)
 
 
 def test_rebake_no_range_configured_fails(runner, cfg_path, mocker):
@@ -3365,6 +4173,107 @@ def test_deploy_rejects_dirty_revision_before_stop(runner, cfg_path, mocker):
     stop_pool.assert_not_called()
 
 
+def test_deploy_rejects_stale_clean_checkout_before_stop(runner, cfg_path, mocker):
+    """A clean but stale checkout must be refused before any remote mutation."""
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300),
+        desired_source=DesiredSourceConfig(repo="org/orcest", sha="b" * 40),
+    )
+    _save(cfg, cfg_path)
+    # Clean local checkout ("a" * 40, via the autouse fixture) does not match
+    # the declared desired sha ("b" * 40).
+    stop_pool = mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    ls_remote = mocker.patch("orcest.fleet.source_revision._run_ls_remote")
+
+    result = runner.invoke(fleet, ["deploy", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "does not match the desired" in " ".join(result.output.split())
+    stop_pool.assert_not_called()
+    ls_remote.assert_not_called()  # sha-pinned: no network resolution needed
+
+
+def test_deploy_rejects_unresolvable_desired_ref_before_stop(runner, cfg_path, mocker):
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300),
+        desired_source=DesiredSourceConfig(repo="org/orcest", ref="refs/heads/master"),
+    )
+    _save(cfg, cfg_path)
+    stop_pool = mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.source_revision._run_ls_remote",
+        side_effect=subprocess.TimeoutExpired(cmd="git", timeout=10),
+    )
+
+    result = runner.invoke(fleet, ["deploy", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "could not be resolved" in " ".join(result.output.split())
+    stop_pool.assert_not_called()
+
+
+def test_deploy_freezes_desired_revision_across_ref_movement(runner, cfg_path, mocker):
+    """A ref that moves mid-deploy must not mix SHAs within one deploy run."""
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300),
+        desired_source=DesiredSourceConfig(repo="org/orcest", ref="refs/heads/master"),
+    )
+    _save(cfg, cfg_path)
+    frozen_sha = "a" * 40
+    moved_sha = "c" * 40
+    mocker.patch("orcest.fleet.orchestrator._resolve_deploy_revision", return_value=frozen_sha)
+    responses = iter(
+        [
+            subprocess.CompletedProcess([], 0, stdout=f"{frozen_sha}\trefs/heads/master\n"),
+            subprocess.CompletedProcess([], 0, stdout=f"{moved_sha}\trefs/heads/master\n"),
+        ]
+    )
+    ls_remote = mocker.patch(
+        "orcest.fleet.source_revision._run_ls_remote", side_effect=lambda *a, **kw: next(responses)
+    )
+    mocker.patch("orcest.fleet.cli._upgrade_cli")
+    _mock_proxmox_client(mocker)
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch("orcest.fleet.orchestrator.get_pool_redis_members", return_value=(set(), {}))
+    mocker.patch("orcest.fleet.orchestrator.clean_pending_tasks", return_value=0)
+    mocker.patch("orcest.fleet.orchestrator.get_deployed_pool_backend", return_value=None)
+    mocker.patch("orcest.fleet.orchestrator.upload_source")
+    mocker.patch("orcest.fleet.orchestrator.build_image")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_password", return_value="pw")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
+    mocker.patch("orcest.fleet.orchestrator.upload_fleet_config")
+    mocker.patch("orcest.fleet.orchestrator.ensure_pool_manager")
+    wait_mock = mocker.patch("orcest.fleet.cli._wait_for_candidate_workers")
+
+    result = runner.invoke(fleet, ["deploy", "--config", cfg_path])
+
+    assert result.exit_code == 0, result.output
+    # `git ls-remote` was consulted only once for the whole deploy, even
+    # though `_validate_deploy_source_revision` inside `update` and the
+    # preflight both check the desired revision.
+    assert ls_remote.call_count == 1
+    assert wait_mock.call_args.kwargs["expected_revision"] == frozen_sha
+    assert wait_mock.call_args.kwargs["expected_revision"] != moved_sha
+
+
 def test_deploy_requires_worker_range_before_stop(runner, cfg_path, mocker):
     cfg = _proxmox_cfg(
         proxmox=ProxmoxConfig(
@@ -3782,6 +4691,7 @@ def test_deploy_rebuild_template_uses_rebake_pointer_swap(runner, cfg_path, mock
         "orcest.fleet.orchestrator.set_current_template_vmid",
         side_effect=lambda *_args, **_kwargs: call_order.append("set_current_template_vmid"),
     )
+    mocker.patch("orcest.fleet.orchestrator.set_current_template_revision")
     mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
     mocker.patch(
         "orcest.fleet.orchestrator.get_pool_redis_members",

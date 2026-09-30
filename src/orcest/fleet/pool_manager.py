@@ -43,6 +43,7 @@ from orcest.shared.events import EventPublisher, make_event
 from orcest.shared.models import (
     CONSUMER_GROUP,
     DEAD_LETTER_STREAM,
+    RESULTS_STREAM,
     TRANSIENT_SUMMARY_PREFIX,
     ResultStatus,
     Task,
@@ -56,6 +57,7 @@ from orcest.shared.provider_stream_health import (
     stream_health_snapshot_key,
 )
 from orcest.shared.redis_client import RedisClient
+from orcest.workflow_store.v1.isolation import is_legacy_pel_allowlisted, is_v1_protocol_stream
 
 logger = logging.getLogger(__name__)
 
@@ -79,9 +81,7 @@ _DRAIN_QUIESCE_SECONDS = 5.25
 # branch.
 _POST_STOP_PENDING_CHECK_ATTEMPTS = 3
 _POST_STOP_PENDING_CHECK_RETRY_SECONDS = 1.0
-# Results stream + cap, mirroring worker/loop.py so the reaper writes a
-# transient-FAILED result to the same place the orchestrator reads.
-_RESULTS_STREAM = "results"
+# Results stream cap used when the reaper publishes a transient failure.
 _RESULT_MAXLEN = 20000
 # Fixed worker_id stamped on reaper-published results (operator-facing).
 _REAPER_WORKER_ID = "pool-manager-reaper"
@@ -194,6 +194,11 @@ class PoolManager:
         # failure retries until Redis is readable or this age exceeds the
         # snapshot freshness window (_STREAM_HEALTH_TTL_SECONDS).
         self._stream_health_restore_first_attempt: dict[tuple[str, str], float] = {}
+        # Consecutive Redis-read failures per stream-health snapshot key.
+        # Warn at 1, 10, 100, then every 1000th so a sustained outage during
+        # the restore window does not flood logs. Discarded on a successful
+        # pipeline read and when restore gives up at the freshness deadline.
+        self._stream_health_restore_read_failures: dict[str, int] = {}
         # EventPublisher instances, cached per project key_prefix ("default"
         # for the pool manager's own prefix). A fresh EventPublisher per call
         # would reset its decimated-error counter every time, defeating the
@@ -2008,7 +2013,7 @@ class PoolManager:
                     "stream",
                 }:
                     raise RuntimeError(f"unexpected Redis TYPE output {key_type!r}")
-                if key_type == "stream":
+                if key_type == "stream" and is_legacy_pel_allowlisted(fq_key):
                     streams.add(fq_key)
         except Exception:
             logger.warning("Failed to discover task streams from Redis", exc_info=True)
@@ -2022,6 +2027,8 @@ class PoolManager:
     def _is_task_stream_key(key: str) -> bool:
         """Return True for backend task streams, not arbitrary tasks:* keys."""
         parts = key.split(":")
+        if is_v1_protocol_stream(key):
+            return False
         if len(parts) == 2:
             return parts[0] == "tasks" and bool(parts[1]) and parts[1] != "issue"
         if len(parts) == 3:
@@ -2282,6 +2289,14 @@ class PoolManager:
         task_streams, discovery_complete = self._task_streams_with_discovery_status()
         recovered_all = discovery_complete
         for fq_stream in task_streams:
+            if is_v1_protocol_stream(fq_stream) or not is_legacy_pel_allowlisted(fq_stream):
+                logger.warning(
+                    "Reaped VM %d: refusing legacy PEL authority on v1 stream %s",
+                    vm_id,
+                    fq_stream,
+                )
+                recovered_all = False
+                continue
             unrecovered_entries = False
             entries = self._read_consumer_pending(fq_stream, consumer)
             if entries is None:
@@ -2347,9 +2362,9 @@ class PoolManager:
                             )
                     continue
                 result_stream = (
-                    f"{task.key_prefix}:{_RESULTS_STREAM}"
+                    f"{task.key_prefix}:{RESULTS_STREAM}"
                     if task.key_prefix
-                    else self._fq_task_stream(_RESULTS_STREAM)
+                    else self._fq_task_stream(RESULTS_STREAM)
                 )
                 credential_recovery = recover_credential_checkpoint(
                     self._redis,
@@ -2569,13 +2584,13 @@ class PoolManager:
     def _task_result_already_published(self, task: Task) -> bool | None:
         try:
             if task.key_prefix:
-                fq_results = f"{task.key_prefix}:{_RESULTS_STREAM}"
+                fq_results = f"{task.key_prefix}:{RESULTS_STREAM}"
                 entries = cast(
                     Any,
                     self._redis.client.xrevrange(fq_results, count=_RESULT_MAXLEN),
                 )
             else:
-                entries = self._redis.xrevrange(_RESULTS_STREAM, count=_RESULT_MAXLEN)
+                entries = self._redis.xrevrange(RESULTS_STREAM, count=_RESULT_MAXLEN)
         except Exception:
             logger.warning(
                 "Reaped task %s: failed to inspect results stream before recovery",
@@ -2641,10 +2656,10 @@ class PoolManager:
         )
         try:
             if task.key_prefix:
-                fq_results = f"{task.key_prefix}:{_RESULTS_STREAM}"
+                fq_results = f"{task.key_prefix}:{RESULTS_STREAM}"
                 self._redis.xadd_capped_raw(fq_results, result.to_dict(), maxlen=_RESULT_MAXLEN)
             else:
-                self._redis.xadd_capped(_RESULTS_STREAM, result.to_dict(), maxlen=_RESULT_MAXLEN)
+                self._redis.xadd_capped(RESULTS_STREAM, result.to_dict(), maxlen=_RESULT_MAXLEN)
         except Exception:
             logger.warning(
                 "Reaped task %s: failed to publish transient-FAILED result",
@@ -2719,6 +2734,13 @@ class PoolManager:
             )
 
     def _safe_xack(self, fq_stream: str, entry_id: str) -> bool:
+        if is_v1_protocol_stream(fq_stream) or not is_legacy_pel_allowlisted(fq_stream):
+            logger.error(
+                "Refusing to ACK v1/non-legacy stream %s entry %s",
+                fq_stream,
+                entry_id,
+            )
+            return False
         try:
             self._redis.xack_raw(fq_stream, CONSUMER_GROUP, entry_id)
             return True
@@ -2996,6 +3018,7 @@ class PoolManager:
         if self._stream_health_tracker.has_state(provider, stream):
             return True
         identity = (provider, stream)
+        key = stream_health_snapshot_key(provider, issue=issue)
         first_attempt = self._stream_health_restore_first_attempt.setdefault(identity, now)
         if now - first_attempt > float(_STREAM_HEALTH_TTL_SECONDS):
             logger.warning(
@@ -3004,9 +3027,9 @@ class PoolManager:
                 provider,
                 stream,
             )
+            self._stream_health_restore_read_failures.pop(key, None)
             return True
         try:
-            key = stream_health_snapshot_key(provider, issue=issue)
             record = self._read_stream_health_snapshot_record(key)
             if record is None:
                 return False
@@ -3054,12 +3077,18 @@ class PoolManager:
             pipe.ttl(key)
             raw, ttl = pipe.execute()
         except Exception:
-            logger.warning(
-                "Failed to read stream health snapshot %s; restore will retry",
-                key,
-                exc_info=True,
-            )
+            count = self._stream_health_restore_read_failures.get(key, 0) + 1
+            self._stream_health_restore_read_failures[key] = count
+            if count in (1, 10, 100) or count % 1000 == 0:
+                logger.warning(
+                    "Failed to read stream health snapshot %s; restore will retry "
+                    "(%d consecutive failures)",
+                    key,
+                    count,
+                    exc_info=True,
+                )
             return None
+        self._stream_health_restore_read_failures.pop(key, None)
         payload = None if raw is None else str(raw)
         try:
             ttl_seconds = int(ttl)

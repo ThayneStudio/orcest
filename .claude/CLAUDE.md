@@ -32,19 +32,29 @@ src/orcest/
 ## Development
 
 ```bash
-# Install in dev mode
-pip install -e ".[dev]"
+# Install in dev mode (locked)
+python -m pip install -r requirements-dev.lock
+python -m pip install --no-deps --no-build-isolation -e .
 
-# Run all tests (starts Redis via Docker, runs everything, stops Redis)
+# Fast local aggregate: lint-check + typecheck + unit tests
+make check-fast
+
+# Full local aggregate: check-fast + integration + stress + dashboard
+# Does not include CI-only image builds or dashboard Compose/image smokes.
+make check-full
+
+# Compatibility: unit, then invocation-scoped integration/stress Redis, then dashboard
 make test
 
-# Run unit tests only (no Redis needed)
+# Individual leaves
+make lint-check
+make typecheck
 make test-unit
+make test-integration
+make test-stress
+make test-dashboard
 
-# Lint
-make lint
-
-# Format
+# Format (applies changes)
 make format
 ```
 
@@ -62,16 +72,19 @@ make format
 
 ## Dashboard
 
-GitHub itself is the dashboard:
-- Labels: `orcest:ready`, `orcest:blocked`, `orcest:needs-human`
+See [product vision](../docs/vision.md) and [dashboard runbook](../docs/fleet-dashboard.md).
+The fleet dashboard projects observations without making scheduling decisions.
+Configured provider accounts, VM allocation, and running agents are separate concepts.
+GitHub remains an inspectable source of work and delivery evidence:
+- Labels: `orcest:ready`, `orcest:needs-human`
 - Comments on PRs/issues for status updates
 - `orcest status` CLI for system health
 
 ## Issue Dependencies
 
 Issues labeled `orcest:ready` with a still-open prerequisite are
-automatically deferred (no manual `orcest:blocked` needed). Two
-sources are checked (see `src/orcest/orchestrator/issue_deps.py` and
+automatically deferred. Two sources are checked (see
+`src/orcest/orchestrator/issue_deps.py` and
 `docs/issue-dependencies.md`); an open blocker in either defers:
 
 1. **GitHub-native blocked-by relationships** (issue sidebar /

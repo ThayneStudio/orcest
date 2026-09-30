@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
 from orcest.shared.models import is_claude_provider
@@ -55,6 +57,54 @@ class ProviderPool:
     loop.py can swap the pool instance without changing every call site yet.
     """
 
+    def dashboard_accounts(self) -> list[dict]:
+        """Public account inventory; no credentials or authentication payloads."""
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            accounts: dict[str, dict] = {}
+            for entry in self._entries:
+                key = entry.account_key()
+                expiry = self._cooldowns.get(key)
+                account = accounts.setdefault(
+                    key,
+                    {
+                        "id": key,
+                        "provider": entry.provider,
+                        "models": [],
+                        "availability": "cooldown" if expiry and expiry > now else "available",
+                        "resets_at": expiry.timestamp() if expiry and expiry > now else None,
+                        "quota": self._usage.get(key),
+                    },
+                )
+                if entry.model and entry.model not in account["models"]:
+                    account["models"].append(entry.model)
+            return list(accounts.values())
+
+    def record_usage(self, account_key: str, data: dict[str, object]) -> None:
+        """Retain only validated public quota windows from an existing probe."""
+        windows = []
+        for key in ("five_hour", "seven_day"):
+            value = data.get(key)
+            if not isinstance(value, dict):
+                continue
+            percent = value.get("utilization")
+            reset = value.get("resets_at")
+            if not isinstance(percent, int | float) or not math.isfinite(percent):
+                continue
+            windows.append(
+                {
+                    "name": key,
+                    "used_percent": max(0, min(100, percent)),
+                    "resets_at": reset if isinstance(reset, str) else None,
+                }
+            )
+        if windows:
+            with self._lock:
+                self._usage[account_key] = {
+                    "observed_at": datetime.now(timezone.utc).timestamp(),
+                    "windows": windows,
+                }
+
     def __init__(self, entries: list[ProviderEntry]) -> None:
         if not entries:
             raise ValueError("ProviderPool requires at least one entry")
@@ -76,6 +126,8 @@ class ProviderPool:
 
         self._entries: list[ProviderEntry] = list(seen.values())  # order preserved for RR
         self._counter: int = 0
+        self._account_subset_counters: dict[tuple[str, ...], int] = {}
+        self._account_variant_counters: dict[tuple[str, ...], int] = {}
         # Cooldowns are keyed by ACCOUNT (provider + credential hash), NOT by
         # identity(): rate limits are per-account, so benching an account benches
         # every model-entry that shares its credential. See ProviderEntry.account_key.
@@ -95,6 +147,7 @@ class ProviderPool:
         # stays Redis-free per the pool boundary).
         self._credential_overrides: dict[str, tuple[str, float]] = {}
         self._lock = threading.RLock()
+        self._usage: dict[str, dict] = {}
 
     @classmethod
     def from_claude_tokens(cls, tokens: list[str]) -> "ProviderPool":
@@ -190,6 +243,44 @@ class ProviderPool:
                 if entry.account_key() not in self._cooldowns:
                     return entry
             return None
+
+    def next_entry_from(self, candidates: Iterable[ProviderEntry]) -> ProviderEntry | None:
+        """Round-robin across an eligible subset without changing quota semantics.
+
+        Capacity routing groups credentials by their actual worker backend and
+        calls this only after selecting that backend.  Keeping the account
+        rotation here preserves the pool's cooldown lock and ensures multiple
+        credentials do not masquerade as multiple workers in the capacity
+        calculation.
+        """
+        requested = {entry.identity() for entry in candidates}
+        if not requested:
+            return None
+        with self._lock:
+            self._prune_cooldowns()
+            eligible = [
+                entry
+                for entry in self._entries
+                if entry.identity() in requested and entry.account_key() not in self._cooldowns
+            ]
+            if not eligible:
+                return None
+            entries_by_account: dict[str, list[ProviderEntry]] = {}
+            for entry in eligible:
+                entries_by_account.setdefault(entry.account_key(), []).append(entry)
+
+            # Rate limits and cooldowns are account-scoped, so accounts—not
+            # model/alias entries—receive equal turns. Entries within the
+            # chosen account rotate independently in stable pool order.
+            account_key = tuple(entries_by_account)
+            account_counter = self._account_subset_counters.get(account_key, 0)
+            self._account_subset_counters[account_key] = account_counter + 1
+            selected_account = account_key[account_counter % len(account_key)]
+            variants = entries_by_account[selected_account]
+            variant_key = (selected_account, *(entry.identity() for entry in variants))
+            variant_counter = self._account_variant_counters.get(variant_key, 0)
+            self._account_variant_counters[variant_key] = variant_counter + 1
+            return variants[variant_counter % len(variants)]
 
     # ------------------------------------------------------------------
     # Primary (lean) registration / exhaustion API

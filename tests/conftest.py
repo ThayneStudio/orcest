@@ -1,13 +1,13 @@
 """Shared fixtures for all test modules."""
 
-import os
+import sys
 import types
-from urllib.parse import urlparse
 
 import fakeredis
 import pytest
 import redis
 
+from orcest.orchestrator.gh import PRReviewSnapshot
 from orcest.shared.config import (
     GithubConfig,
     LabelConfig,
@@ -20,6 +20,13 @@ from orcest.shared.config import (
 )
 from orcest.shared.models import Task, TaskType
 from orcest.shared.redis_client import RedisClient
+from tests.harness.proof import (
+    RedisProofError,
+    assert_invocation_proof,
+    require_test_redis_proof,
+    setup_real_redis_client,
+    teardown_real_redis_client,
+)
 
 # --- Marker registration ---
 
@@ -168,6 +175,7 @@ def gh_mock(mocker):
         "get_ci_status",
         "get_pr_diff",
         "get_failed_run_logs",
+        "get_review_snapshot",
         "add_label",
         "remove_label",
         "post_comment",
@@ -185,80 +193,128 @@ def gh_mock(mocker):
     ]:
         mock = mocker.patch(f"orcest.orchestrator.gh.{fn_name}")
         setattr(ns, fn_name, mock)
+    if "orcest.orchestrator.issue_delivery" in sys.modules:
+        ns.observe_issue_handoff = mocker.patch(
+            "orcest.orchestrator.issue_delivery.observe_issue_handoff"
+        )
     ns.get_pr.return_value = {"headRefOid": "abc123", "statusCheckRollup": []}
+    ns.get_ci_status.return_value = [
+        {"name": "tests", "status": "COMPLETED", "conclusion": "SUCCESS"}
+    ]
+    ns.get_unresolved_review_threads.return_value = []
+    ns.get_review_snapshot.return_value = PRReviewSnapshot(
+        head_sha="abc123",
+        state="OPEN",
+        is_draft=False,
+        labels=(),
+        review_decision="APPROVED",
+        has_current_head_approval=True,
+    )
     ns.has_issue_comment_marker.return_value = False
+    if hasattr(ns, "observe_issue_handoff"):
+        from orcest.orchestrator.github_delivery_verifier import (
+            DeliveryErrorKind,
+            DeliveryFailureReason,
+            HandoffObservation,
+        )
+
+        ns.observe_issue_handoff.return_value = HandoffObservation(
+            verified=False,
+            error_kind=DeliveryErrorKind.MISMATCH,
+            reason=DeliveryFailureReason.NO_CANONICAL_CLOSING_REFERENCE,
+            repo="owner/testrepo",
+            issue_number=0,
+            default_branch="",
+            default_branch_oid="",
+            expected_head_ref="",
+            claimed_head_oid="",
+            live_head_oid="",
+            complete=False,
+            message="test default",
+        )
     return ns
+
+
+@pytest.fixture
+def make_review_snapshot():
+    def factory(
+        *,
+        head_sha: str = "abc123",
+        state: str = "OPEN",
+        is_draft: bool = False,
+        labels: tuple[str, ...] = (),
+        review_decision: str = "APPROVED",
+        has_current_head_approval: bool = True,
+    ) -> PRReviewSnapshot:
+        return PRReviewSnapshot(
+            head_sha=head_sha,
+            state=state,
+            is_draft=is_draft,
+            labels=labels,
+            review_decision=review_decision,
+            has_current_head_approval=has_current_head_approval,
+        )
+
+    return factory
 
 
 # --- Real Redis fixtures (shared by integration and stress tests) ---
 
 
-def _get_redis_url():
-    return os.environ.get("ORCEST_TEST_REDIS_URL", "redis://localhost:6379/15")
-
-
-def _parse_redis_url(url: str) -> dict:
-    """Parse a Redis URL into host/port/db/password components."""
-    parsed = urlparse(url)
-    return {
-        "host": parsed.hostname or "localhost",
-        "port": parsed.port or 6379,
-        "db": int(parsed.path.lstrip("/") or "15"),
-        "password": parsed.password,
-    }
-
-
 @pytest.fixture(scope="session")
 def _check_redis():
-    """Skip all integration/stress tests if Redis is not available."""
-    url = _get_redis_url()
-    r = redis.from_url(url)
+    """Fail closed unless this invocation's Redis URL and nonce are proven."""
     try:
-        r.ping()
-    except redis.ConnectionError:
-        pytest.skip("Real Redis not available. Start Redis or set ORCEST_TEST_REDIS_URL.")
-    finally:
-        r.close()
+        url, nonce, _parts = require_test_redis_proof()
+        assert_invocation_proof(url, nonce)
+        r = redis.from_url(url)
+        try:
+            r.ping()
+        finally:
+            r.close()
+    except RedisProofError as exc:
+        pytest.fail(str(exc))
+    except redis.RedisError as exc:
+        pytest.fail(f"Test Redis is unreachable: {exc}")
 
 
 @pytest.fixture
 def real_redis_client(_check_redis):
-    """RedisClient connected to real Redis DB 15, flushed per test."""
-    url = _get_redis_url()
-    parsed = _parse_redis_url(url)
-    config = RedisConfig(
-        host=parsed["host"],
-        port=parsed["port"],
-        db=parsed["db"],
-        password=parsed["password"],
-        key_prefix="",
-    )
-    client = RedisClient(config)
-    client.client.flushdb()
-    yield client
-    client.client.flushdb()
-    client.close()
+    """RedisClient connected to the invocation-scoped test Redis, flushed per test."""
+    try:
+        client, url, nonce = setup_real_redis_client()
+    except RedisProofError as exc:
+        pytest.fail(str(exc))
+    try:
+        yield client
+    finally:
+        try:
+            teardown_real_redis_client(client, url, nonce)
+        except RedisProofError as exc:
+            pytest.fail(str(exc))
 
 
 @pytest.fixture
 def make_real_redis_client(_check_redis):
     """Factory for creating additional real Redis clients (same DB)."""
-    url = _get_redis_url()
-    parsed = _parse_redis_url(url)
+    _url, _nonce, parsed = require_test_redis_proof()
     clients: list[RedisClient] = []
 
     def factory():
-        config = RedisConfig(
-            host=parsed["host"],
-            port=parsed["port"],
-            db=parsed["db"],
-            password=parsed["password"],
-            key_prefix="",
+        c = RedisClient(
+            RedisConfig(
+                host=parsed["host"],
+                port=parsed["port"],
+                db=parsed["db"],
+                password=parsed["password"],
+                key_prefix="",
+            )
         )
-        c = RedisClient(config)
         clients.append(c)
         return c
 
-    yield factory
-    for c in clients:
-        c.close()
+    try:
+        yield factory
+    finally:
+        for c in clients:
+            c.close()

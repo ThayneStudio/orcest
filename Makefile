@@ -1,12 +1,15 @@
-.PHONY: test test-unit check-dashboard-tracked check-dashboard-release-revision check-dashboard-clean-copy test-dashboard audit-dashboard redis-up redis-down lint format lock build-dashboard smoke-dashboard-image smoke-dashboard-compose dev-dashboard check-dashboard-remote-paths preflight-dashboard-remote sync-dashboard-remote sync-dashboard-remote-unlocked deploy-dashboard deploy-dashboard-remote
+.PHONY: test test-unit test-integration test-stress check-dashboard-tracked check-dashboard-release-revision check-dashboard-clean-copy test-dashboard audit-dashboard redis-up redis-down lint lint-check typecheck format lock lock-dev check-lock-dev check-fast check-full build-dashboard smoke-dashboard-image smoke-dashboard-compose dev-dashboard check-dashboard-remote-paths preflight-dashboard-remote sync-dashboard-remote sync-dashboard-remote-unlocked deploy-dashboard deploy-dashboard-remote
 
+PIP_COMPILE_CMD ?= pip-compile
 DASHBOARD_REDIS_ENV ?= /opt/orcest/.redis.env
 DASHBOARD_ENV ?= /opt/orcest/.dashboard.env
 DASHBOARD_NODE_VERSION ?= $(shell cat dashboard/.node-version)
 DASHBOARD_NODE_IMAGE ?= node:$(DASHBOARD_NODE_VERSION)-slim
+DASHBOARD_CLEAN_COPY_RUNNER ?= docker
 DASHBOARD_AUDIT_LEVEL ?= moderate
 ORCEST_BUILD_REVISION ?= $(shell git rev-parse HEAD 2>/dev/null)
 DASHBOARD_NPM_ENV = -e NPM_CONFIG_AUDIT=false -e NPM_CONFIG_FUND=false -e NPM_CONFIG_PROGRESS=false -e NPM_CONFIG_UPDATE_NOTIFIER=false
+DASHBOARD_NPM_ENV_NATIVE = NPM_CONFIG_AUDIT=false NPM_CONFIG_FUND=false NPM_CONFIG_PROGRESS=false NPM_CONFIG_UPDATE_NOTIFIER=false
 DASHBOARD_DOCKER_RUN = docker run --rm --user "$(shell id -u):$(shell id -g)" -e HOME=/tmp $(DASHBOARD_NPM_ENV) -v "$(CURDIR)/dashboard:/app" -w /app $(DASHBOARD_NODE_IMAGE)
 DASHBOARD_SOURCE_TAR_EXCLUDES = --exclude='./node_modules' --exclude='./dist' --exclude='./build' --exclude='./.git' --exclude='./.env' --exclude='./.env.*' --exclude='./*.env' --exclude='./.npmrc*' --exclude='./npm-debug.log*' --exclude='./vite.config.ts.timestamp-*.mjs'
 DASHBOARD_RSYNC_EXCLUDES = --exclude='node_modules/' --exclude='dist/' --exclude='build/' --exclude='.git/' --exclude='.env' --exclude='.env.*' --exclude='*.env' --exclude='.npmrc*' --exclude='npm-debug.log*' --exclude='vite.config.ts.timestamp-*.mjs'
@@ -37,9 +40,20 @@ DASHBOARD_REMOTE_COMPOSE_STATE_FILE_SH = $(call DASHBOARD_SHELL_QUOTE,$(DASHBOAR
 DASHBOARD_NODE_VERSION_SH = $(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_NODE_VERSION))
 DASHBOARD_NODE_IMAGE_SH = $(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_NODE_IMAGE))
 
-define DASHBOARD_RUN_IN_CLEAN_COPY
+define DASHBOARD_RUN_IN_CLEAN_COPY_DOCKER
 tar -C "$(CURDIR)/dashboard" $(DASHBOARD_SOURCE_TAR_EXCLUDES) -cf - . | \
 docker run --rm -i -e HOME=/tmp $(DASHBOARD_NPM_ENV) -w /app $(DASHBOARD_NODE_IMAGE) sh -lc 'tar -C /app -xf - && $(1)'
+endef
+
+define DASHBOARD_RUN_IN_CLEAN_COPY_NATIVE
+tmpdir=$$(mktemp -d); \
+trap 'rm -rf "$$tmpdir"' EXIT INT TERM; \
+tar -C "$(CURDIR)/dashboard" $(DASHBOARD_SOURCE_TAR_EXCLUDES) -cf - . | tar -C "$$tmpdir" -xf -; \
+cd "$$tmpdir" && HOME="$$tmpdir" $(DASHBOARD_NPM_ENV_NATIVE) sh -lc '$(1)'
+endef
+
+define DASHBOARD_RUN_IN_CLEAN_COPY
+$(if $(filter native,$(DASHBOARD_CLEAN_COPY_RUNNER)),$(call DASHBOARD_RUN_IN_CLEAN_COPY_NATIVE,$(1)),$(call DASHBOARD_RUN_IN_CLEAN_COPY_DOCKER,$(1)))
 endef
 
 define DASHBOARD_RUN_REMOTE
@@ -74,13 +88,37 @@ test-dashboard: check-dashboard-tracked
 audit-dashboard: check-dashboard-tracked
 	$(call DASHBOARD_RUN_IN_CLEAN_COPY,npm ci && npm audit --audit-level=$(DASHBOARD_AUDIT_LEVEL))
 
-# All tests — starts Redis, runs everything, stops Redis
-test: redis-up
-	pytest -v --cov=src/orcest --cov-report=term-missing; ret=$$?; \
-	if [ $$ret -eq 0 ]; then $(MAKE) test-dashboard; ret=$$?; fi; \
-	$(MAKE) redis-down; exit $$ret
+# Compatibility entry point: unit tests, then managed Redis-backed suites,
+# then dashboard. Each Redis-backed target gets its own invocation-scoped
+# Compose project; nothing here starts or stops docker-compose.redis.yml.
+# Prefer check-fast / check-full for the canonical DAG; this target does not
+# run lint-check or typecheck.
+test:
+	$(MAKE) test-unit
+	$(MAKE) test-integration
+	$(MAKE) test-stress
+	$(MAKE) test-dashboard
 
-# Start Redis in Docker for integration/stress tests
+# Real-Redis tests, including inline @pytest.mark.integration outside tests/integration/.
+test-integration:
+	python3 -m tests.harness.supervisor python3 -m pytest -m integration --cov=src/orcest --cov-report=term-missing
+
+# High-concurrency real-Redis tests, including inline @pytest.mark.stress.
+test-stress:
+	python3 -m tests.harness.supervisor python3 -m pytest -m stress --cov=src/orcest --cov-report=term-missing
+
+# Fast local aggregate. No Redis, dashboard, or image builds.
+check-fast: lint-check typecheck test-unit
+
+# Full local aggregate: check-fast plus managed Redis suites and dashboard.
+# Root/dashboard image builds and dashboard Compose/image smokes stay CI-only
+# until their tags and ports are worktree-safe.
+check-full: check-fast test-integration test-stress test-dashboard
+
+# Manual-development helpers for the shared docker-compose.redis.yml service.
+# Correctness targets (test, test-unit, test-integration, test-stress,
+# test-dashboard, lint-check, typecheck, check-fast, check-full) must not
+# depend on these.
 redis-up:
 	docker compose -f docker-compose.redis.yml up -d redis
 	@echo "Waiting for Redis..."
@@ -93,11 +131,28 @@ redis-down:
 lint:
 	ruff check src/ tests/
 
+lint-check:
+	ruff check src/ tests/
+	ruff format --check src/ tests/
+
+typecheck:
+	mypy src/
+
 format:
 	ruff format src/ tests/
 
 lock:
-	pip-compile pyproject.toml --output-file requirements.lock --strip-extras
+	$(PIP_COMPILE_CMD) pyproject.toml --output-file requirements.lock --strip-extras
+
+lock-dev:
+	$(PIP_COMPILE_CMD) pyproject.toml --extra dev --all-build-deps --constraint requirements.lock --constraint requirements-dev-toolchain.txt --output-file requirements-dev.lock --strip-extras --allow-unsafe --no-header
+
+check-lock-dev:
+	@tmp=$$(mktemp); \
+	trap 'rm -f "$$tmp"' EXIT INT TERM; \
+	cp requirements-dev.lock "$$tmp" && \
+	$(PIP_COMPILE_CMD) --quiet pyproject.toml --extra dev --all-build-deps --constraint requirements.lock --constraint requirements-dev-toolchain.txt --output-file "$$tmp" --strip-extras --allow-unsafe --no-header && \
+	diff -u requirements-dev.lock "$$tmp"
 
 build-dashboard: check-dashboard-tracked
 	$(call DASHBOARD_RUN_IN_CLEAN_COPY,npm ci && npm run build)

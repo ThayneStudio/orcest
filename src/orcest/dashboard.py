@@ -20,7 +20,7 @@ from typing import Any
 import redis as redis_lib
 from rich.markup import escape as rich_escape
 
-from orcest.shared.models import DEAD_LETTER_STREAM
+from orcest.shared.models import DEAD_LETTER_STREAM, RESULTS_STREAM
 from orcest.shared.output_streams import is_output_continuation
 from orcest.shared.provider_stream_health import (
     STREAM_HEALTH_KEY_PREFIX,
@@ -28,6 +28,13 @@ from orcest.shared.provider_stream_health import (
     StreamHealthState,
 )
 from orcest.shared.redis_client import RedisClient
+from orcest.shared.result_stream_health import (
+    ResultStreamHealth,
+    format_result_stream_metrics,
+    format_result_stream_warning,
+    inspect_result_stream,
+    unavailable_result_stream_health,
+)
 
 # Global (cross-project, unprefixed) key prefix PoolManager publishes canonical
 # per-stream health snapshots under (``provider-stream-health:{provider}:pr``
@@ -84,6 +91,9 @@ class SystemSnapshot:
 
     redis_ok: bool
     fetched_at: datetime
+    # Always populated. A disconnected snapshot carries an explicit unavailable
+    # value, so renderers never need an unreachable Redis-OK/None fallback.
+    result_stream_health: ResultStreamHealth
     queue_depths: dict[str, int] = field(default_factory=dict)
     results_depth: int = 0
     dead_letter_count: int = 0
@@ -104,6 +114,7 @@ def fetch_snapshot(redis: RedisClient, max_results: int = 20) -> SystemSnapshot:
         return SystemSnapshot(
             redis_ok=False,
             fetched_at=datetime.now(timezone.utc),
+            result_stream_health=unavailable_result_stream_health(redis._prefixed(RESULTS_STREAM)),
         )
 
     try:
@@ -117,6 +128,7 @@ def fetch_snapshot(redis: RedisClient, max_results: int = 20) -> SystemSnapshot:
         return SystemSnapshot(
             redis_ok=False,
             fetched_at=datetime.now(timezone.utc),
+            result_stream_health=unavailable_result_stream_health(redis._prefixed(RESULTS_STREAM)),
         )
 
 
@@ -129,10 +141,8 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
     # Discover task streams
     task_streams = redis.scan_iter(match="tasks:*")
 
-    try:
-        results_depth: int = redis.xlen("results")
-    except redis_lib.ResponseError:
-        results_depth = 0
+    result_stream_health = inspect_result_stream(redis)
+    results_depth = result_stream_health.retained_entries
 
     try:
         dead_letter_count: int = redis.xlen(DEAD_LETTER_STREAM)
@@ -194,7 +204,7 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
     # Recent results (most recent first)
     recent_results = []
     try:
-        entries: list[Any] = redis.xrevrange("results", count=max_results)
+        entries: list[Any] = redis.xrevrange(RESULTS_STREAM, count=max_results)
     except redis_lib.ResponseError:
         entries = []
     for _entry_id, fields in entries:
@@ -284,6 +294,7 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
         fetched_at=datetime.now(timezone.utc),
         queue_depths=queue_depths,
         results_depth=results_depth,
+        result_stream_health=result_stream_health,
         dead_letter_count=dead_letter_count,
         locks=locks,
         consumer_groups=consumer_groups,
@@ -448,8 +459,6 @@ def _status_style(status: str) -> str:
         return "green"
     if s == "failed":
         return "red"
-    if s == "blocked":
-        return "yellow"
     if s == "usage_exhausted":
         return "magenta"
     return "white"
@@ -488,6 +497,16 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             display: none;
         }
         #stream-health-banner.visible {
+            display: block;
+        }
+        #result-health-banner {
+            height: auto;
+            background: $error;
+            color: $text;
+            padding: 0 1;
+            display: none;
+        }
+        #result-health-banner.visible {
             display: block;
         }
         .section-title {
@@ -548,9 +567,12 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             yield Header(show_clock=True)
             yield Static("", id="health-bar")
             yield Static("", id="stream-health-banner")
+            yield Static("", id="result-health-banner")
             with VerticalScroll(id="overview-container"):
                 yield Static("Queue Depths", classes="section-title")
                 yield DataTable(id="queues-table")
+                yield Static("Result Stream Health", classes="section-title")
+                yield DataTable(id="result-health-table")
                 yield Static("Provider Stream Health", classes="section-title")
                 yield DataTable(id="stream-health-table")
                 yield Static("Active Locks", classes="section-title")
@@ -571,7 +593,10 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
 
         def on_mount(self) -> None:
             queues = self.query_one("#queues-table", DataTable)
-            queues.add_columns("Stream", "Pending")
+            queues.add_columns("Stream", "Work", "Retained XLEN")
+
+            result_health = self.query_one("#result-health-table", DataTable)
+            result_health.add_columns("Metric", "Value")
 
             stream_health = self.query_one("#stream-health-table", DataTable)
             stream_health.add_columns(
@@ -644,12 +669,30 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             queues = self.query_one("#queues-table", DataTable)
             queues.clear()
             for stream, depth in snapshot.queue_depths.items():
-                queues.add_row(stream, str(depth))
+                queues.add_row(stream, str(depth), "--")
             if not snapshot.queue_depths:
-                queues.add_row("(no task streams)", "0")
+                queues.add_row("(no task streams)", "0", "--")
+            result_health = snapshot.result_stream_health
+            result_work = result_health.work
+            queues.add_row("results work", str(result_work), "--")
+            queues.add_row("results retained", "--", str(snapshot.results_depth))
             dl_count = snapshot.dead_letter_count
             dl_text = Text(str(dl_count), style="red bold") if dl_count > 0 else Text(str(dl_count))
-            queues.add_row(DEAD_LETTER_STREAM, dl_text)
+            queues.add_row(DEAD_LETTER_STREAM, dl_text, str(dl_count))
+
+            result_table = self.query_one("#result-health-table", DataTable)
+            result_table.clear()
+            for metric, value in format_result_stream_metrics(result_health):
+                result_table.add_row(metric, value)
+
+            result_banner = self.query_one("#result-health-banner", Static)
+            warning = format_result_stream_warning(result_health)
+            if warning:
+                result_banner.update(warning)
+                result_banner.add_class("visible")
+            else:
+                result_banner.update("")
+                result_banner.remove_class("visible")
 
             self._update_stream_health(snapshot)
 

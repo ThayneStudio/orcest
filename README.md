@@ -1,11 +1,13 @@
 # Orcest
 
-Autonomous CI/CD orchestration. A single orchestrator watches GitHub, runs
-heuristics, and hands work to a managed fleet of ephemeral worker VMs that
-invoke coding agents — Claude, Grok, or Codex — against the target repo.
+Lightweight coordination for autonomous coding agents. Orcest discovers work,
+observes dependencies and delivery checks, and hands eligible tasks to ephemeral
+worker VMs running Claude, Grok, or Codex. GitHub currently supplies issue, PR, and
+CI evidence; Orcest observes that process instead of becoming a CI/CD engine.
 
-GitHub is the dashboard. Redis is coordination state. There are no
-long-lived scripts.
+The [product vision](docs/vision.md) records the long-term direction. The
+[fleet dashboard runbook](docs/fleet-dashboard.md) covers live observations,
+sign-in, validation, and rollout.
 
 ---
 
@@ -16,9 +18,8 @@ Grok, Codex) running on a managed fleet of VMs. It replaces the older
 Ralph system: instead of long-lived scripts, a single orchestrator
 watches GitHub, decides what is actionable, and hands tasks to ephemeral,
 repo-agnostic workers that clone the target repo and run an agent CLI
-against it. GitHub itself is the dashboard — labels, comments, and PR
-state are the source of truth; Redis is purely coordination state
-(queues, locks, retry counters).
+against it. Labels, comments, and PR state remain source evidence. Redis holds
+coordination state and a read-only dashboard projection of those observations.
 
 ## Architecture
 
@@ -41,9 +42,10 @@ actionable (see [`docs/wiki/current-orchestrator-state-model.md`](docs/wiki/curr
 - **Redis** — task distribution via streams, distributed locks via
   `SET NX EX`, pending markers tied to PR head SHAs, attempt counters,
   per-provider exhaustion keys, and operational memory.
-- **GitHub as dashboard** — labels (`orcest:ready`, `orcest:blocked`,
-  `orcest:needs-human`), PR/issue comments for status, and `orcest status`
-  for a Rich/Textual TUI of queue and worker health.
+- **Visibility** — the fleet dashboard shows work lifecycle, reasons for waiting,
+  agent output, configured provider accounts, and VM capacity. GitHub labels
+  (`orcest:ready`, `orcest:needs-human`) and PR/issue comments remain inspectable
+  source evidence; `orcest status` supplies terminal diagnostics.
 - **Snapshot validation** — every task carries the PR head SHA plus a
   decision reason (`ci_failure`, `changes_requested`,
   `merge_conflict_rebase`, ...). Workers cheap-validate before running;
@@ -171,8 +173,8 @@ src/orcest/
 ## Key features
 
 - **GitHub polling + label-driven triage** — discovers actionable PRs and
-  issues via labels (`orcest:ready`, terminal `orcest:blocked` /
-  `orcest:needs-human`) and per-snapshot decision reasons.
+  issues via labels (`orcest:ready` and terminal `orcest:needs-human`)
+  and per-snapshot decision reasons.
 - **CI triage** — captures failing check names at enqueue time, drops
   tasks whose CI predicate no longer applies before running.
 - **Issue dependency deferral** — `orcest:ready` issues whose body
@@ -193,13 +195,17 @@ src/orcest/
 
 ## Installation
 
-Orcest requires **Python 3.12 or newer**. Clone the repo and install in
-editable mode:
+Orcest development uses **Python 3.12**, `pip==24.0`, and
+`pip-tools==7.5.2` to regenerate the development lock. Clone the repo
+and install the locked development environment in editable mode:
 
 ```bash
 git clone https://github.com/ThayneStudio/orcest.git
 cd orcest
-pip install -e ".[dev]"
+python3.12 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements-dev.lock
+python -m pip install --no-deps --no-build-isolation -e .
 ```
 
 Available extras:
@@ -217,13 +223,21 @@ The `Makefile` provides the canonical developer targets:
 
 | Target                               | What it does                                                                                              |
 | ------------------------------------ | --------------------------------------------------------------------------------------------------------- |
+| `make lint-check`                    | `ruff check src/ tests/` and `ruff format --check src/ tests/`.                                           |
+| `make typecheck`                     | `mypy src/`.                                                                                              |
 | `make test-unit`                     | Runs only tests marked `unit` (uses `fakeredis` / mocks; no external services required).                  |
-| `make test`                          | Starts Redis, runs pytest, then `make test-dashboard` if pytest passes, tears Redis down, and exits with the first failing phase. |
+| `make test-integration`              | Starts an invocation-scoped Redis and runs `pytest -m integration` (including inline markers outside `tests/integration/`). |
+| `make test-stress`                   | Starts an invocation-scoped Redis and runs `pytest -m stress`.                                            |
+| `make test-dashboard`                | Runs dashboard install, typecheck, tests, build, and bundle-runtime check in the pinned Node Docker image. |
+| `make check-fast`                    | Aggregate of `lint-check`, `typecheck`, and `test-unit`.                                                   |
+| `make check-full`                    | Aggregate of `check-fast`, `test-integration`, `test-stress`, and `test-dashboard`. Does not include CI-only image builds or dashboard Compose/image smokes. |
+| `make test`                          | Compatibility entry point: `test-unit`, managed `test-integration`, managed `test-stress`, then `test-dashboard`. Stops on the first failing phase. |
 | `make lint`                          | `ruff check src/ tests/`                                                                                  |
 | `make format`                        | `ruff format src/ tests/`                                                                                 |
-| `make redis-up` / `make redis-down`  | Manage the test Redis container directly.                                                                 |
-| `make lock`                          | Regenerate `requirements.lock` via `pip-compile`.                                                         |
-| `make test-dashboard`                | Runs dashboard install, typecheck, tests, build, and bundle-runtime check in the pinned Node Docker image. |
+| `make redis-up` / `make redis-down`  | Manual helpers for the shared `docker-compose.redis.yml` service used by local orchestrator development. Not used by correctness targets. |
+| `make lock`                          | Regenerate the runtime `requirements.lock` via `pip-compile`.                                             |
+| `make lock-dev`                      | Regenerate `requirements-dev.lock` from the `dev` extra and PEP 517 build requirements, constrained by the runtime lock. |
+| `make check-lock-dev`                | Regenerate `requirements-dev.lock` into a temporary file and compare it with the committed lock.           |
 | `make audit-dashboard`               | Runs `npm audit --audit-level=$(DASHBOARD_AUDIT_LEVEL)` on its own. Kept out of `test-dashboard` (and non-blocking in CI) so a new registry advisory cannot fail an unrelated PR. |
 | `make build-dashboard`               | Builds the dashboard in the pinned Node Docker image.                                                      |
 | `make smoke-dashboard-compose`       | Builds the dashboard Compose stack with an authenticated Redis container and verifies `/api/ready`.        |
@@ -249,7 +263,7 @@ verbatim from the implementations in `src/orcest/cli.py` and
 | `orcest dead-letters`       | List and optionally replay dead-lettered tasks (`--replay`, `--count`).                       |
 | `orcest init`               | Initialize orcest on a Proxmox host (writes `/etc/orcest/config.yaml`, copies Terraform templates, runs `tofu init`). |
 | `orcest upgrade`            | Update the orcest CLI to the latest version from GitHub and refresh Terraform templates.      |
-| `orcest init-labels`        | Create orcest labels (`orcest:ready`, `orcest:blocked`, `orcest:needs-human`) on every configured project repo. |
+| `orcest init-labels`        | Create orcest labels (`orcest:ready`, `orcest:needs-human`) on every configured project repo. |
 | `orcest provision <host>`   | Provision a worker VM via SSH: copy setup script, config, systemd service; start the worker. |
 | `orcest pool-manage`        | Run the warm pool manager (long-running service that reconciles ephemeral worker VMs).        |
 | `orcest trace`              | Inspect an archived worker trace. Supports `<task-id>`, `--pr owner/repo#N`, `--list <project>`, `--meta`, `--raw`. |
@@ -276,7 +290,7 @@ Top-level keys:
   list is given.
 - **`polling`** — `interval` in seconds between GitHub polling cycles
   (default `60`).
-- **`labels`** — names for the three orcest labels: `ready`, `blocked`,
+- **`labels`** — names for the two orcest labels: `ready` and
   `needs_human`.
 - **`runner`** — `type` (default `claude`), `timeout`, `max_retries`,
   `retry_backoff`, optional `model`. Used to compute pending-task marker
@@ -302,6 +316,12 @@ Top-level keys:
 - **`trace_archive_path`** — absolute path on the orchestrator process
   where verbatim per-task traces are archived. Omit to disable the
   archiver.
+- **`workflow_state_root`** — optional workflow-control v1 state directory.
+  When configured, the legacy PR selector reads `workflow.db` in query-only
+  mode and excludes PRs owned by a live v1 Publication. Docker deployments
+  must also set `ORCEST_WORKFLOW_STATE_HOST_PATH` to the host directory that
+  contains `workflow.db`; fleet-managed deployments set
+  `workflow_state_host_path` in fleet config and generate both settings.
 
 ### Providers
 
@@ -385,7 +405,10 @@ GitHub repo. It is **not** a production deploy — for that, see
    ```bash
    git clone https://github.com/ThayneStudio/orcest.git
    cd orcest
-   pip install -e ".[dev]"
+   python3.12 -m venv .venv
+   . .venv/bin/activate
+   python -m pip install -r requirements-dev.lock
+   python -m pip install --no-deps --no-build-isolation -e .
    ```
 2. **Start Redis.**
    ```bash
@@ -666,6 +689,11 @@ Notes:
   orcest trace --pr <num>          # all traces for a PR
   orcest trace --list              # recent traces
   ```
+- **Workflow-Control v1 ownership fence.** Set the fleet config's
+  `workflow_state_host_path` to the absolute host directory containing the v1
+  `workflow.db`. Fleet generation mounts it read-only at
+  `/var/lib/orcest/workflow` and emits the matching `workflow_state_root` for
+  each legacy orchestrator.
 - **Issue-dependency deferrals** log at INFO from the orchestrator as
   `Issue #<n>: deferred, waiting on open blocker(s): #<a>, #<b>`.
 - **State machine semantics** for what the orchestrator is doing per

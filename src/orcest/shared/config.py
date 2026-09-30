@@ -58,7 +58,6 @@ class PollingConfig:
 
 @dataclass
 class LabelConfig:
-    blocked: str = "orcest:blocked"
     needs_human: str = "orcest:needs-human"
     ready: str = "orcest:ready"
 
@@ -105,6 +104,27 @@ class DeploymentConfig:
 
 
 @dataclass
+class IssueDeliveryVerifierConfig:
+    """Durable GitHub issue delivery verification (enforcing completion gate).
+
+    ``enabled: false`` restores the pre-gate completed-issue path (immediate
+    ``orcest:ready`` removal) only for newly consumed results. It does not
+    process or clear existing verification jobs and dispatch barriers, so
+    disable only after draining or quarantining in-flight delivery state; see
+    ``docs/operations/issue-delivery-verification-rollback.md``.
+    """
+
+    enabled: bool = True
+    grace_seconds: int = 60
+    backoff_initial_seconds: int = 10
+    backoff_max_seconds: int = 300
+    scheduler_batch_size: int = 20
+    oldest_pending_alert_seconds: int = 1800
+    page_cap: int = 50
+    ineffective_cooldown_seconds: int = 60
+
+
+@dataclass
 class OrchestratorConfig:
     redis: RedisConfig = field(default_factory=RedisConfig)
     github: GithubConfig = field(default_factory=GithubConfig)
@@ -139,6 +159,9 @@ class OrchestratorConfig:
     # to pre-archive). Storage backend (NFS, local disk, etc.) is opaque to
     # orcest — operator mounts whatever they want at this path.
     trace_archive_path: str | None = None
+    # Optional workflow-control v1 state root.  When set, the legacy PR
+    # selector consults workflow.db read-only and excludes v1-owned refs/IDs.
+    workflow_state_root: str | None = None
     # Monitor ingest wiring for the EventRelay (orcest.orchestrator.event_relay).
     # None disables the relay (default; matches trace_archive_path's pattern).
     monitor_ingest_url: str | None = None
@@ -165,6 +188,11 @@ class OrchestratorConfig:
     # Default 0 ships in observation mode -- an operator opts into
     # autonomous kills by setting a positive per-hour budget.
     max_kills_per_hour: int = 0
+    # Read-only GitHub issue delivery verifier (YAML block
+    # `issue_delivery_verifier:`), run on the completed-issue result path.
+    issue_delivery_verifier: IssueDeliveryVerifierConfig = field(
+        default_factory=IssueDeliveryVerifierConfig
+    )
 
 
 @dataclass
@@ -751,8 +779,11 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
 
     # Labels
     labels_raw = {k.replace("-", "_"): v for k, v in _safe_dict(raw, "labels").items()}
+    unsupported_label_keys = sorted(set(labels_raw) - {"needs_human", "ready"})
+    if unsupported_label_keys:
+        joined_keys = ", ".join(unsupported_label_keys)
+        raise ValueError(f"Unsupported labels config key(s): {joined_keys}")
     labels_config = LabelConfig(
-        blocked=_safe_str(labels_raw.get("blocked", "orcest:blocked"), "labels.blocked"),
         needs_human=_safe_str(
             labels_raw.get("needs_human", "orcest:needs-human"), "labels.needs_human"
         ),
@@ -839,6 +870,68 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
             f"when health_check_url is set, got {deployment_config.health_check_timeout}"
         )
 
+    # Durable GitHub issue delivery verifier
+    issue_delivery_verifier_raw = _safe_dict(raw, "issue_delivery_verifier")
+    _idv_defaults = IssueDeliveryVerifierConfig()
+    issue_delivery_verifier_config = IssueDeliveryVerifierConfig(
+        enabled=_safe_bool(
+            issue_delivery_verifier_raw.get("enabled", _idv_defaults.enabled),
+            "issue_delivery_verifier.enabled",
+        ),
+        grace_seconds=_safe_int(
+            issue_delivery_verifier_raw.get("grace_seconds", _idv_defaults.grace_seconds),
+            "issue_delivery_verifier.grace_seconds",
+        ),
+        backoff_initial_seconds=_safe_int(
+            issue_delivery_verifier_raw.get(
+                "backoff_initial_seconds", _idv_defaults.backoff_initial_seconds
+            ),
+            "issue_delivery_verifier.backoff_initial_seconds",
+        ),
+        backoff_max_seconds=_safe_int(
+            issue_delivery_verifier_raw.get(
+                "backoff_max_seconds", _idv_defaults.backoff_max_seconds
+            ),
+            "issue_delivery_verifier.backoff_max_seconds",
+        ),
+        scheduler_batch_size=_safe_int(
+            issue_delivery_verifier_raw.get(
+                "scheduler_batch_size", _idv_defaults.scheduler_batch_size
+            ),
+            "issue_delivery_verifier.scheduler_batch_size",
+        ),
+        oldest_pending_alert_seconds=_safe_int(
+            issue_delivery_verifier_raw.get(
+                "oldest_pending_alert_seconds", _idv_defaults.oldest_pending_alert_seconds
+            ),
+            "issue_delivery_verifier.oldest_pending_alert_seconds",
+        ),
+        page_cap=_safe_int(
+            issue_delivery_verifier_raw.get("page_cap", _idv_defaults.page_cap),
+            "issue_delivery_verifier.page_cap",
+        ),
+        ineffective_cooldown_seconds=_safe_int(
+            issue_delivery_verifier_raw.get(
+                "ineffective_cooldown_seconds", _idv_defaults.ineffective_cooldown_seconds
+            ),
+            "issue_delivery_verifier.ineffective_cooldown_seconds",
+        ),
+    )
+    if issue_delivery_verifier_config.grace_seconds < 0:
+        raise ValueError("issue_delivery_verifier.grace_seconds must be >= 0")
+    if issue_delivery_verifier_config.backoff_initial_seconds < 1:
+        raise ValueError("issue_delivery_verifier.backoff_initial_seconds must be >= 1")
+    if issue_delivery_verifier_config.backoff_max_seconds < 1:
+        raise ValueError("issue_delivery_verifier.backoff_max_seconds must be >= 1")
+    if issue_delivery_verifier_config.scheduler_batch_size < 1:
+        raise ValueError("issue_delivery_verifier.scheduler_batch_size must be >= 1")
+    if issue_delivery_verifier_config.oldest_pending_alert_seconds < 1:
+        raise ValueError("issue_delivery_verifier.oldest_pending_alert_seconds must be >= 1")
+    if issue_delivery_verifier_config.page_cap < 1:
+        raise ValueError("issue_delivery_verifier.page_cap must be >= 1")
+    if issue_delivery_verifier_config.ineffective_cooldown_seconds < 0:
+        raise ValueError("issue_delivery_verifier.ineffective_cooldown_seconds must be >= 0")
+
     # Seconds a pending check can be stuck before being re-triggered (default 2 hours)
     stale_pending_timeout_seconds = _safe_int(
         raw.get("stale_pending_timeout_seconds", 7200), "stale_pending_timeout_seconds"
@@ -869,6 +962,14 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         trace_archive_path: str | None = None
     else:
         trace_archive_path = _safe_str(trace_archive_raw, "trace_archive_path").strip()
+
+    workflow_state_root_raw = raw.get("workflow_state_root")
+    if workflow_state_root_raw is None:
+        workflow_state_root: str | None = None
+    else:
+        workflow_state_root = (
+            _safe_str(workflow_state_root_raw, "workflow_state_root").strip() or None
+        )
 
     # Optional monitor ingest URL for the EventRelay. YAML null or absent →
     # relay disabled, same pattern as trace_archive_path above.
@@ -924,12 +1025,14 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         task_key_prefix=task_key_prefix,
         providers=top_providers,
         trace_archive_path=trace_archive_path,
+        workflow_state_root=workflow_state_root,
         monitor_ingest_url=monitor_ingest_url,
         monitor_write_token_env=monitor_write_token_env,
         pressure_min_tasks=pressure_min_tasks,
         pressure_window=pressure_window,
         pressure_hold=pressure_hold,
         max_kills_per_hour=max_kills_per_hour,
+        issue_delivery_verifier=issue_delivery_verifier_config,
     )
 
     # Validate required fields

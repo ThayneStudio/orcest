@@ -65,7 +65,7 @@ def test_load_orchestrator_config_from_yaml(tmp_path: Path):
         "polling:\n"
         "  interval: 30\n"
         "labels:\n"
-        "  blocked: custom:blocked\n"
+        "  ready: custom:ready\n"
     )
 
     config = load_orchestrator_config(cfg_file)
@@ -76,7 +76,7 @@ def test_load_orchestrator_config_from_yaml(tmp_path: Path):
     assert config.github.token == "ghp_yaml_token"
     assert config.github.repo == "acme/widgets"
     assert config.polling.interval == 30
-    assert config.labels.blocked == "custom:blocked"
+    assert config.labels.ready == "custom:ready"
     # Non-overridden label keeps its default
     assert config.labels.needs_human == "orcest:needs-human"
     assert config.max_transient_failures == 5
@@ -109,6 +109,28 @@ def test_load_orchestrator_config_max_transient_failures_from_yaml(tmp_path: Pat
     config = load_orchestrator_config(cfg_file)
 
     assert config.max_transient_failures == 7
+
+
+def test_load_orchestrator_config_workflow_state_root(tmp_path: Path):
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\nworkflow_state_root: /var/lib/orcest/workflow\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.workflow_state_root == "/var/lib/orcest/workflow"
+
+
+def test_load_orchestrator_config_blank_workflow_state_root_disables_lookup(
+    tmp_path: Path,
+):
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text('github:\n  repo: acme/widgets\nworkflow_state_root: ""\n')
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.workflow_state_root is None
 
 
 def test_load_orchestrator_config_max_transient_failures_env_override(tmp_path: Path, monkeypatch):
@@ -308,6 +330,49 @@ def test_delete_branch_on_merge_null_raises(tmp_path: Path):
     cfg_file.write_text("github:\n  repo: acme/widgets\ndelete_branch_on_merge: null\n")
 
     with pytest.raises(ValueError, match="explicitly set to null"):
+        load_orchestrator_config(cfg_file)
+
+
+def test_issue_delivery_verifier_defaults_enabled_when_absent(tmp_path: Path):
+    """An absent issue_delivery_verifier block defaults enabled to True."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text("github:\n  repo: acme/widgets\n")
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.issue_delivery_verifier.enabled is True
+
+
+def test_issue_delivery_verifier_defaults_enabled_when_empty_block(tmp_path: Path):
+    """An empty issue_delivery_verifier block defaults enabled to True."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text("github:\n  repo: acme/widgets\nissue_delivery_verifier: {}\n")
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.issue_delivery_verifier.enabled is True
+
+
+def test_issue_delivery_verifier_enabled_false_from_yaml(tmp_path: Path):
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\nissue_delivery_verifier:\n  enabled: false\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.issue_delivery_verifier.enabled is False
+
+
+@pytest.mark.parametrize("enabled_yaml", ['"false"', "0", "null"])
+def test_issue_delivery_verifier_enabled_rejects_non_bool(tmp_path: Path, enabled_yaml: str):
+    """Quoted strings, integers, and explicit null are rejected via _safe_bool."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        f"github:\n  repo: acme/widgets\nissue_delivery_verifier:\n  enabled: {enabled_yaml}\n"
+    )
+
+    with pytest.raises(ValueError, match="issue_delivery_verifier.enabled"):
         load_orchestrator_config(cfg_file)
 
 
@@ -956,18 +1021,21 @@ def test_labels_hyphenated_yaml_keys_are_accepted(tmp_path: Path):
     """YAML keys with hyphens (e.g. needs-human) should be treated the same as underscores."""
     cfg_file = tmp_path / "orcest.yaml"
     cfg_file.write_text(
-        "github:\n"
-        "  repo: acme/widgets\n"
-        "labels:\n"
-        "  needs-human: custom:needs-human\n"
-        "  blocked: custom:blocked\n"
+        "github:\n  repo: acme/widgets\nlabels:\n  needs-human: custom:needs-human\n"
     )
 
     config = load_orchestrator_config(cfg_file)
 
     assert config.labels.needs_human == "custom:needs-human"
-    assert config.labels.blocked == "custom:blocked"
     assert config.labels.ready == "orcest:ready"
+
+
+def test_unsupported_label_config_key_is_rejected(tmp_path: Path):
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text("github:\n  repo: acme/widgets\nlabels:\n  unsupported-key: custom:value\n")
+
+    with pytest.raises(ValueError, match=r"Unsupported labels config key.*unsupported_key"):
+        load_orchestrator_config(cfg_file)
 
 
 def test_runner_hyphenated_yaml_keys_are_accepted_orchestrator(tmp_path: Path):

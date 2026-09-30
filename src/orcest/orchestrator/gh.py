@@ -13,11 +13,17 @@ import re
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+_LABEL_ALREADY_ABSENT_RE = re.compile(
+    r"(?:gh:\s+label\s+does\s+not\s+exist\s+\(http\s+404\)"
+    r"|label\s+(?:'[^'\r\n]+'|\"[^\"\r\n]+\")\s+not\s+found)",
+    re.IGNORECASE,
+)
 
 _MAX_PAGES = 50  # safety cap; each page fetches up to 100 threads (50 × 100 = 5 000 total)
 
@@ -29,6 +35,10 @@ class GhCliError(Exception):
         super().__init__(message)
         self.stderr = stderr
         self.returncode = returncode
+
+
+class GhStaleSnapshotError(GhCliError):
+    """GitHub data no longer matches the PR snapshot being evaluated."""
 
 
 class GhRateLimitError(GhCliError):
@@ -49,6 +59,32 @@ class GhNotInstalledError(GhCliError):
     """Raised when the gh CLI binary is not found on PATH."""
 
 
+def _label_already_absent(stderr: str | None) -> bool:
+    """True when `stderr` means a label-removal target was already gone.
+
+    Accept exactly two response families: gh's current REST error for a
+    missing label (``gh: Label does not exist (HTTP 404)``), and the legacy
+    quoted-label form (``label 'x' not found``). Keeping these as explicit
+    alternatives avoids accidentally accepting undocumented hybrids such as
+    ``Label does not exist`` without a status. Additional lines or context are
+    rejected so permission, authentication, repository, and server failures
+    cannot be hidden by incidental label wording.
+    """
+    return _LABEL_ALREADY_ABSENT_RE.fullmatch((stderr or "").strip()) is not None
+
+
+@dataclass(frozen=True)
+class PRReviewSnapshot:
+    """Strictly validated review evidence for one PR head."""
+
+    head_sha: str
+    state: str
+    is_draft: bool
+    labels: tuple[str, ...]
+    review_decision: str
+    has_current_head_approval: bool
+
+
 def _validate_repo(repo: str) -> None:
     """Validate that repo matches the expected 'owner/repo' format.
 
@@ -59,6 +95,86 @@ def _validate_repo(repo: str) -> None:
             f"Invalid repo format: {repo!r}. Expected 'owner/repo' with "
             "alphanumeric characters, hyphens, underscores, and dots only."
         )
+
+
+def _require_nonempty_sha(value: str | None, *, field: str = "head SHA") -> str:
+    if not isinstance(value, str) or not value:
+        raise GhCliError(f"Missing or empty {field}")
+    return value
+
+
+def _parse_json_object(output: str, *, context: str) -> dict[str, Any]:
+    if not output:
+        raise GhCliError(f"{context} returned empty response")
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError as e:
+        raise GhCliError(f"Failed to parse gh output as JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise GhCliError(f"{context} returned non-object JSON")
+    if "errors" in data:
+        errors = data["errors"]
+        if isinstance(errors, list):
+            msgs = [e.get("message", str(e)) if isinstance(e, dict) else str(e) for e in errors]
+        else:
+            msgs = [str(errors)]
+        raise GhCliError(f"{context} returned GraphQL errors: {'; '.join(msgs)}")
+    return data
+
+
+def _require_object(value: Any, *, field: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise GhCliError(f"Malformed GitHub response: {field} must be an object")
+    return value
+
+
+def _require_list(value: Any, *, field: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise GhCliError(f"Malformed GitHub response: {field} must be a list")
+    return value
+
+
+def _require_bool(value: Any, *, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise GhCliError(f"Malformed GitHub response: {field} must be a boolean")
+    return value
+
+
+def _require_str(value: Any, *, field: str, allow_empty: bool = True) -> str:
+    if not isinstance(value, str) or (not allow_empty and not value):
+        raise GhCliError(f"Malformed GitHub response: {field} must be a string")
+    return value
+
+
+def _pull_request_from_graphql(data: dict[str, Any], *, repo: str, number: int) -> dict[str, Any]:
+    root_data = data.get("data")
+    if root_data is None:
+        raise GhCliError(
+            f"GraphQL returned null repository for {repo!r} -- "
+            "check that the repo exists and the token has access"
+        )
+    root = _require_object(root_data, field="data")
+    repo_data = root.get("repository")
+    if repo_data is None:
+        raise GhCliError(
+            f"GraphQL returned null repository for {repo!r} -- "
+            "check that the repo exists and the token has access"
+        )
+    repository = _require_object(repo_data, field="data.repository")
+    pr_node = repository.get("pullRequest")
+    if pr_node is None:
+        raise GhCliError(f"GraphQL returned null pullRequest for PR #{number} in {repo}")
+    return _require_object(pr_node, field="data.repository.pullRequest")
+
+
+def _require_connection(
+    value: Any, *, field: str
+) -> tuple[dict[str, Any], list[Any], dict[str, Any]]:
+    connection = _require_object(value, field=field)
+    page_info = _require_object(connection.get("pageInfo"), field=f"{field}.pageInfo")
+    nodes = _require_list(connection.get("nodes"), field=f"{field}.nodes")
+    _require_bool(page_info.get("hasNextPage"), field=f"{field}.pageInfo.hasNextPage")
+    return connection, nodes, page_info
 
 
 _GH_TIMEOUT_SECONDS = 120
@@ -169,7 +285,7 @@ def _run_gh(args: list[str], token: str) -> str:
 def list_open_prs(repo: str, token: str, limit: int = 100) -> list[dict]:
     """List open PRs, sorted oldest first.
 
-    Returns list of dicts with keys: number, title, headRefName,
+    Returns list of dicts with keys: number, title, body, headRefName,
     baseRefName, headRefOid, isDraft, createdAt, labels, reviewDecision,
     mergeable, mergeStateStatus.
 
@@ -197,6 +313,7 @@ query($owner: String!, $repo: String!, $first: Int!, $after: String) {
       nodes {
         number
         title
+        body
         headRefName
         baseRefName
         headRefOid
@@ -322,12 +439,23 @@ def get_pr(repo: str, number: int, token: str) -> dict:
         raise GhCliError(f"Failed to parse gh output as JSON: {e}") from e
 
 
-def get_ci_status(repo: str, pr_number: int, token: str) -> list[dict]:
+def get_ci_status(
+    repo: str,
+    pr_number: int,
+    token: str,
+    *,
+    expected_head_sha: str | None = None,
+) -> list[dict]:
     """Get CI check runs for a PR.
 
     Returns list of dicts with: name, status, conclusion, detailsUrl.
     """
     _validate_repo(repo)
+    json_fields = "statusCheckRollup"
+    if expected_head_sha is not None:
+        _require_nonempty_sha(expected_head_sha, field="expected_head_sha")
+        json_fields = "headRefOid,statusCheckRollup"
+
     output = _run_gh(
         [
             "pr",
@@ -336,17 +464,174 @@ def get_ci_status(repo: str, pr_number: int, token: str) -> list[dict]:
             "--repo",
             repo,
             "--json",
-            "statusCheckRollup",
+            json_fields,
         ],
         token,
     )
-    if not output:
+    if not output and expected_head_sha is None:
         return []
-    try:
-        data = json.loads(output)
-    except json.JSONDecodeError as e:
-        raise GhCliError(f"Failed to parse gh output as JSON: {e}") from e
-    return data.get("statusCheckRollup") or []
+    data = _parse_json_object(output, context=f"gh pr view CI status for PR #{pr_number}")
+    if expected_head_sha is not None:
+        head_sha = _require_nonempty_sha(data.get("headRefOid"), field="headRefOid")
+        if head_sha != expected_head_sha:
+            raise GhStaleSnapshotError(
+                f"PR #{pr_number} head changed while fetching CI status "
+                f"(expected {expected_head_sha}, got {head_sha})"
+            )
+    checks = data.get("statusCheckRollup") or []
+    if not isinstance(checks, list):
+        raise GhCliError("Malformed GitHub response: statusCheckRollup must be a list")
+    return checks
+
+
+def get_review_snapshot(
+    repo: str,
+    number: int,
+    token: str,
+    *,
+    expected_head_sha: str,
+) -> PRReviewSnapshot:
+    """Fetch current-head review evidence with strict pagination validation."""
+    _validate_repo(repo)
+    expected_head_sha = _require_nonempty_sha(expected_head_sha, field="expected_head_sha")
+    owner, name = repo.split("/", 1)
+
+    query = """
+query($owner: String!, $repo: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      headRefOid
+      state
+      isDraft
+      reviewDecision
+      labels(first: 100) {
+        pageInfo { hasNextPage }
+        nodes { name }
+      }
+      latestOpinionatedReviews(first: 100, after: $after, writersOnly: true) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          state
+          author { login }
+          authorCanPushToRepository
+          commit { oid }
+        }
+      }
+    }
+  }
+}
+"""
+
+    cursor: str | None = None
+    page_count = 0
+    baseline: tuple[str, bool, tuple[str, ...], str] | None = None
+
+    while page_count < _MAX_PAGES:
+        page_count += 1
+        args = [
+            "api",
+            "graphql",
+            "-f",
+            f"owner={owner}",
+            "-f",
+            f"repo={name}",
+            "-F",
+            f"number={number}",
+            "-f",
+            f"query={query}",
+        ]
+        if cursor is not None:
+            args.extend(["-f", f"after={cursor}"])
+
+        output = _run_gh(args, token)
+        data = _parse_json_object(output, context=f"review snapshot for PR #{number}")
+        pr_node = _pull_request_from_graphql(data, repo=repo, number=number)
+        head_sha = _require_nonempty_sha(pr_node.get("headRefOid"), field="headRefOid")
+        if head_sha != expected_head_sha:
+            raise GhStaleSnapshotError(
+                f"PR #{number} head changed while fetching review snapshot "
+                f"(expected {expected_head_sha}, got {head_sha})"
+            )
+        state = _require_str(pr_node.get("state"), field="pullRequest.state", allow_empty=False)
+        is_draft = _require_bool(pr_node.get("isDraft"), field="pullRequest.isDraft")
+        if "reviewDecision" not in pr_node:
+            raise GhCliError("Malformed GitHub response: pullRequest.reviewDecision is missing")
+        review_decision_raw = pr_node.get("reviewDecision")
+        if review_decision_raw is None:
+            review_decision = ""
+        else:
+            review_decision = _require_str(review_decision_raw, field="pullRequest.reviewDecision")
+
+        _labels_conn, label_nodes, label_page = _require_connection(
+            pr_node.get("labels"), field="pullRequest.labels"
+        )
+        if label_page.get("hasNextPage"):
+            raise GhCliError(f"PR #{number} in {repo} has more than 100 labels")
+        labels: list[str] = []
+        for label in label_nodes:
+            label_node = _require_object(label, field="pullRequest.labels.nodes[]")
+            labels.append(_require_str(label_node.get("name"), field="label.name"))
+        label_tuple = tuple(labels)
+
+        current = (state, is_draft, label_tuple, review_decision)
+        if baseline is None:
+            baseline = current
+        elif current != baseline:
+            raise GhStaleSnapshotError(
+                f"PR #{number} review snapshot metadata changed during pagination"
+            )
+
+        _reviews_conn, review_nodes, page_info = _require_connection(
+            pr_node.get("latestOpinionatedReviews"),
+            field="pullRequest.latestOpinionatedReviews",
+        )
+        for review in review_nodes:
+            review_node = _require_object(
+                review, field="pullRequest.latestOpinionatedReviews.nodes[]"
+            )
+            review_state = _require_str(review_node.get("state"), field="review.state")
+            author_can_push = _require_bool(
+                review_node.get("authorCanPushToRepository"),
+                field="review.authorCanPushToRepository",
+            )
+            if "commit" not in review_node:
+                raise GhCliError("Malformed GitHub response: review.commit is missing")
+            commit = review_node.get("commit")
+            commit_oid = ""
+            if commit is not None:
+                commit_obj = _require_object(commit, field="review.commit")
+                commit_oid = _require_str(commit_obj.get("oid"), field="review.commit.oid")
+            if review_state == "APPROVED" and author_can_push and commit_oid == expected_head_sha:
+                assert baseline is not None
+                return PRReviewSnapshot(
+                    head_sha=head_sha,
+                    state=baseline[0],
+                    is_draft=baseline[1],
+                    labels=baseline[2],
+                    review_decision=baseline[3],
+                    has_current_head_approval=True,
+                )
+
+        if page_info.get("hasNextPage"):
+            cursor_value = page_info.get("endCursor")
+            if not isinstance(cursor_value, str) or not cursor_value:
+                raise GhCliError(f"PR #{number} review snapshot pagination missing endCursor")
+            cursor = cursor_value
+            continue
+
+        assert baseline is not None
+        return PRReviewSnapshot(
+            head_sha=head_sha,
+            state=baseline[0],
+            is_draft=baseline[1],
+            labels=baseline[2],
+            review_decision=baseline[3],
+            has_current_head_approval=False,
+        )
+
+    raise GhCliError(
+        f"PR #{number} review snapshot reached MAX_PAGES ({_MAX_PAGES}) before completion"
+    )
 
 
 def get_pr_diff(repo: str, number: int, token: str) -> str:
@@ -501,7 +786,7 @@ def remove_label(repo: str, number: int, label: str, token: str) -> None:
             token,
         )
     except GhCliError as exc:
-        if "not found" in (exc.stderr or "").lower():
+        if _label_already_absent(exc.stderr):
             logger.debug(
                 "remove_label: label %r not on #%d, ignoring",
                 label,
@@ -577,14 +862,15 @@ def merge_pr(
         delete_branch: Whether to delete the head branch after merging.
             Defaults to True. Set to False if branch protection rules
             prevent deletion or if you prefer to keep branches post-merge.
-        head_sha: Expected PR head SHA. When provided, GitHub rejects the
-            merge if the branch head changed after discovery.
+        head_sha: Expected PR head SHA. GitHub rejects the merge if the branch
+            head changed after discovery.
     """
     if method not in _VALID_MERGE_METHODS:
         raise ValueError(
             f"Invalid merge method: {method!r}. Must be one of {sorted(_VALID_MERGE_METHODS)}."
         )
     _validate_repo(repo)
+    head_sha = _require_nonempty_sha(head_sha, field="head_sha")
     args = [
         "pr",
         "merge",
@@ -595,12 +881,17 @@ def merge_pr(
     ]
     if delete_branch:
         args.append("--delete-branch")
-    if head_sha:
-        args.extend(["--match-head-commit", head_sha])
+    args.extend(["--match-head-commit", head_sha])
     _run_gh(args, token)
 
 
-def get_unresolved_review_threads(repo: str, number: int, token: str) -> list[dict]:
+def get_unresolved_review_threads(
+    repo: str,
+    number: int,
+    token: str,
+    *,
+    expected_head_sha: str | None = None,
+) -> list[dict]:
     """Get unresolved review threads on a PR.
 
     Uses the GitHub GraphQL API to fetch review threads and filters
@@ -610,12 +901,15 @@ def get_unresolved_review_threads(repo: str, number: int, token: str) -> list[di
     Each comment dict has keys: id, author, body, createdAt, updatedAt.
     """
     _validate_repo(repo)
+    if expected_head_sha is not None:
+        expected_head_sha = _require_nonempty_sha(expected_head_sha, field="expected_head_sha")
     owner, name = repo.split("/", 1)
 
     query = """
 query($owner: String!, $repo: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
+      headRefOid
       reviewThreads(first: 100, after: $after) {
         pageInfo { hasNextPage endCursor }
         nodes {
@@ -663,35 +957,23 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
             args.extend(["-f", f"after={cursor}"])
 
         output = _run_gh(args, token)
+        data = _parse_json_object(output, context=f"review threads for PR #{number}")
+        pr_node = _pull_request_from_graphql(data, repo=repo, number=number)
+        if expected_head_sha is not None:
+            head_sha = _require_nonempty_sha(pr_node.get("headRefOid"), field="headRefOid")
+            if head_sha != expected_head_sha:
+                raise GhStaleSnapshotError(
+                    f"PR #{number} head changed while fetching review threads "
+                    f"(expected {expected_head_sha}, got {head_sha})"
+                )
+        review_threads, nodes, page_info = _require_connection(
+            pr_node.get("reviewThreads"), field="pullRequest.reviewThreads"
+        )
+        for node in nodes:
+            thread_node = _require_object(node, field="pullRequest.reviewThreads.nodes[]")
+            _require_bool(thread_node.get("isResolved"), field="reviewThread.isResolved")
+            all_thread_nodes.append(thread_node)
 
-        if not output:
-            raise GhCliError(f"GraphQL query returned empty response for PR #{number} in {repo}")
-
-        try:
-            data = json.loads(output)
-        except json.JSONDecodeError as e:
-            raise GhCliError(f"Failed to parse gh output as JSON: {e}") from e
-
-        # GraphQL can return HTTP 200 with errors in the body. Raise so
-        # callers don't mistake a failed query for "no threads" (which
-        # could trigger an incorrect auto-merge).
-        if "errors" in data:
-            msgs = [e.get("message", str(e)) for e in data["errors"]]
-            raise GhCliError(f"GraphQL errors fetching review threads: {'; '.join(msgs)}")
-
-        repo_data = (data.get("data") or {}).get("repository")
-        if not repo_data:
-            raise GhCliError(
-                f"GraphQL returned null repository for {repo!r} — "
-                "check that the repo exists and the token has access"
-            )
-        pr_node = repo_data.get("pullRequest")
-        if not pr_node:
-            raise GhCliError(f"GraphQL returned null pullRequest for PR #{number} in {repo}")
-        review_threads = pr_node.get("reviewThreads") or {}
-        all_thread_nodes.extend(review_threads.get("nodes") or [])
-
-        page_info = review_threads.get("pageInfo") or {}
         if page_info.get("hasNextPage"):
             if cursor is None:
                 logger.warning(
@@ -700,37 +982,34 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
                     repo,
                 )
             cursor = page_info.get("endCursor")
-            if not cursor:
-                # Safety guard: hasNextPage is True but no cursor returned.
-                logger.warning(
-                    "PR #%d in %s: hasNextPage is True but endCursor is missing; "
-                    "stopping pagination with %d threads fetched so far",
-                    number,
-                    repo,
-                    len(all_thread_nodes),
-                )
-                break
+            if not isinstance(cursor, str) or not cursor:
+                raise GhCliError(f"PR #{number} review thread pagination missing endCursor")
         else:
             break
     else:
         # Loop exhausted _MAX_PAGES without a natural break.
         page_info = review_threads.get("pageInfo") or {}
         if page_info.get("hasNextPage"):
-            logger.warning(
-                "PR #%d in %s: reached MAX_PAGES (%d) pagination limit; "
-                "some review threads may have been truncated (%d fetched so far)",
-                number,
-                repo,
-                _MAX_PAGES,
-                len(all_thread_nodes),
+            raise GhCliError(
+                f"PR #{number} review threads reached MAX_PAGES ({_MAX_PAGES}) before completion"
             )
 
     results = []
     for thread in all_thread_nodes:
         if thread.get("isResolved"):
             continue
-        comments_data = thread.get("comments") or {}
+        raw_comments_data = thread.get("comments")
+        if raw_comments_data is None:
+            comments_data: dict[str, Any] = {}
+        elif isinstance(raw_comments_data, dict):
+            comments_data = raw_comments_data
+        else:
+            raise GhCliError("Malformed GitHub response: reviewThread.comments must be an object")
         comment_page = comments_data.get("pageInfo") or {}
+        if comment_page and not isinstance(comment_page, dict):
+            raise GhCliError(
+                "Malformed GitHub response: reviewThread.comments.pageInfo must be an object"
+            )
         if comment_page.get("hasPreviousPage"):
             thread_id = thread.get("id", "<unknown>")
             logger.warning(
@@ -738,8 +1017,19 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
                 thread_id,
             )
         comments = []
-        for comment in comments_data.get("nodes") or []:
+        comment_nodes = comments_data.get("nodes") or []
+        if not isinstance(comment_nodes, list):
+            raise GhCliError(
+                "Malformed GitHub response: reviewThread.comments.nodes must be a list"
+            )
+        for comment in comment_nodes:
+            if not isinstance(comment, dict):
+                raise GhCliError(
+                    "Malformed GitHub response: reviewThread.comments.nodes[] must be an object"
+                )
             author_info = comment.get("author") or {}
+            if not isinstance(author_info, dict):
+                raise GhCliError("Malformed GitHub response: comment.author must be an object")
             comments.append(
                 {
                     "id": comment.get("id", ""),
@@ -895,7 +1185,7 @@ def get_issue(repo: str, number: int, token: str) -> dict:
             "--repo",
             repo,
             "--json",
-            "number,title,body,labels,assignees",
+            "number,title,body,labels,assignees,state",
         ],
         token,
     )
@@ -994,7 +1284,7 @@ def remove_issue_label(repo: str, number: int, label: str, token: str) -> None:
             token,
         )
     except GhCliError as exc:
-        if "not found" in (exc.stderr or "").lower():
+        if _label_already_absent(exc.stderr):
             logger.debug(
                 "remove_issue_label: label %r not on issue #%d, ignoring",
                 label,

@@ -14,6 +14,7 @@ import signal
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import redis
@@ -23,6 +24,17 @@ from orcest.orchestrator.deployment import DeploymentError, run_deployment
 from orcest.orchestrator.event_relay import EventRelay
 from orcest.orchestrator.fleet_health import FleetHealthMonitor
 from orcest.orchestrator.gh import GhRateLimitError
+from orcest.orchestrator.issue_delivery import (
+    ROUTE_COMPLETED_VERIFY,
+    AdmissionKind,
+    admit_completed_verification_job,
+    admit_issue_result,
+    apply_admission_conflict,
+    process_due_delivery_state_gc,
+    process_due_verification_jobs,
+    quarantine_job_admission_mismatch,
+    reconcile_verification_due_index,
+)
 from orcest.orchestrator.issue_ops import (
     IssueAction,
     clear_attempts as clear_issue_attempts,
@@ -32,6 +44,7 @@ from orcest.orchestrator.issue_ops import (
 from orcest.orchestrator.pr_ops import (
     PRAction,
     PRState,
+    classify_ci_checks,
     clear_attempts,
     clear_attempts_if_head_sha,
     clear_review_retrigger,
@@ -44,6 +57,10 @@ from orcest.orchestrator.pr_ops import (
     set_stale_retrigger_sha,
     set_usage_exhausted_cooldown,
 )
+from orcest.orchestrator.provider_capacity import (
+    CapacityReservation,
+    reserve_provider_capacity,
+)
 from orcest.orchestrator.provider_pool import ProviderPool, provider_credential_is_usable
 from orcest.orchestrator.task_publisher import (
     publish_fix_task,
@@ -54,7 +71,13 @@ from orcest.orchestrator.task_publisher import (
 )
 from orcest.orchestrator.trace_archiver import TraceArchiver
 from orcest.orchestrator.usage_check import get_token_reset_time
-from orcest.shared.config import LabelConfig, OrchestratorConfig, ProjectConfig
+from orcest.shared import work_observations as work_view
+from orcest.shared.config import (
+    IssueDeliveryVerifierConfig,
+    LabelConfig,
+    OrchestratorConfig,
+    ProjectConfig,
+)
 from orcest.shared.coordination import (
     clear_backoff,
     clear_pending_task_if_matches,
@@ -68,6 +91,9 @@ from orcest.shared.logging import setup_logging
 from orcest.shared.models import (
     CONSUMER_GROUP,
     PROVIDER_NAME_RE,
+    RESULTS_CONSUMER_NAME,
+    RESULTS_GROUP,
+    RESULTS_STREAM,
     TRANSIENT_SUMMARY_PREFIX,
     ResultStatus,
     Task,
@@ -77,9 +103,11 @@ from orcest.shared.models import (
 )
 from orcest.shared.providers import ProviderEntry
 from orcest.shared.redis_client import RedisClient, is_redis_oom_error
-
-RESULTS_STREAM = "results"
-RESULTS_GROUP = "orchestrator"
+from orcest.shared.result_stream_health import record_result_consumer_heartbeat
+from orcest.workflow_store import (
+    load_legacy_change_request_exclusion_snapshot,
+    load_legacy_rollout_controls,
+)
 
 # Observability counters (Task 8 hygiene).
 # Per-provider under providers:{provider}: namespace, project-scoped via key_prefix.
@@ -121,6 +149,13 @@ _LEGACY_HEARTBEAT_STALE_FLOOR = 180
 
 class _RetryableResultError(RuntimeError):
     """Result handling failed before its durable side effects committed."""
+
+
+@dataclass(frozen=True)
+class _ProviderSelection:
+    entry: ProviderEntry
+    task_id: str
+    capacity_reservation: CapacityReservation | None = None
 
 
 def _configured_task_providers(
@@ -1053,7 +1088,10 @@ def _mark_usage_exhausted_token(
         logger.info("Rate limit resets at %s (from stream-json)", cooldown_until.isoformat())
     elif entry and is_claude_provider(prov) and entry.credential:
         try:
-            cooldown_until = get_token_reset_time(entry.credential)
+            cooldown_until = get_token_reset_time(
+                entry.credential,
+                observe=lambda data: token_pool.record_usage(entry.account_key(), data),
+            )
         except Exception as e:
             logger.warning("Failed to query token reset time: %s", e)
     marked = token_pool.mark_exhausted(result.task_id, cooldown_until=cooldown_until)
@@ -1262,6 +1300,188 @@ def _back_off_pr_retries(
         reason,
         step,
     )
+
+
+def _merge_evidence_is_current(
+    *,
+    repo: str,
+    token: str,
+    pr_state: PRState,
+    label_config: LabelConfig,
+    logger: logging.Logger,
+) -> bool:
+    """Return True only when fresh same-head evidence still permits merge."""
+    if not pr_state.head_sha:
+        logger.warning(
+            "PR #%d: merge skipped because PRState has empty head SHA",
+            pr_state.number,
+        )
+        return False
+
+    terminal_labels = {label_config.needs_human}
+    try:
+        review_snapshot = gh.get_review_snapshot(
+            repo, pr_state.number, token, expected_head_sha=pr_state.head_sha
+        )
+    except gh.GhStaleSnapshotError:
+        logger.info(
+            "PR #%d: merge skipped because action-time review snapshot head changed",
+            pr_state.number,
+            exc_info=True,
+        )
+        return False
+    except Exception:
+        logger.warning(
+            "PR #%d: merge skipped because action-time review evidence could not be verified",
+            pr_state.number,
+            exc_info=True,
+        )
+        return False
+
+    if review_snapshot.state != "OPEN":
+        logger.info(
+            "PR #%d: merge skipped because action-time PR state is %s",
+            pr_state.number,
+            review_snapshot.state,
+        )
+        return False
+    if review_snapshot.is_draft:
+        logger.info("PR #%d: merge skipped because PR became draft", pr_state.number)
+        return False
+    terminal_present = sorted(set(review_snapshot.labels) & terminal_labels)
+    if terminal_present:
+        logger.info(
+            "PR #%d: merge skipped because terminal label appeared: %s",
+            pr_state.number,
+            terminal_present,
+        )
+        return False
+    if (
+        review_snapshot.review_decision != "APPROVED"
+        or not review_snapshot.has_current_head_approval
+    ):
+        logger.info(
+            "PR #%d: merge skipped because action-time approval eligibility changed "
+            "(decision=%s current_head_approval=%s)",
+            pr_state.number,
+            review_snapshot.review_decision,
+            review_snapshot.has_current_head_approval,
+        )
+        return False
+
+    try:
+        checks = gh.get_ci_status(repo, pr_state.number, token, expected_head_sha=pr_state.head_sha)
+    except gh.GhStaleSnapshotError:
+        logger.info(
+            "PR #%d: merge skipped because action-time CI snapshot head changed",
+            pr_state.number,
+            exc_info=True,
+        )
+        return False
+    except Exception:
+        logger.warning(
+            "PR #%d: merge skipped because action-time CI evidence could not be verified",
+            pr_state.number,
+            exc_info=True,
+        )
+        return False
+
+    ci_state = classify_ci_checks(checks)
+    if not checks or not ci_state.terminal_success:
+        logger.info(
+            "PR #%d: merge skipped because action-time CI eligibility changed "
+            "(checks=%d failures=%d pending=%d)",
+            pr_state.number,
+            len(checks),
+            len(ci_state.failures),
+            len(ci_state.pending),
+        )
+        return False
+
+    try:
+        threads = gh.get_unresolved_review_threads(
+            repo, pr_state.number, token, expected_head_sha=pr_state.head_sha
+        )
+    except gh.GhStaleSnapshotError:
+        logger.info(
+            "PR #%d: merge skipped because action-time thread snapshot head changed",
+            pr_state.number,
+            exc_info=True,
+        )
+        return False
+    except Exception:
+        logger.warning(
+            "PR #%d: merge skipped because action-time thread evidence could not be verified",
+            pr_state.number,
+            exc_info=True,
+        )
+        return False
+    if threads:
+        logger.info(
+            "PR #%d: merge skipped because %d unresolved thread(s) appeared",
+            pr_state.number,
+            len(threads),
+        )
+        return False
+
+    return True
+
+
+def _review_rerun_still_needed(
+    *,
+    repo: str,
+    token: str,
+    pr_state: PRState,
+    label_config: LabelConfig,
+    logger: logging.Logger,
+) -> bool:
+    """Best-effort stale-action guard before rerunning claude-review."""
+    if not pr_state.head_sha:
+        logger.warning(
+            "PR #%d: review rerun skipped because PRState has empty head SHA",
+            pr_state.number,
+        )
+        return False
+    try:
+        snapshot = gh.get_review_snapshot(
+            repo, pr_state.number, token, expected_head_sha=pr_state.head_sha
+        )
+    except gh.GhStaleSnapshotError:
+        logger.info(
+            "PR #%d: review rerun skipped because action became obsolete: head changed",
+            pr_state.number,
+            exc_info=True,
+        )
+        return False
+    except Exception:
+        logger.warning(
+            "PR #%d: review rerun skipped because fresh review snapshot failed",
+            pr_state.number,
+            exc_info=True,
+        )
+        return False
+
+    terminal_labels = {label_config.needs_human}
+    if snapshot.state != "OPEN" or snapshot.is_draft or set(snapshot.labels) & terminal_labels:
+        logger.info(
+            "PR #%d: review rerun skipped because action became obsolete: "
+            "state=%s draft=%s labels=%s",
+            pr_state.number,
+            snapshot.state,
+            snapshot.is_draft,
+            list(snapshot.labels),
+        )
+        return False
+    if snapshot.review_decision == "CHANGES_REQUESTED" or snapshot.has_current_head_approval:
+        logger.info(
+            "PR #%d: review rerun skipped because action became obsolete: "
+            "decision=%s current_head_approval=%s",
+            pr_state.number,
+            snapshot.review_decision,
+            snapshot.has_current_head_approval,
+        )
+        return False
+    return True
 
 
 def _load_fleet_repo_to_project_map(logger: logging.Logger) -> dict[str, str]:
@@ -1698,9 +1918,38 @@ def _poll_cycle(
                 token_pool=pool,
                 max_transient_failures=config.max_transient_failures,
                 shared_credential_redis=task_redis,
+                issue_delivery_verifier=config.issue_delivery_verifier,
             )
         except Exception:
             logger.error("Failed to consume results for %s", project.repo, exc_info=True)
+
+    if config.issue_delivery_verifier.enabled:
+        for project, project_redis in project_clients:
+            try:
+                reconcile_verification_due_index(project_redis)
+                process_due_verification_jobs(
+                    project_redis,
+                    project.repo,
+                    project.token,
+                    config.labels,
+                    config.issue_delivery_verifier,
+                    stream_redis=task_redis,
+                    logger_=logger.getChild(project.repo),
+                )
+            except Exception:
+                logger.error(
+                    "Failed to process issue delivery verification for %s",
+                    project.repo,
+                    exc_info=True,
+                )
+            try:
+                process_due_delivery_state_gc(project_redis, project.repo)
+            except Exception:
+                logger.error(
+                    "Failed to collect terminal issue delivery state for %s",
+                    project.repo,
+                    exc_info=True,
+                )
 
     # M1-conc: reclaim delivered+ACKed task entries (which carry plaintext
     # GitHub PAT + provider credential) once per poll cycle. xtrim_acked_entries
@@ -1788,12 +2037,12 @@ def _poll_project(
     token = project.token
     key_prefix = project.key_prefix
 
-    def _select_provider_entry() -> ProviderEntry | None:
-        """Pick the next ProviderEntry from the pool using the lean surface only
-        (provider/credential/model/identity()).
+    def _select_provider_entry() -> _ProviderSelection | None:
+        """Quota-filter accounts, then reserve a proven backend capacity slot.
 
         Returns None if all entries are exhausted/cooling (caller should skip enqueue
-        and the skip counter is incremented for observability).
+        and the skip counter is incremented for observability), or if no eligible
+        backend has a complete snapshot with effective spare capacity.
 
         Falls back to synthesizing a lean claude entry from project.claude_token when
         no pool was configured for the project (single-token legacy or test paths).
@@ -1831,15 +2080,31 @@ def _poll_project(
                     project.repo,
                 )
                 return None
-            return ProviderEntry(
+            entry = ProviderEntry(
                 provider="claude",
                 credential=cred,
                 model=None,
                 source="legacy_claude_tokens",
             )
+            task_id = str(uuid.uuid4())
+            # Startup normally materializes even one legacy token as a pool,
+            # but direct compatibility callers must obey capacity admission too.
+            backend = _published_provider_for_entry(entry, config.default_runner)
+            capacity_reservation = reserve_provider_capacity(
+                task_redis,
+                [backend],
+                task_id,
+                logger,
+            )
+            if capacity_reservation is None:
+                return None
+            return _ProviderSelection(entry, task_id, capacity_reservation)
 
-        entry = token_pool.next_entry()
-        if entry is None:
+        # Quota/account eligibility is deliberately evaluated before any
+        # operational-capacity score. Multiple eligible credentials for one
+        # backend are collapsed below and never inflate worker capacity.
+        available_entries = token_pool.available_entries()
+        if not available_entries:
             # Increment aggregate (compat) + per-provider exhausted_skip counters
             # (Task 8). Uses only provider name from lean surface.
             try:
@@ -1865,7 +2130,36 @@ def _poll_project(
                     )
             # Debug log includes masked identities only (from pool __repr__)
             logger.debug("Provider pool exhausted during selection: %r", token_pool)
-        return entry
+            return None
+
+        entries_by_backend: dict[str, list[ProviderEntry]] = {}
+        for entry in available_entries:
+            backend = _published_provider_for_entry(entry, config.default_runner)
+            entries_by_backend.setdefault(backend, []).append(entry)
+
+        task_id = str(uuid.uuid4())
+        capacity_reservation = reserve_provider_capacity(
+            task_redis,
+            list(entries_by_backend),
+            task_id,
+            logger,
+        )
+        if capacity_reservation is None:
+            return None
+
+        selected_entry = token_pool.next_entry_from(
+            entries_by_backend[capacity_reservation.provider]
+        )
+        if selected_entry is None:
+            # A same-process cooldown raced the capacity read. Do not hold a
+            # backend slot for an account that is no longer quota eligible.
+            capacity_reservation.release()
+            return None
+        return _ProviderSelection(
+            entry=selected_entry,
+            task_id=task_id,
+            capacity_reservation=capacity_reservation,
+        )
 
     def _register_task(task_id: str, entry: ProviderEntry | str) -> None:
         """Record which provider entry (lean surface) was used for a task id
@@ -1880,7 +2174,7 @@ def _poll_project(
                 )
 
     def _try_publish(
-        entry: ProviderEntry,
+        selection: _ProviderSelection,
         publish_fn: Callable[..., Task | None],
         **publish_kwargs: Any,
     ) -> Task | None:
@@ -1890,45 +2184,110 @@ def _poll_project(
         key_prefix, task_redis. Calls task_completed on None-return or exception.
         Re-raises so callers can do site-specific logging. Returns publish result.
         """
-        task_id = str(uuid.uuid4())
-        _register_task(task_id, entry)
-        # Use the latest written-back credential blob if the CLI rotated it
-        # (OAuth-blob providers). Refresh this account from shared Redis at
-        # handoff time because each project orchestrator has its own local pool.
-        if token_pool is not None:
-            _refresh_shared_credential_override(
-                task_redis,
-                token_pool,
-                entry.account_key(),
-                logger,
-            )
-        cred = (
-            token_pool.effective_credential(entry) if token_pool is not None else entry.credential
-        )
-        published_provider = _published_provider_for_entry(entry, config.default_runner)
+        entry = selection.entry
+        task_id = selection.task_id
         try:
+            _register_task(task_id, entry)
+            # Use the latest written-back credential blob if the CLI rotated it
+            # (OAuth-blob providers). Refresh this account from shared Redis at
+            # handoff time because each project orchestrator has its own local pool.
+            if token_pool is not None:
+                _refresh_shared_credential_override(
+                    task_redis,
+                    token_pool,
+                    entry.account_key(),
+                    logger,
+                )
+            cred = (
+                token_pool.effective_credential(entry)
+                if token_pool is not None
+                else entry.credential
+            )
+            published_provider = _published_provider_for_entry(entry, config.default_runner)
+            capacity_kwargs: dict[str, object] = {}
+            if selection.capacity_reservation is not None:
+                capacity_kwargs["capacity_reservation"] = selection.capacity_reservation
+            publish_credential = "" if omit_raw_task_credentials else cred
             res = publish_fn(
                 **publish_kwargs,
-                claude_token=cred if is_claude_provider(published_provider) else "",
+                **capacity_kwargs,
+                claude_token=(
+                    ""
+                    if omit_raw_task_credentials
+                    else (cred if is_claude_provider(published_provider) else "")
+                ),
                 key_prefix=key_prefix,
                 task_redis=task_redis,
                 provider=published_provider,
-                credential=cred,
+                credential=publish_credential,
                 model=entry.model,
                 task_id=task_id,
                 provider_account=entry.account_key(),
+                omit_raw_credentials=omit_raw_task_credentials,
             )
             if res is None and token_pool is not None:
                 token_pool.task_completed(task_id)
                 _clear_task_provider_account(project_redis, task_id, logger)
+            if res is not None:
+                work_view.queued(project_redis, res)
             return res
         except Exception:
             if token_pool is not None:
                 token_pool.task_completed(task_id)
                 _clear_task_provider_account(project_redis, task_id, logger)
             raise
+        finally:
+            if selection.capacity_reservation is not None:
+                selection.capacity_reservation.release()
 
+    work_view.project_observation(
+        project_redis,
+        repo,
+        config.polling.interval,
+        token_pool,
+    )
     labels = config.labels
+
+    legacy_exclusion_predicate: Callable[..., bool] | None = None
+    legacy_exclusion_unavailable = False
+    v1_owned_project = False
+    legacy_admissions_frozen = False
+    omit_raw_task_credentials = False
+    issue_lookup_unavailable = False
+    workflow_state_root = config.workflow_state_root
+    if workflow_state_root is not None:
+        try:
+            legacy_exclusion_snapshot = load_legacy_change_request_exclusion_snapshot(
+                workflow_state_root,
+                repository_locator=repo,
+            )
+        except Exception:
+            legacy_exclusion_unavailable = True
+            logger.error(
+                "workflow-control v1 ownership snapshot for %s is unavailable; "
+                "excluding unmarked PRs for this poll",
+                repo,
+                exc_info=True,
+            )
+        else:
+            legacy_exclusion_predicate = legacy_exclusion_snapshot.excludes
+        try:
+            rollout_controls = load_legacy_rollout_controls(
+                workflow_state_root,
+                repository_locator=repo,
+            )
+        except Exception:
+            issue_lookup_unavailable = True
+            logger.error(
+                "workflow-control v1 rollout controls for %s are unavailable; "
+                "excluding issue intake for this poll",
+                repo,
+                exc_info=True,
+            )
+        else:
+            v1_owned_project = rollout_controls.issue_intake_engine == "V1"
+            legacy_admissions_frozen = rollout_controls.legacy_admissions_frozen
+            omit_raw_task_credentials = rollout_controls.omit_raw_task_credentials
 
     # Discover PRs needing action
     pr_states = discover_actionable_prs(
@@ -1939,7 +2298,13 @@ def _poll_project(
         max_attempts=config.max_attempts,
         max_total_attempts=config.max_total_attempts,
         stale_pending_timeout_seconds=config.stale_pending_timeout_seconds,
+        legacy_exclusion_predicate=legacy_exclusion_predicate,
+        legacy_exclusion_unavailable=(legacy_exclusion_unavailable or issue_lookup_unavailable),
+        legacy_admissions_frozen=legacy_admissions_frozen,
     )
+
+    for observed_pr in pr_states:
+        work_view.observe(project_redis, repo, "pr", observed_pr)
 
     # Sort: merges first (quick wins), then fixes/followups oldest-first
     # (lowest PR number = longest waiting). Skips don't matter but sort
@@ -1998,6 +2363,14 @@ def _poll_project(
     for pr_state in pr_states:
         if pr_state.action == PRAction.MERGE:
             logger.info("PR #%d (%s): merging", pr_state.number, pr_state.title)
+            if not _merge_evidence_is_current(
+                repo=repo,
+                token=token,
+                pr_state=pr_state,
+                label_config=labels,
+                logger=logger,
+            ):
+                continue
             try:
                 gh.merge_pr(
                     repo,
@@ -2007,6 +2380,7 @@ def _poll_project(
                     head_sha=pr_state.head_sha,
                 )
                 merged += 1
+                work_view.merged(project_redis, repo, pr_state.number)
             except Exception as e:
                 err_msg = _exception_message_with_stderr(e)
                 logger.error(
@@ -2029,7 +2403,7 @@ def _poll_project(
                     entry = _select_provider_entry()
                     if entry is None:
                         logger.warning(
-                            "All providers exhausted, skipping rebase task for PR #%d",
+                            "No provider capacity available, skipping rebase task for PR #%d",
                             pr_state.number,
                         )
                         continue
@@ -2218,7 +2592,7 @@ def _poll_project(
                     entry = _select_provider_entry()
                     if entry is None:
                         logger.warning(
-                            "All providers exhausted, skipping proactive rebase for PR #%d",
+                            "No provider capacity available, skipping proactive rebase for PR #%d",
                             other_pr.number,
                         )
                         continue
@@ -2264,7 +2638,7 @@ def _poll_project(
             entry = _select_provider_entry()
             if entry is None:
                 logger.warning(
-                    "All providers exhausted, skipping fix task for PR #%d",
+                    "No provider capacity available, skipping fix task for PR #%d",
                     pr_state.number,
                 )
             else:
@@ -2296,7 +2670,7 @@ def _poll_project(
             entry = _select_provider_entry()
             if entry is None:
                 logger.warning(
-                    "All providers exhausted, skipping followup task for PR #%d",
+                    "No provider capacity available, skipping followup task for PR #%d",
                     pr_state.number,
                 )
             else:
@@ -2331,7 +2705,7 @@ def _poll_project(
             entry = _select_provider_entry()
             if entry is None:
                 logger.warning(
-                    "All providers exhausted, skipping rebase task for PR #%d",
+                    "No provider capacity available, skipping rebase task for PR #%d",
                     pr_state.number,
                 )
             else:
@@ -2393,6 +2767,14 @@ def _poll_project(
                     "PR #%d: RETRIGGER_REVIEW action but review_run_id is None, skipping",
                     pr_state.number,
                 )
+            elif not _review_rerun_still_needed(
+                repo=repo,
+                token=token,
+                pr_state=pr_state,
+                label_config=labels,
+                logger=logger,
+            ):
+                continue
             elif _review_rerun_failure_cooldown_active(
                 project_redis, repo, pr_state.number, pr_state.head_sha
             ):
@@ -2604,6 +2986,15 @@ def _poll_project(
                 )
         elif pr_state.action == PRAction.SKIP_BACKOFF:
             logger.info("PR #%d: in backoff cooldown, skipping", pr_state.number)
+        elif pr_state.action == PRAction.SKIP_V1_OWNED:
+            logger.debug("PR #%d: reserved for workflow-control v1, skipping", pr_state.number)
+        elif pr_state.action == PRAction.SKIP_LEGACY_FROZEN:
+            logger.debug("PR #%d: legacy admissions frozen, skipping", pr_state.number)
+        elif pr_state.action == PRAction.SKIP_V1_LOOKUP_UNAVAILABLE:
+            logger.debug(
+                "PR #%d: workflow-control v1 ownership lookup unavailable; fail-closed skip",
+                pr_state.number,
+            )
         elif pr_state.action == PRAction.SKIP_DRAFT:
             logger.debug("PR #%d: draft, skipping", pr_state.number)
         elif pr_state.action == PRAction.SKIP_PENDING:
@@ -2656,9 +3047,18 @@ def _poll_project(
                 redis=project_redis,
                 label_config=labels,
                 max_attempts=config.max_attempts,
+                issue_delivery_verifier=config.issue_delivery_verifier,
+                v1_owned_project=v1_owned_project,
+                legacy_admissions_frozen=legacy_admissions_frozen,
+                legacy_exclusion_unavailable=(
+                    legacy_exclusion_unavailable or issue_lookup_unavailable
+                ),
             )
         except Exception as e:
             logger.error(f"Issue discovery failed: {e}", exc_info=True)
+
+    for observed_issue in issue_states:
+        work_view.observe(project_redis, repo, "issue", observed_issue)
 
     # Act on issues
     for issue_state in issue_states:
@@ -2669,7 +3069,7 @@ def _poll_project(
             entry = _select_provider_entry()
             if entry is None:
                 logger.warning(
-                    "All providers exhausted, skipping issue task for issue #%d",
+                    "No provider capacity available, skipping issue task for issue #%d",
                     issue_state.number,
                 )
             else:
@@ -2707,6 +3107,12 @@ def _poll_project(
             )
         elif issue_state.action == IssueAction.SKIP_QUEUED:
             logger.debug(f"Issue #{issue_state.number}: task already queued, skipping")
+        elif issue_state.action == IssueAction.SKIP_VERIFYING:
+            logger.debug(f"Issue #{issue_state.number}: delivery verification in flight, skipping")
+        elif issue_state.action == IssueAction.SKIP_DELIVERY_COOLDOWN:
+            logger.debug(
+                f"Issue #{issue_state.number}: ineffective-delivery cooldown active, skipping"
+            )
         elif issue_state.action == IssueAction.SKIP_LOCKED:
             logger.debug(f"Issue #{issue_state.number}: locked, skipping")
         elif issue_state.action == IssueAction.SKIP_ACTIVE:
@@ -2718,6 +3124,14 @@ def _poll_project(
             )
         elif issue_state.action == IssueAction.SKIP_LABELED:
             logger.debug(f"Issue #{issue_state.number}: terminal label, skipping")
+        elif issue_state.action == IssueAction.SKIP_V1_OWNED:
+            logger.debug(
+                "Issue #%d: reserved for workflow-control v1, skipping", issue_state.number
+            )
+        elif issue_state.action == IssueAction.SKIP_LEGACY_FROZEN:
+            logger.debug("Issue #%d: legacy admissions frozen, skipping", issue_state.number)
+        elif issue_state.action == IssueAction.SKIP_V1_LOOKUP_UNAVAILABLE:
+            logger.debug("Issue #%d: v1 ownership lookup unavailable, skipping", issue_state.number)
         elif issue_state.action == IssueAction.SKIP_DEPENDENCY:
             blockers = ", ".join(issue_state.open_blockers)
             logger.info(
@@ -2730,6 +3144,10 @@ def _poll_project(
                 f"Issue #{issue_state.number}: unhandled action {issue_state.action!r}, skipping"
             )
 
+    seen_work = {work_view.work_key(repo, "pr", s.number) for s in pr_states}
+    seen_work.update(work_view.work_key(repo, "issue", s.number) for s in issue_states)
+    if not issue_streams_all_backed_up or force_issue_discovery:
+        work_view.reconcile_missing(project_redis, repo, token, seen_work)
     return enqueued, merged, len(pr_states), len(issue_states)
 
 
@@ -2741,6 +3159,7 @@ def _consume_results_for_project(
     token_pool: ProviderPool | None = None,
     max_transient_failures: int = 5,
     shared_credential_redis: RedisClient | None = None,
+    issue_delivery_verifier: IssueDeliveryVerifierConfig | None = None,
 ) -> None:
     """Consume any pending results from workers for a single project.
 
@@ -2760,7 +3179,7 @@ def _consume_results_for_project(
     while True:
         entries = redis.xreadgroup(
             group=RESULTS_GROUP,
-            consumer="orchestrator-main",
+            consumer=RESULTS_CONSUMER_NAME,
             stream=RESULTS_STREAM,
             count=10,
             block_ms=None,
@@ -2782,6 +3201,7 @@ def _consume_results_for_project(
                     token_pool=token_pool,
                     max_transient_failures=max_transient_failures,
                     shared_credential_redis=shared_credential_redis,
+                    issue_delivery_verifier=issue_delivery_verifier,
                 )
                 logger.info(f"Recovered pending result {entry_id}")
             except _RetryableResultError as exc:
@@ -2820,7 +3240,7 @@ def _consume_results_for_project(
     while True:
         entries = redis.xreadgroup(
             group=RESULTS_GROUP,
-            consumer="orchestrator-main",
+            consumer=RESULTS_CONSUMER_NAME,
             stream=RESULTS_STREAM,
             count=10,
             block_ms=None,
@@ -2841,6 +3261,7 @@ def _consume_results_for_project(
                     token_pool=token_pool,
                     max_transient_failures=max_transient_failures,
                     shared_credential_redis=shared_credential_redis,
+                    issue_delivery_verifier=issue_delivery_verifier,
                 )
             except _RetryableResultError as exc:
                 logger.warning(
@@ -2870,6 +3291,12 @@ def _consume_results_for_project(
                     exc_info=True,
                 )
 
+    # Redis before 7.2 leaves XINFO CONSUMERS ``idle`` growing while a healthy
+    # consumer polls an empty stream. Record successful consumer-loop passes in
+    # a separate expiring key so health checks do not report that deployment as
+    # dead merely because there was no result to consume.
+    record_result_consumer_heartbeat(redis)
+
 
 def _handle_result(
     project: ProjectConfig,
@@ -2880,6 +3307,7 @@ def _handle_result(
     token_pool: ProviderPool | None = None,
     max_transient_failures: int = 5,
     shared_credential_redis: RedisClient | None = None,
+    issue_delivery_verifier: IssueDeliveryVerifierConfig | None = None,
 ) -> None:
     """Process a single task result.
 
@@ -2888,7 +3316,6 @@ def _handle_result(
     - completed: clears issue attempt counter; PR attempts remain until the SHA changes
     - failed: retried automatically; needs-human is added ONLY when the worker
       explicitly reported a human-decision blocker (result.needs_human)
-    - blocked: adds blocked label
     - usage_exhausted: no label changes; resource resumes after cooldown
     """
     logger.info(
@@ -3153,6 +3580,46 @@ def _handle_result(
         _release_provider_task_tracking()
         return
 
+    verifier_config = issue_delivery_verifier or IssueDeliveryVerifierConfig()
+
+    if is_issue and verifier_config.enabled:
+        try:
+            admission = admit_issue_result(redis, repo, result, logger_=logger)
+        except Exception as exc:
+            raise _RetryableResultError(
+                f"failed to admit issue result for #{resource_id}: {exc}"
+            ) from exc
+        if admission.kind is AdmissionKind.CONFLICT:
+            try:
+                apply_admission_conflict(redis, repo, result, admission, logger_=logger)
+            except Exception as exc:
+                raise _RetryableResultError(
+                    f"failed to apply issue-result conflict for #{resource_id}: {exc}"
+                ) from exc
+            _commit_result_side_effects()
+            return
+        if admission.route == ROUTE_COMPLETED_VERIFY:
+            try:
+                job_admitted = admit_completed_verification_job(
+                    redis, repo, result, admission, verifier_config, logger_=logger
+                )
+            except Exception as exc:
+                raise _RetryableResultError(
+                    f"failed to admit verification job for issue #{resource_id}: {exc}"
+                ) from exc
+            if job_admitted is None:
+                try:
+                    quarantine_job_admission_mismatch(
+                        redis, repo, result, admission, logger_=logger
+                    )
+                except Exception as exc:
+                    raise _RetryableResultError(
+                        "failed to quarantine verification job admission mismatch "
+                        f"for issue #{resource_id}: {exc}"
+                    ) from exc
+            _commit_result_side_effects()
+            return
+
     # Select the right GitHub functions based on resource type
     _add_label = gh.add_issue_label if is_issue else gh.add_label
     _post_comment = gh.post_issue_comment if is_issue else gh.post_comment
@@ -3167,6 +3634,10 @@ def _handle_result(
     # task successes.
     if result.status == ResultStatus.COMPLETED:
         if is_issue:
+            logger.debug(
+                "Issue #%d delivery verifier disabled by config; completing immediately",
+                resource_id,
+            )
             try:
                 clear_issue_attempts(redis, repo, resource_id)
             except Exception as exc:
@@ -3405,21 +3876,7 @@ def _handle_result(
                 exc,
                 side_effect="label",
             )
-    elif result.status == ResultStatus.BLOCKED:
-        try:
-            _add_label(repo, resource_id, labels.blocked, token)
-            labeled = True
-        except Exception as exc:
-            _raise_or_abandon_github_side_effect(
-                redis,
-                result,
-                logger,
-                f"failed to add blocked label on {resource_label} #{resource_id}",
-                exc,
-                side_effect="label",
-            )
-
-    # Only post comments for non-success statuses (failures, blocked, etc.)
+    # Only post comments for non-success statuses.
     # Success is silent to avoid comment noise on PRs/issues.
     if result.status != ResultStatus.COMPLETED:
         safe_summary = result.summary[:500] if result.summary else ""
@@ -3442,19 +3899,6 @@ def _handle_result(
             body = (
                 f"**orcest** needs a human decision on this PR.\n\n"
                 f"The worker reported: {reason}\n\n"
-                f"{label_note}"
-            )
-        elif result.status == ResultStatus.BLOCKED:
-            label_note = (
-                f"Labeling as `{labels.blocked}` — waiting for external input."
-                if labeled
-                else f"Failed to add `{labels.blocked}` label — please triage manually."
-            )
-            body = (
-                f"**orcest** task `{result.task_id}` is blocked "
-                f"({result.duration_seconds}s, "
-                f"worker: {result.worker_id}).\n\n"
-                f"Summary: {safe_summary}\n\n"
                 f"{label_note}"
             )
         elif result.status == ResultStatus.USAGE_EXHAUSTED:
@@ -3504,7 +3948,7 @@ def _handle_result(
     # Clean up ProviderPool tracking. This unconditional trailing call is the
     # safety net guaranteeing the UUID -> identity mapping in
     # ProviderPool._task_identities does NOT leak for any non-USAGE_EXHAUSTED,
-    # non-rebake result path (SUCCEEDED/COMPLETED, needs_human FAILED, BLOCKED,
+    # non-rebake result path (SUCCEEDED/COMPLETED, needs_human FAILED,
     # transient, etc.). mark_exhausted already pops the mapping for exhausted
     # results, so task_completed is a no-op there (safe to call). The durable
     # task -> account mapping is cleared at the same boundary.

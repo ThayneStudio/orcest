@@ -26,7 +26,7 @@ Conditions for automatic merge:
 - All CI checks green
 - No unresolved review comments
 - Branch rebased on latest `main` (no merge commits)
-- No `orcest:blocked` or `orcest:needs-human` labels
+- No `orcest:needs-human` label
 
 Merge strategy: rebase-merge (configurable per repo).
 
@@ -46,14 +46,13 @@ Merge strategy: rebase-merge (configurable per repo).
 ### Merge Conflict Detection
 
 - After any push to `main`, check all open managed PRs for conflicts
-- If conflict detected: post a comment explaining the conflict, add `orcest:blocked` label
+- If conflict detected: post a comment explaining the conflict
 - Create a `REBASE_PR` task in the work queue
 
 ### PR Priority Ordering
 
 - Default ordering: oldest PR first (FIFO)
 - Priority boost for PRs that are one step from mergeable (e.g., CI passing but needs rebase)
-- Deprioritize PRs with `orcest:blocked` label
 - Configurable priority weights
 
 ## Notes

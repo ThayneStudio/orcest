@@ -30,6 +30,9 @@ def test_taxonomy_is_locked_v1_set():
         "task.activity",
         "fleet.pressure",
         "fleet.kill_limit",
+        "issue.result.admitted",
+        "issue.delivery.phase",
+        "issue.delivery.alert",
     }
     assert EVENT_TYPES == frozenset("net.orcest." + s for s in suffixes)
 

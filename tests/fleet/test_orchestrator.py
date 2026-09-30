@@ -1,5 +1,6 @@
 """Tests for orcest.fleet.orchestrator pure functions."""
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from orcest.fleet.orchestrator import (
     generate_orchestrator_config,
     get_deployed_pool_backend,
     get_deployed_pool_vmid_range,
+    get_worker_heartbeat_details,
     get_worker_heartbeats,
     image_exists,
     upload_fleet_config,
@@ -103,6 +105,44 @@ def test_get_worker_heartbeats_returns_backend_and_revision(mocker):
     assert ssh.call_count == 2
 
 
+def test_get_worker_heartbeat_details_returns_provider_cli_metadata(mocker):
+    key = "orcest:workers:heartbeat:orcest-worker-10001"
+    provider_cli = {
+        "schema": 1,
+        "provider": "codex",
+        "desired_version": "0.149.1",
+        "template_version": "0.149.1",
+        "observed_version": "0.131.0",
+        "status": "version_mismatch",
+    }
+    mocker.patch(
+        "orcest.fleet.orchestrator._ssh",
+        side_effect=[
+            subprocess.CompletedProcess([], 0, stdout=f"{key}\n", stderr=""),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=json.dumps(
+                    {
+                        "backend": "codex",
+                        "revision": "a" * 40,
+                        "provider_cli": provider_cli,
+                    }
+                ),
+                stderr="",
+            ),
+        ],
+    )
+
+    assert get_worker_heartbeat_details("user@host") == {
+        "orcest-worker-10001": {
+            "backend": "codex",
+            "revision": "a" * 40,
+            "provider_cli": provider_cli,
+        }
+    }
+
+
 class TestValidateProjectName:
     def test_valid_names(self):
         for name in ["alpha", "my-project", "v2.0", "test_repo", "A1"]:
@@ -141,6 +181,7 @@ class TestGenerateEnvFile:
         assert "ORCEST_REDIS_KEY_PREFIX='myproj'" in env
         assert "ORCEST_IMAGE='orcest:latest'" in env
         assert "ORCEST_CONFIG_DIR='/opt/orcest/projects/myproj/config'" in env
+        assert "ORCEST_WORKFLOW_STATE_HOST_PATH" not in env
 
     def test_project_name_in_config_dir(self):
         env = generate_env_file(
@@ -230,6 +271,25 @@ class TestGenerateEnvFile:
 
         assert "MONITOR_WRITE_TOKEN='monitor-secret'" in env
 
+    def test_generate_env_file_emits_workflow_state_mount(self):
+        env = generate_env_file(
+            github_token="t",
+            key_prefix="p",
+            project_name="p",
+            workflow_state_host_path="/var/lib/orcest-v1",
+        )
+
+        assert "ORCEST_WORKFLOW_STATE_HOST_PATH='/var/lib/orcest-v1'" in env
+
+    def test_generate_env_file_rejects_relative_workflow_state_mount(self):
+        with pytest.raises(ValueError, match="workflow_state_host_path must be an absolute path"):
+            generate_env_file(
+                github_token="t",
+                key_prefix="p",
+                project_name="p",
+                workflow_state_host_path="relative/state",
+            )
+
     def test_generate_env_file_rejects_single_quote_in_redis_password(self):
         """C1: the password is single-quoted in .env, so a single quote must be
         rejected (mirrors the github_token/key_prefix injection guards)."""
@@ -276,6 +336,7 @@ class TestGenerateOrchestratorConfig:
         assert data["redis"]["port"] == 6379
         assert data["redis"]["key_prefix"] == "myproj"
         assert data["github"]["repo"] == "Org/repo"
+        assert "workflow_state_root" not in data
 
     def test_key_prefix_matches_project(self):
         """The key_prefix in the config matches what was passed."""
@@ -293,6 +354,17 @@ class TestGenerateOrchestratorConfig:
 
         assert data["monitor_ingest_url"] == "http://monitor:9091/ingest/v1/events"
         assert data["monitor_write_token_env"] == "MONITOR_WRITE_TOKEN"
+
+    def test_emits_workflow_state_root(self):
+        data = yaml.safe_load(
+            generate_orchestrator_config(
+                repo="O/r",
+                key_prefix="p",
+                workflow_state_enabled=True,
+            )
+        )
+
+        assert data["workflow_state_root"] == "/var/lib/orcest/workflow"
 
     def test_no_providers_block_without_extra_providers(self):
         """Default: no providers: block (claude comes from legacy synthesis)."""
@@ -702,6 +774,137 @@ class TestRedisCliRoutedThroughDockerExec:
         cmd = ssh.call_args[0][1]
         assert "docker exec orcest-redis-redis-1" in cmd
         assert "GET orcest:pool:current_template_vmid" in cmd
+
+    def test_set_current_template_revision_uses_docker_exec(self, mocker):
+        from orcest.fleet.orchestrator import set_current_template_revision
+
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._ok)
+        set_current_template_revision("user@host", "a" * 40)
+        cmd = ssh.call_args[0][1]
+        assert "docker exec orcest-redis-redis-1" in cmd
+        assert "SET orcest:pool:current_template_revision" in cmd
+        assert "a" * 40 in cmd
+
+    def test_set_current_template_revision_rejects_dirty(self, mocker):
+        from orcest.fleet.orchestrator import set_current_template_revision
+
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._ok)
+        with pytest.raises(ValueError, match="non-attested"):
+            set_current_template_revision("user@host", "a" * 40 + "-dirty")
+        ssh.assert_not_called()
+
+    def test_set_current_template_revision_rejects_unknown(self, mocker):
+        from orcest.fleet.orchestrator import set_current_template_revision
+
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._ok)
+        with pytest.raises(ValueError, match="non-attested"):
+            set_current_template_revision("user@host", "unknown")
+        ssh.assert_not_called()
+
+    def test_get_current_template_revision_uses_docker_exec(self, mocker):
+        from orcest.fleet.orchestrator import get_current_template_revision
+
+        ssh = mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=f"{'a' * 40}\n", stderr=""
+            ),
+        )
+        result = get_current_template_revision("user@host")
+        assert result == "a" * 40
+        cmd = ssh.call_args[0][1]
+        assert "docker exec orcest-redis-redis-1" in cmd
+        assert "GET orcest:pool:current_template_revision" in cmd
+
+    def test_get_current_template_revision_returns_none_when_unset(self, mocker):
+        from orcest.fleet.orchestrator import get_current_template_revision
+
+        mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+        )
+        assert get_current_template_revision("user@host") is None
+
+    def test_get_draining_worker_ids_uses_docker_exec(self, mocker):
+        from orcest.fleet.orchestrator import get_draining_worker_ids
+
+        ssh = mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="orcest-worker-300\norcest-worker-301\n", stderr=""
+            ),
+        )
+        result = get_draining_worker_ids("user@host")
+        assert result == {"orcest-worker-300", "orcest-worker-301"}
+        cmd = ssh.call_args[0][1]
+        assert "SMEMBERS orcest:pool:draining" in cmd
+
+    def test_get_container_revision_reads_oci_label(self, mocker):
+        from orcest.fleet.orchestrator import get_container_revision
+
+        ssh = mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=f"{'a' * 40}\n", stderr=""
+            ),
+        )
+        result = get_container_revision("user@host", "orcest-alpha", "orchestrator")
+        assert result == "a" * 40
+        cmd = ssh.call_args[0][1]
+        assert "docker compose -p orcest-alpha ps -q orchestrator" in cmd
+        assert "org.opencontainers.image.revision" in cmd
+
+    def test_get_container_revision_returns_none_when_container_absent(self, mocker):
+        from orcest.fleet.orchestrator import get_container_revision
+
+        mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr=""),
+        )
+        assert get_container_revision("user@host", "orcest-alpha", "orchestrator") is None
+
+    def test_get_container_revision_returns_none_for_unknown_label(self, mocker):
+        from orcest.fleet.orchestrator import get_container_revision
+
+        mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="unknown\n", stderr=""
+            ),
+        )
+        assert get_container_revision("user@host", "orcest-alpha", "orchestrator") is None
+
+    def test_get_container_revision_rejects_unsafe_project_name(self):
+        from orcest.fleet.orchestrator import get_container_revision
+
+        with pytest.raises(ValueError, match="compose project"):
+            get_container_revision("user@host", "orcest; rm -rf /", "orchestrator")
+
+    def test_get_project_orchestrator_revision_uses_project_prefix(self, mocker):
+        from orcest.fleet.orchestrator import get_project_orchestrator_revision
+
+        ssh = mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=f"{'a' * 40}\n", stderr=""
+            ),
+        )
+        assert get_project_orchestrator_revision("user@host", "alpha") == "a" * 40
+        cmd = ssh.call_args[0][1]
+        assert "docker compose -p orcest-alpha ps -q orchestrator" in cmd
+
+    def test_get_pool_manager_revision_uses_pool_project(self, mocker):
+        from orcest.fleet.orchestrator import get_pool_manager_revision
+
+        ssh = mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=f"{'a' * 40}\n", stderr=""
+            ),
+        )
+        assert get_pool_manager_revision("user@host") == "a" * 40
+        cmd = ssh.call_args[0][1]
+        assert "docker compose -p orcest-pool ps -q pool-manager" in cmd
 
     def test_get_pool_redis_members_uses_docker_exec(self, mocker):
         from orcest.fleet.orchestrator import get_pool_redis_members
@@ -1310,17 +1513,45 @@ class TestRedisStackEnvFile:
 
         ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._ok)
         ensure_pool_manager("user@host")
-        cmd = ssh.call_args[0][1]
-        assert f"--env-file {REDIS_ENV_PATH}" in cmd
-        assert "docker-compose.pool.yml" in cmd
-        assert "run --rm --no-deps --entrypoint sh pool-manager" in cmd
-        assert "test -r /home/orcest/app/config/fleet.yaml" in cmd
-        assert "test -r /home/orcest/.ssh" in cmd
-        assert "test -x /home/orcest/.ssh" in cmd
-        assert "test -f /home/orcest/.ssh/id_ed25519" in cmd
-        assert "test -r /home/orcest/.ssh/id_ed25519" in cmd
-        assert "up -d --force-recreate pool-manager" in cmd
-        assert "RestartCount" in cmd
+        assert ssh.call_count == 2
+        preflight_cmd = ssh.call_args_list[0][0][1]
+        startup_cmd = ssh.call_args_list[1][0][1]
+        assert f"--env-file {REDIS_ENV_PATH}" in preflight_cmd
+        assert "docker-compose.pool.yml" in preflight_cmd
+        assert "run --rm --no-deps --entrypoint sh pool-manager" in preflight_cmd
+        assert "test -r /home/orcest/app/config/fleet.yaml" in preflight_cmd
+        assert "test -r /home/orcest/.ssh" in preflight_cmd
+        assert "test -x /home/orcest/.ssh" in preflight_cmd
+        assert "test -f /home/orcest/.ssh/id_ed25519" in preflight_cmd
+        assert "test -r /home/orcest/.ssh/id_ed25519" in preflight_cmd
+        assert "command -v ssh" in preflight_cmd
+        assert "ssh -V" in preflight_cmd
+        assert "up -d --force-recreate pool-manager" not in preflight_cmd
+        assert f"--env-file {REDIS_ENV_PATH}" in startup_cmd
+        assert "up -d --force-recreate pool-manager" in startup_cmd
+        assert "RestartCount" in startup_cmd
+
+    @pytest.mark.parametrize(
+        "diagnostic",
+        [
+            "pool-manager prerequisite failed: ssh client executable not found",
+            "pool-manager prerequisite failed: ssh client executable is unusable",
+        ],
+    )
+    def test_pool_manager_ssh_preflight_failure_prevents_startup(self, mocker, diagnostic):
+        from orcest.fleet.orchestrator import ensure_pool_manager
+
+        ssh = mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess([], 1, stdout="", stderr=diagnostic),
+        )
+
+        with pytest.raises(RuntimeError, match="ssh client executable") as exc_info:
+            ensure_pool_manager("user@host")
+
+        assert diagnostic in str(exc_info.value)
+        assert ssh.call_count == 1
+        assert "up -d --force-recreate pool-manager" not in ssh.call_args[0][1]
 
     def test_deploy_stack_passes_redis_env_file(self, mocker):
         """The per-project orchestrator stack needs the redis password too. Its
@@ -1349,6 +1580,17 @@ class TestRedisStackEnvFile:
 
         assert "CODEX_API_KEY" in compose
         assert "OPENAI_API_KEY" in compose
+
+    @pytest.mark.parametrize(
+        "compose_path",
+        ["docker-compose.yml", "src/orcest/fleet/deploy/docker-compose.yml"],
+    )
+    def test_orchestrator_compose_mounts_workflow_state_read_only(self, compose_path):
+        compose = Path(compose_path).read_text()
+
+        assert (
+            "${ORCEST_WORKFLOW_STATE_HOST_PATH:-/dev/null}:/var/lib/orcest/workflow:ro"
+        ) in compose
 
 
 class TestRedisCliAuthenticates:
