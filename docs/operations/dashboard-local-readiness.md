@@ -160,7 +160,7 @@ node scripts/observe-live-fleet.mjs \
   --url http://127.0.0.1:44319 --pid LOCAL_CANDIDATE_PID \
   --revision FULL_CANDIDATE_SHA --token-file PRIVATE_TOKEN_FILE \
   --state-dir NEW_PERSISTENT_EVIDENCE_DIRECTORY
-node --test scripts/live-evidence.test.mjs
+node --test scripts/live-evidence.check.mjs
 ```
 
 The token file must contain only the candidate token and have private file
