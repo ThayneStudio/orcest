@@ -5,7 +5,7 @@ Row text lives in ``golden/failure_injection_matrix.json`` (transcribed
 verbatim from the wiki table, one JSON object per row, in table order) rather
 than inline Python string literals, matching this repo's existing golden-
 fixture convention (see tests/workflow_contract/golden/) and keeping the
-89-column line-length lint happy without wrapping normative prose. See
+100-column line-length lint happy without wrapping normative prose. See
 coverage.py for which automated test proves each case today, and
 test_matrix_completeness.py for the release gate that every case is
 accounted for.
