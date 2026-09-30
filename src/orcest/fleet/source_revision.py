@@ -12,9 +12,13 @@ from __future__ import annotations
 
 import os
 import re
+import selectors
+import signal
 import subprocess
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from orcest.revision import normalize_revision, revision_is_attested
 
@@ -25,6 +29,10 @@ RESOLUTION_TIMEOUT_SECONDS = 10.0
 _MAX_LS_REMOTE_BYTES = 4096
 _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _MAX_DIAGNOSTIC_REVISION_CHARS = 64
+_REF_RE = re.compile(r"^refs/[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
+_OWNER_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+_SCP_REPOSITORY_RE = re.compile(r"^git@[A-Za-z0-9.-]+:[A-Za-z0-9._/-]+(?:\.git)?$")
+_PROCESS_TERM_GRACE_SECONDS = 1.0
 
 # Fixed-vocabulary error classification: never echo raw stderr (it can quote
 # back the repository URL) -- only ever return one of these bounded strings.
@@ -57,6 +65,69 @@ class DesiredRevision:
         return self.sha is not None
 
 
+def _safe_repository(repository: str) -> tuple[str, str] | None:
+    """Return ``(display, git_argument)`` for a non-secret repository value."""
+    if not repository or len(repository) > 512 or repository.startswith("-"):
+        return None
+    if any(ord(char) < 32 or char.isspace() for char in repository):
+        return None
+    if _OWNER_REPO_RE.fullmatch(repository):
+        return repository, f"https://github.com/{repository}.git"
+    if _SCP_REPOSITORY_RE.fullmatch(repository):
+        return repository, repository
+
+    try:
+        parsed = urlsplit(repository)
+        hostname = parsed.hostname
+        # Accessing `.port` performs numeric/range validation. Without it an
+        # arbitrary token in the port position would be accepted and echoed.
+        _port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme not in {"https", "ssh"}:
+        return None
+    if not hostname or parsed.query or parsed.fragment:
+        return None
+    # A password, token, or arbitrary username in an URL is not valid
+    # non-secret fleet policy.  SSH URLs may use the conventional `git` user.
+    if parsed.password is not None:
+        return None
+    if parsed.username is not None and not (parsed.scheme == "ssh" and parsed.username == "git"):
+        return None
+    if not parsed.path or not re.fullmatch(r"/[A-Za-z0-9._/-]+", parsed.path):
+        return None
+    return repository, repository
+
+
+def _valid_ref(ref: str) -> bool:
+    """Conservatively validate a fully-qualified ref without running Git."""
+    return bool(
+        _REF_RE.fullmatch(ref)
+        and ".." not in ref
+        and "//" not in ref
+        and not ref.endswith(("/", "."))
+        and "/." not in ref
+        and "@{" not in ref
+    )
+
+
+def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+    """Terminate and reap one isolated subprocess group."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=_PROCESS_TERM_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
 def _run_ls_remote(repo: str, ref: str, timeout: float) -> subprocess.CompletedProcess[str]:
     """Run the bounded, read-only remote ref lookup.
 
@@ -67,13 +138,48 @@ def _run_ls_remote(repo: str, ref: str, timeout: float) -> subprocess.CompletedP
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_ASKPASS"] = "true"
-    return subprocess.run(
-        ["git", "ls-remote", "--exit-code", repo, ref],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
+    argv = ["git", "ls-remote", "--exit-code", repo, ref, f"{ref}^{{}}"]
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
         env=env,
     )
+    assert process.stdout is not None and process.stderr is not None
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    deadline = time.monotonic() + timeout
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+            selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+            while selector.get_map() or process.poll() is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                for key, _events in selector.select(timeout=min(remaining, 0.05)):
+                    buffer = buffers[key.data]
+                    chunk = os.read(key.fd, _MAX_LS_REMOTE_BYTES + 1 - len(buffer))
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    buffer.extend(chunk)
+                    if len(buffer) > _MAX_LS_REMOTE_BYTES:
+                        # Return fixed over-limit data; never retain unbounded diagnostics.
+                        return subprocess.CompletedProcess(
+                            argv, 1, stdout="x" * (_MAX_LS_REMOTE_BYTES + 1), stderr=""
+                        )
+            return subprocess.CompletedProcess(
+                argv,
+                process.wait(),
+                stdout=buffers["stdout"].decode("utf-8", errors="replace"),
+                stderr=buffers["stderr"].decode("utf-8", errors="replace"),
+            )
+    finally:
+        _terminate_process(process)
+        process.stdout.close()
+        process.stderr.close()
 
 
 def _classify_git_failure(stderr: str) -> str:
@@ -100,9 +206,20 @@ def resolve_desired_revision(
     repo = str(getattr(desired, "repo", "") or "").strip()
     ref = str(getattr(desired, "ref", "") or "").strip()
     sha = str(getattr(desired, "sha", "") or "").strip().lower()
+    safe_repository = _safe_repository(repo)
+    safe_ref = ref if _valid_ref(ref) else ""
+    display_repo = safe_repository[0] if safe_repository else ""
 
     if not repo or not (ref or sha):
-        return DesiredRevision(repo=repo, ref=ref, sha=None, error="desired revision unconfigured")
+        return DesiredRevision(
+            repo=display_repo, ref=safe_ref, sha=None, error="desired revision unconfigured"
+        )
+    if safe_repository is None or (not sha and not safe_ref):
+        return DesiredRevision(
+            repo=display_repo, ref=safe_ref, sha=None, error="invalid desired source configuration"
+        )
+    repo = display_repo
+    ref = safe_ref
 
     if sha:
         normalized = normalize_revision(sha)
@@ -116,7 +233,7 @@ def resolve_desired_revision(
         return DesiredRevision(repo=repo, ref="", sha=normalized, error=None)
 
     try:
-        result = _run_ls_remote(repo, ref, timeout)
+        result = _run_ls_remote(safe_repository[1], ref, timeout)
     except subprocess.TimeoutExpired:
         return DesiredRevision(
             repo=repo, ref=ref, sha=None, error="desired ref resolution timed out"
@@ -139,14 +256,24 @@ def resolve_desired_revision(
     if result.returncode != 0:
         return DesiredRevision(repo=repo, ref=ref, sha=None, error=_classify_git_failure(stderr))
 
-    first_line = stdout.strip().splitlines()[0] if stdout.strip() else ""
-    parts = first_line.split()
-    candidate = parts[0].strip().lower() if parts else ""
-    if len(parts) < 2 or not _FULL_SHA_RE.fullmatch(candidate):
+    revisions: dict[str, str] = {}
+    for line in stdout.splitlines():
+        parts = line.split("\t")
+        if (
+            len(parts) != 2
+            or not _FULL_SHA_RE.fullmatch(parts[0].lower())
+            or parts[1] not in {ref, f"{ref}^{{}}"}
+            or (parts[1] in revisions and revisions[parts[1]] != parts[0].lower())
+        ):
+            return DesiredRevision(
+                repo=repo, ref=ref, sha=None, error="desired ref response was malformed"
+            )
+        revisions[parts[1]] = parts[0].lower()
+    candidate = revisions.get(f"{ref}^{{}}") or revisions.get(ref)
+    if candidate is None:
         return DesiredRevision(
             repo=repo, ref=ref, sha=None, error="desired ref response was malformed"
         )
-
     return DesiredRevision(repo=repo, ref=ref, sha=candidate, error=None)
 
 

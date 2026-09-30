@@ -2675,8 +2675,8 @@ def test_rebake_allocates_next_free_vmid_and_swaps_pointer(runner, cfg_path, moc
     assert result.exit_code == 0, result.output
     assert "Rebake complete" in result.output
     mock_px.convert_to_template.assert_called_once_with(9001)
-    mock_set.assert_called_once_with("orcest@10.20.0.1", 9001)
-    mock_set_revision.assert_called_once_with("orcest@10.20.0.1", "a" * 40)
+    mock_set.assert_called_once_with("orcest@10.20.0.1", 9001, revision="a" * 40)
+    mock_set_revision.assert_not_called()
 
 
 def test_rebake_no_range_configured_fails(runner, cfg_path, mocker):
@@ -4726,7 +4726,7 @@ def test_deploy_rebuild_template_uses_rebake_pointer_swap(runner, cfg_path, mock
     assert result.exit_code == 0, result.output
     assert "Rebaking template" in result.output
     mock_px.convert_to_template.assert_called_once_with(9001)
-    mock_set.assert_called_once_with("orcest@10.20.0.23", 9001)
+    mock_set.assert_called_once_with("orcest@10.20.0.23", 9001, revision="a" * 40)
     assert call_order == ["set_current_template_vmid", "ensure_pool_manager"]
 
 
@@ -5051,3 +5051,46 @@ class TestWaitForCloudInit:
         )
         mocker.patch("orcest.fleet.cli.time.sleep")
         assert _wait_for_cloud_init("10.0.0.1", "orcest", Console(), timeout=60) is False
+
+
+def test_rebake_rejects_clean_stale_source_before_vm_mutation(runner, cfg_path, mocker):
+    from orcest.fleet.config import DesiredSourceConfig
+
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vmid_range=[9000, 9009], template_vm_id=9000),
+    )
+    cfg.desired_source = DesiredSourceConfig(
+        repo="https://github.com/ThayneStudio/orcest", sha="b" * 40
+    )
+    _save(cfg, cfg_path)
+    create_client = mocker.patch("orcest.fleet.cli._create_proxmox_client")
+    result = runner.invoke(fleet, ["rebake", "--config", cfg_path])
+    assert result.exit_code != 0
+    assert "does not match" in " ".join(result.output.split())
+    create_client.assert_not_called()
+
+
+def test_source_health_does_not_treat_unreadable_workers_as_empty(runner, cfg_path, mocker):
+    cfg = TestSourceHealth()._base_cfg()
+    _save(cfg, cfg_path)
+    _mock_source_revision_surfaces(
+        mocker, orchestrator="a" * 40, pool_manager="a" * 40, template="a" * 40
+    )
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_worker_heartbeat_details",
+        side_effect=RuntimeError("unavailable"),
+    )
+    result = runner.invoke(fleet, ["source-health", "--config", cfg_path, "--json"])
+    assert result.exit_code != 0
+    assert "worker-inventory" in result.output
+
+
+def test_source_health_requires_runtime_host(runner, cfg_path):
+    from orcest.fleet.config import DesiredSourceConfig
+
+    cfg = FleetConfig(desired_source=DesiredSourceConfig(repo="org/orcest", sha="a" * 40))
+    _save(cfg, cfg_path)
+    result = runner.invoke(fleet, ["source-health", "--config", cfg_path, "--json"])
+    assert result.exit_code != 0
+    assert '"healthy": false' in result.output
