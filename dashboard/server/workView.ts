@@ -492,6 +492,9 @@ export async function fetchWorkView(
   if (message.snapshot.degraded_sections.length)
     notices.push("Some operational data is unavailable.");
   return {
+    ...(process.env.ORCEST_DASHBOARD_MODE === "local-harness"
+      ? { environment: "local-harness" as const }
+      : {}),
     pools: message.snapshot.worker_pool,
     version: 1,
     fetchedAt: now,

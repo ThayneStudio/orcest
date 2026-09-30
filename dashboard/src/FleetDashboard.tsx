@@ -115,6 +115,7 @@ export default function FleetDashboard() {
     [limit, setLimit] = useState(150),
     [selected, setSelected] = useState<string | null>(null),
     [attention, setAttention] = useState(false);
+  const [snapshotFilter, setSnapshotFilter] = useState({ project: "", query: "" });
   const [detail, setDetail] = useState<FleetWork | null>(null),
     [detailError, setDetailError] = useState(""),
     [tab, setTab] = useState("context"),
@@ -150,7 +151,9 @@ export default function FleetDashboard() {
           limit: String(limit),
         });
         const next = await readPages(params, limit, abort.signal);
+        if (abort.signal.aborted) return;
         setData(next);
+        setSnapshotFilter({ project, query });
         setError("");
       } catch (e) {
         if (!abort.signal.aborted) setError((e as Error).message);
@@ -158,6 +161,7 @@ export default function FleetDashboard() {
         if (!abort.signal.aborted) timer = setTimeout(poll, 3000);
       }
     }
+    setError("");
     void poll();
     return () => {
       abort.abort();
@@ -226,19 +230,25 @@ export default function FleetDashboard() {
     }
   }, [selected, attention]);
   function open(work: FleetWork) {
+    openWork(work.id, work);
+  }
+  function openWork(id: string, work: FleetWork | null) {
     returnFocus.current = document.activeElement as HTMLElement;
-    setSelected(work.id);
+    setSelected(id);
     setDetail(work);
     setDetailError("");
     setAttention(false);
     setAttemptId(null);
-    setTab(work.activity === "executing" ? "output" : "context");
+    setTab(!work || work.activity === "executing" ? "output" : "context");
   }
   function close() {
     setSelected(null);
     setAttention(false);
     setDetailError("");
   }
+  const filtersPending =
+    !!data &&
+    (snapshotFilter.project !== project || snapshotFilter.query !== query);
   const allocated = data?.pools.reduce((n, p) => n + p.active_count, 0) ?? 0;
   const warm = data?.pools.reduce((n, p) => n + p.idle_count, 0) ?? 0;
   const items = data?.items || [],
@@ -285,6 +295,11 @@ export default function FleetDashboard() {
       </header>
       <main>
         <h1 className="sr-only">Orcest fleet</h1>
+        {data?.environment === "local-harness" && (
+          <p className="fleet-warning" role="status">
+            Local harness · Simulated fleet activity. No live projects or agents are affected.
+          </p>
+        )}
         <div className="fleet-summary-bar">
           {data?.pools.length ? (
             <span title="Allocated VMs out of all currently provisioned VMs; this is not the configured capacity limit.">
@@ -361,7 +376,8 @@ export default function FleetDashboard() {
         </div>
         {error && (
           <div className="fleet-warning" role="alert">
-            {error} {data ? "Showing the last successful snapshot." : ""}
+            {error}{" "}
+            {data && !filtersPending ? "Showing the last successful snapshot." : ""}
           </div>
         )}
         {data?.notices.map((n) => (
@@ -374,7 +390,12 @@ export default function FleetDashboard() {
             Loading fleet observations…
           </div>
         )}
-        {view === "board" && data && (
+        {view === "board" && filtersPending && !error && (
+          <div className="fleet-empty" role="status">
+            Updating work for the selected filters…
+          </div>
+        )}
+        {view === "board" && data && !filtersPending && (
           <>
             <div className="fleet-board">
               {stages.map((stage) => {
@@ -560,12 +581,9 @@ export default function FleetDashboard() {
                     {w.workId ? (
                       <button
                         onClick={() => {
-                          const work = items.find((i) => i.id === w.workId);
-                          if (work) open(work);
-                          else {
-                            setSelected(w.workId);
-                            setDetail(null);
-                          }
+                          const workId = w.workId;
+                          if (!workId) return;
+                          openWork(workId, items.find((i) => i.id === workId) ?? null);
                         }}
                       >
                         View work →
