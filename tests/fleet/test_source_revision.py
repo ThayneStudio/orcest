@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -277,3 +278,132 @@ class TestEvaluateSourceRevision:
         surfaces = [RuntimeRevision(surface="worker:w1", revision="a" * 500)]
         report = evaluate_source_revision(_desired(), surfaces)
         assert all(len(m) < 300 for m in report.mismatches)
+
+
+@pytest.mark.parametrize(
+    "repo",
+    [
+        "https://token:private@github.com/org/repo.git",
+        "https://github.com/org/repo.git?token=private",
+        "ext::sh -c private",
+        "--upload-pack=private",
+    ],
+)
+def test_unsafe_repository_is_redacted_and_never_invoked(repo, mocker):
+    from dataclasses import asdict
+
+    run = mocker.patch("orcest.fleet.source_revision._run_ls_remote")
+    desired = DesiredSourceConfig(repo=repo, ref="refs/heads/master")
+    resolved = resolve_desired_revision(desired)
+    assert not resolved.resolved
+    assert "private" not in str(asdict(resolved))
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize("ref", ["master", "refs/heads/*", "refs/heads/private?token"])
+def test_non_exact_ref_is_redacted_and_never_invoked(ref, mocker):
+    run = mocker.patch("orcest.fleet.source_revision._run_ls_remote")
+    resolved = resolve_desired_revision(DesiredSourceConfig(repo="org/orcest", ref=ref))
+    assert not resolved.resolved
+    assert resolved.ref == ""
+    run.assert_not_called()
+
+
+def test_unrequested_ref_is_rejected(mocker):
+    mocker.patch(
+        "orcest.fleet.source_revision._run_ls_remote",
+        return_value=_completed(
+            stdout=f"{SHA_A}\trefs/heads/unrequested\n",
+        ),
+    )
+    resolved = resolve_desired_revision(
+        DesiredSourceConfig(repo="org/orcest", ref="refs/heads/master")
+    )
+    assert not resolved.resolved
+
+
+def test_annotated_tag_resolves_peeled_commit(mocker):
+    mocker.patch(
+        "orcest.fleet.source_revision._run_ls_remote",
+        return_value=_completed(
+            stdout=f"{SHA_A}\trefs/tags/release\n{SHA_B}\trefs/tags/release^{{}}\n",
+        ),
+    )
+    resolved = resolve_desired_revision(
+        DesiredSourceConfig(repo="org/orcest", ref="refs/tags/release")
+    )
+    assert resolved.sha == SHA_B
+
+
+def test_real_remote_process_output_limit_and_timeout(mocker):
+    import sys
+
+    from orcest.fleet import source_revision as source
+
+    original_popen = subprocess.Popen
+    process = None
+    program = "import os,time;os.write(1,b'x'*8192);time.sleep(60)"
+
+    def spawn(_argv, **kwargs):
+        nonlocal process
+        process = original_popen([sys.executable, "-c", program], **kwargs)
+        return process
+
+    mocker.patch.object(source.subprocess, "Popen", side_effect=spawn)
+    result = source._run_ls_remote("https://github.com/org/repo.git", "refs/heads/master", 2)
+    assert len(result.stdout) == source._MAX_LS_REMOTE_BYTES + 1
+    assert process is not None and process.poll() is not None
+    program = "import time;time.sleep(60)"
+    with pytest.raises(subprocess.TimeoutExpired):
+        source._run_ls_remote("https://github.com/org/repo.git", "refs/heads/master", 0.1)
+    assert process is not None and process.poll() is not None
+
+
+def test_remote_timeout_kills_helper_after_git_leader_exits(mocker, tmp_path):
+    import os
+    import sys
+    import time
+
+    from orcest.fleet import source_revision as source
+
+    original_popen = subprocess.Popen
+    pid_file = tmp_path / "helper.pid"
+    program = (
+        "import os,time,pathlib;"
+        "pid=os.fork();"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(pid)) if pid else None;"
+        "os._exit(0) if pid else time.sleep(60)"
+    )
+
+    def spawn(_argv, **kwargs):
+        return original_popen([sys.executable, "-c", program], **kwargs)
+
+    mocker.patch.object(source.subprocess, "Popen", side_effect=spawn)
+    with pytest.raises(subprocess.TimeoutExpired):
+        source._run_ls_remote("https://github.com/org/repo.git", "refs/heads/master", 0.2)
+    helper_pid = int(pid_file.read_text())
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(helper_pid, 0)
+            # A dead child can remain a zombie until its adopter reaps it.
+            if Path(f"/proc/{helper_pid}/stat").read_text().split()[2] == "Z":
+                break
+        except (ProcessLookupError, FileNotFoundError):
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("Git helper survived isolated process-group cleanup")
+
+
+def test_conflicting_duplicate_ref_is_rejected(mocker):
+    mocker.patch(
+        "orcest.fleet.source_revision._run_ls_remote",
+        return_value=_completed(
+            stdout=f"{SHA_A}\trefs/heads/master\n{SHA_B}\trefs/heads/master\n",
+        ),
+    )
+    resolved = resolve_desired_revision(
+        DesiredSourceConfig(repo="org/orcest", ref="refs/heads/master")
+    )
+    assert not resolved.resolved
