@@ -61,6 +61,7 @@ export interface FleetWorker {
   workId: string | null;
 }
 export interface WorkView {
+  environment?: "local-harness";
   pools: WorkerPoolInfo[];
   version: 1;
   fetchedAt: number;
