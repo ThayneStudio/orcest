@@ -313,6 +313,23 @@ export async function fetchWorkView(
     readHashes(keys),
     readHashes(projectKeys),
   ]);
+  // Physical discovery keys establish stable source identity. Project hashes
+  // may contain account credentials, so expose only this explicit allowlist.
+  const sourceObservations = projects.map((project, i) => {
+    const key = projectKeys[i];
+    const suffix = "dashboard:project";
+    const prefix = key.endsWith(`:${suffix}`)
+      ? key.slice(0, -suffix.length - 1)
+      : "";
+    const observedAt = numeric(project.observed_at);
+    return {
+      id: Buffer.from(key).toString("base64url"),
+      prefix,
+      project: project.repo || null,
+      observedAt,
+      stale: !observedAt || now - observedAt > 180,
+    };
+  });
   // SCAN and HGETALL are not atomic: an observation can expire between them.
   // Keep keys paired with their hashes before deriving identity or run indices.
   const present = stored.flatMap((fields, i) =>
@@ -496,6 +513,7 @@ export async function fetchWorkView(
       ? { environment: "local-harness" as const }
       : {}),
     pools: message.snapshot.worker_pool,
+    sourceObservations,
     version: 1,
     fetchedAt: now,
     items: visible,
