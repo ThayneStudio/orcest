@@ -6337,3 +6337,44 @@ def test_backfill_provider_account_oom_propagates_for_deferral(fake_redis_client
             ttl_seconds=300,
             logger=logging.getLogger("test"),
         )
+
+
+def test_issue_backpressure_preserves_retained_observation_refresh(
+    mocker, fake_redis_client, gh_mock
+):
+    from orcest.shared import work_observations as view
+    from orcest.shared.config import LabelConfig
+
+    project = ProjectConfig(
+        repo="acme/widgets", token="ghp-project", claude_tokens=["credential"], key_prefix="widgets"
+    )
+    config = OrchestratorConfig(labels=LabelConfig(), projects=[project])
+    project_redis = RedisClient.from_client(fake_redis_client.client, key_prefix=project.key_prefix)
+    key = view.work_key(project.repo, "issue", 12)
+    project_redis.hset_mapping(
+        key,
+        {"repo": project.repo, "kind": "issue", "number": "12", "observed_at": "1000"},
+    )
+    project_redis.client.zadd(view.full_key(project_redis, "dashboard:tracked"), {key: 1000})
+    mocker.patch.object(fake_redis_client, "stream_unread_count", return_value=1)
+    mocker.patch("orcest.orchestrator.loop.discover_actionable_prs", return_value=[])
+    discover = mocker.patch("orcest.orchestrator.loop.discover_actionable_issues", return_value=[])
+    read = mocker.patch("orcest.orchestrator.gh.get_issue", return_value={"state": "CLOSED"})
+    publish = mocker.patch("orcest.orchestrator.loop.publish_issue_task")
+    result = _poll_project(
+        project,
+        project_redis,
+        fake_redis_client,
+        config,
+        logging.getLogger("test"),
+        3600,
+        token_pool=None,
+        force_issue_discovery=False,
+    )
+    discover.assert_not_called()
+    publish.assert_not_called()
+    assert result[0] == 0
+    read.assert_called_once_with(project.repo, 12, project.token)
+    refreshed = project_redis.hgetall(key)
+    assert refreshed["outcome"] == "closed"
+    assert float(refreshed["observed_at"]) > 1000
