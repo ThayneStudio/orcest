@@ -53,7 +53,30 @@ obeying the **Provider Registration & Invocation Boundary**.
 
    Update the "Grok CLI not present" style message if you want a different wording.
 
-4. **Runner / parsing**
+4. **Register the pinned CLI version and template metadata**
+
+   In `src/orcest/shared/provider_versions.py`, add the new backend name to
+   `PROVIDER_CLI_DESIRED_VERSIONS` with the exact CLI version pinned by the
+   installer. Add the same backend to `PROVIDER_CLI_TEMPLATE_KEYS`, mapping
+   it to the version field emitted in `/etc/orcest/template.versions` (for
+   example, `gemini_version`). Backend aliases using the same CLI may share
+   that field, as `claude` and `clauder` share `claude_version`.
+
+   Update `src/orcest/fleet/cloud_init.py` to install the same pinned version
+   and emit its version field in `_template_versions_write_file()`. Keep
+   those values aligned with `provision/setup-worker.sh` before rebaking.
+   The template metadata parser reads only fields registered in
+   `PROVIDER_CLI_TEMPLATE_KEYS`.
+
+   These manifests support worker version probes and rollout health; they
+   do not define provider invocation. A backend missing from
+   `PROVIDER_CLI_DESIRED_VERSIONS` fails the `provider_cli_versions` check
+   and overall rollout health. Missing template metadata or a mismatch
+   between the desired, baked, and observed CLI versions also fails the
+   check. Rebake and verify the new worker's version heartbeat before
+   enabling its tasks; installing a binary alone does not satisfy this gate.
+
+5. **Runner / parsing**
 
    Provider CLIs have distinct flags and event schemas, so each supported
    provider owns a small runner subclass. Reuse `_BaseCliRunner` for process,
@@ -61,7 +84,7 @@ obeying the **Provider Registration & Invocation Boundary**.
    provider-specific argv/parsing/auth hooks in the new class. Add fixtures for
    every event type and failure classification supported by the pinned CLI.
 
-5. **Rebake the worker image**
+6. **Rebake the worker image**
 
    ```bash
    # on the template VM or via fleet
@@ -71,7 +94,7 @@ obeying the **Provider Registration & Invocation Boundary**.
 
    After rebake, any worker cloned from the new template has the binary + the registry entry.
 
-6. **Declare the provider in the orchestrator (declarative only)**
+7. **Declare the provider in the orchestrator (declarative only)**
 
    In `orchestrator.yaml` (top-level or inside a `projects[].providers`):
 
@@ -115,7 +138,7 @@ obeying the **Provider Registration & Invocation Boundary**.
    rejects the project until every provider it can publish has at least one
    scheduled slot.
 
-7. **Test, including skew**
+8. **Test, including skew**
 
    - Add the provider to a test project's config and worker profile layout.
    - Publish a task for it.
