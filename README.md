@@ -528,6 +528,36 @@ All subcommands live under `orcest fleet` (`src/orcest/fleet/cli.py`):
 | `gc-templates [--dry-run] [--yes]`                               | Destroy orcest worker templates in the template VMID range that are no longer active and have no live clones. Only VMs that are actually templates named `orcest-worker-*` are eligible; anything else sharing the range is listed and skipped. Prompts before destroying unless `--yes`. |
 | `set-pool-size <N> [--vm-id-start …]`                            | Set the target warm pool size.                                                                             |
 
+### Cloud-image workspace capacity
+
+`create-template` and `rebake` download and verify the exact cloud-image
+bytes in a temporary workspace before importing them into Proxmox storage.
+By default Python places that workspace under `/tmp`; it is not placed in
+`pool.storage`. The rebake host must therefore keep **at least 8 GiB free in
+`/tmp`, plus filesystem and operational headroom**. Do not rely on a small
+root partition or RAM-backed `tmpfs` for this workspace.
+
+To use a larger host filesystem, set `TMPDIR` to an existing, root-writable
+directory before running the command:
+
+```bash
+install -d -m 0700 /path/on/large-filesystem/orcest-tmp
+TMPDIR=/path/on/large-filesystem/orcest-tmp orcest fleet rebake
+```
+
+For the scheduled rebake, configure the same value with a systemd drop-in:
+
+```ini
+# systemctl edit orcest-rebake-template.service
+[Service]
+Environment=TMPDIR=/path/on/large-filesystem/orcest-tmp
+```
+
+Run `systemctl daemon-reload` after changing the drop-in. The workspace is
+removed after success or failure, and retries remove each attempt before
+starting the next, but capacity for one full image (up to 8 GiB) is required
+throughout verification and import.
+
 ## Onboarding a project
 
 1. **Prep the repo on GitHub.** Add the `orcest:ready` label (the
