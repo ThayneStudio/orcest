@@ -21,7 +21,6 @@ deploy_lock_held="${DASHBOARD_DEPLOY_LOCK_HELD:-0}"
 rollback_image_pinned=0
 candidate_may_be_live=0
 candidate_tag_replaced=0
-candidate_build_completed=0
 pre_build_image_id=""
 compose_config_swapped=0
 compose_candidate_backup=""
@@ -498,17 +497,15 @@ restorable_image_name() {
   esac
 }
 
-# Drop the service tag only when this deploy actually produced the image behind
-# it. A build that failed (transient `npm ci`, registry blip, ...) never touches
-# the tag, so removing it would destroy the last-good image and leave the
-# operator with nothing to `up -d --no-build` back to.
+# Drop the service tag only when this deploy changed the image behind it.
+# Compose can succeed without rebuilding a preexisting image (for example,
+# when the service has no build configuration). Its exit status cannot prove
+# tag ownership; an unchanged image must survive later validation failures.
 remove_candidate_image_tag() {
-  if [ "$candidate_build_completed" != "1" ]; then
-    current_image_id="$(docker image inspect -f '{{.Id}}' "$dashboard_image" 2>/dev/null || true)"
-    if [ -n "$current_image_id" ] && [ "$current_image_id" = "$pre_build_image_id" ]; then
-      echo "Dashboard build did not replace $dashboard_image; keeping the existing image" >&2
-      return 0
-    fi
+  current_image_id="$(docker image inspect -f '{{.Id}}' "$dashboard_image" 2>/dev/null || true)"
+  if [ -n "$current_image_id" ] && [ "$current_image_id" = "$pre_build_image_id" ]; then
+    echo "Dashboard build did not replace $dashboard_image; keeping the existing image" >&2
+    return 0
   fi
   docker image rm "$dashboard_image" >/dev/null 2>&1 || true
   return 0
@@ -623,7 +620,6 @@ if ! DASHBOARD_NODE_VERSION="$node_version" "$@" build dashboard; then
   echo "Dashboard compose build failed" >&2
   fail_before_live_start
 fi
-candidate_build_completed=1
 
 candidate_image="$dashboard_image"
 candidate_image_id="$(docker image inspect -f '{{.Id}}' "$candidate_image" 2>/dev/null || true)"
