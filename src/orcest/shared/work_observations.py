@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from collections.abc import Callable
 from functools import wraps
@@ -191,7 +192,13 @@ def link_publication(redis: RedisClient, repo: str, issue: int, pr: str) -> None
 
 @best_effort
 def reconcile_missing(redis: RedisClient, repo: str, token: str, seen: set[str]) -> None:
-    """Check at most five previously tracked resources per poll, rotating fairly.
+    """Read at most five retained resources per poll, oldest attempt first.
+
+    Discovery refreshes the seen resources separately. Merged, expired, and
+    malformed records consume no GitHub-read slots. Stable per-resource attempt
+    times prevent a changing discovery set or repeated read failures from
+    starving other retained observations. Attempt time is not source freshness:
+    only a successful authoritative read advances ``observed_at``.
 
     This is observation only: it never invokes selectors or changes GitHub.
     Missing ready labels do not mark an issue complete. Terminal records are kept
@@ -201,19 +208,31 @@ def reconcile_missing(redis: RedisClient, repo: str, token: str, seen: set[str])
 
     index = full_key(redis, "dashboard:tracked")
     keys = cast(list[str], redis.client.zrange(index, 0, -1))
-    candidates = [key for key in keys if isinstance(key, str) and key not in seen]
-    if not candidates:
+    missing = [key for key in keys if isinstance(key, str) and key not in seen]
+    if not missing:
         return
-    cursor = int(redis.hget("dashboard:project", "reconcile_cursor") or 0)
-    for offset in range(min(5, len(candidates))):
-        key = candidates[(cursor + offset) % len(candidates)]
-        item = redis.hgetall(key)
-        if not item or item.get("repo") != repo:
+    pipe = redis.client.pipeline(transaction=False)
+    for key in missing:
+        pipe.hgetall(full_key(redis, key))
+    records = cast(list[dict[str, str]], pipe.execute())
+    now = time.time()
+
+    def timestamp(raw: str | None) -> float:
+        try:
+            value = float(raw or "0")
+        except ValueError:
+            return 0
+        return min(value, now) if math.isfinite(value) and value > 0 else 0
+
+    candidates: list[tuple[str, dict[str, str], int]] = []
+    for key, item in zip(missing, records, strict=True):
+        if not item:
+            redis.client.zrem(index, key)
             continue
-        if (
-            item.get("outcome")
-            and time.time() - float(item.get("completed_at") or "0") > 30 * 86400
-        ):
+        if item.get("repo") != repo:
+            continue
+        completed = timestamp(item.get("completed_at"))
+        if item.get("outcome") and completed > 0 and now - completed > 30 * 86400:
             redis.client.zrem(index, key)
             redis.client.expire(full_key(redis, key), 86400)
             redis.client.expire(full_key(redis, key + ":attempts"), 86400)
@@ -222,6 +241,23 @@ def reconcile_missing(redis: RedisClient, repo: str, token: str, seen: set[str])
             continue
         try:
             number = int(item["number"])
+            if work_key(repo, item.get("kind", ""), number) != key:
+                continue
+        except (KeyError, TypeError, ValueError):
+            continue
+        candidates.append((key, item, number))
+    candidates.sort(
+        key=lambda candidate: (
+            max(
+                timestamp(candidate[1].get("observed_at")),
+                timestamp(candidate[1].get("last_reconcile_attempt_at")),
+            ),
+            candidate[0],
+        )
+    )
+    for key, item, number in candidates[:5]:
+        redis.hset(key, "last_reconcile_attempt_at", str(time.time()))
+        try:
             source = (
                 gh.get_pr(repo, number, token)
                 if item["kind"] == "pr"
@@ -257,4 +293,3 @@ def reconcile_missing(redis: RedisClient, repo: str, token: str, seen: set[str])
         except Exception:
             # Preserve stale evidence on failed reads; do not treat absence as done.
             continue
-    redis.hset("dashboard:project", "reconcile_cursor", str(cursor + 5))

@@ -3146,8 +3146,9 @@ def _poll_project(
 
     seen_work = {work_view.work_key(repo, "pr", s.number) for s in pr_states}
     seen_work.update(work_view.work_key(repo, "issue", s.number) for s in issue_states)
-    if not issue_streams_all_backed_up or force_issue_discovery:
-        work_view.reconcile_missing(project_redis, repo, token, seen_work)
+    # Admission backpressure must not suppress bounded, read-only observations
+    # of already tracked work. This path never selects or publishes new tasks.
+    work_view.reconcile_missing(project_redis, repo, token, seen_work)
     return enqueued, merged, len(pr_states), len(issue_states)
 
 
