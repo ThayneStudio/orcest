@@ -1647,14 +1647,24 @@ exit 99
         assert not compose_calls.exists()
         assert not docker_calls.exists()
 
+    @pytest.mark.parametrize(
+        ("preexisting_image", "build_replaces_tag"),
+        [(None, True), ("sha256:staged", True), ("sha256:staged", False)],
+        ids=["new-tag", "replaced-tag", "successful-no-op-build"],
+    )
     def test_dashboard_deploy_validates_candidate_before_live_start(
         self,
         tmp_path,
+        preexisting_image,
+        build_replaces_tag,
     ):
         """A bad newly built bundle must fail before compose replaces the
         currently served dashboard."""
         calls = tmp_path / "compose-calls.log"
         docker_calls = tmp_path / "docker-calls.log"
+        image_state = tmp_path / "image-state"
+        if preexisting_image:
+            image_state.write_text(preexisting_image + "\n")
         compose = tmp_path / "compose"
         compose.write_text(
             """#!/usr/bin/env sh
@@ -1665,6 +1675,9 @@ case "$1" in
     exit 0
     ;;
     build)
+      if [ "$BUILD_REPLACES_TAG" = "1" ]; then
+        printf '%s\\n' sha256:candidate > "$IMAGE_STATE"
+      fi
       exit 0
       ;;
     up)
@@ -1685,8 +1698,12 @@ exit 1
 set -eu
   printf '%s\\n' "$*" >> "$DOCKER_CALLS"
   if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then
-    printf '%s\\n' sha256:candidate
+    [ -f "$IMAGE_STATE" ] || exit 1
+    cat "$IMAGE_STATE"
     exit 0
+  fi
+  if [ "${1:-}" = "image" ] && [ "${2:-}" = "rm" ]; then
+    rm -f "$IMAGE_STATE"
   fi
   if [ "${1:-}" = "run" ]; then
     exit 1
@@ -1709,6 +1726,8 @@ exit 0
         env["PATH"] = f"{fake_bin}:{env['PATH']}"
         env["COMPOSE_CALLS"] = str(calls)
         env["DOCKER_CALLS"] = str(docker_calls)
+        env["IMAGE_STATE"] = str(image_state)
+        env["BUILD_REPLACES_TAG"] = "1" if build_replaces_tag else "0"
         env["DASHBOARD_TOKEN"] = "test-token"
         env["DASHBOARD_NODE_IMAGE"] = "fake-node"
         lock_dir = tmp_path / "deploy.lock"
@@ -1732,7 +1751,13 @@ exit 0
         assert (
             "run --rm orcest-dashboard:latest node scripts/check-bundle-runtime.mjs" in docker_text
         )
-        assert "image rm orcest-dashboard:latest" in docker_text
+        if build_replaces_tag:
+            assert "image rm orcest-dashboard:latest" in docker_text
+            assert not image_state.exists()
+        else:
+            assert "image rm orcest-dashboard:latest" not in docker_text
+            assert image_state.read_text().strip() == preexisting_image
+            assert "keeping the existing image" in result.stderr
         assert not lock_dir.exists()
 
     def test_dashboard_deploy_falls_back_to_explicit_candidate_image(
@@ -1887,6 +1912,7 @@ exit 1
 set -eu
 printf '%s\\n' "$*" >> "$DOCKER_CALLS"
 if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ] && [ "${5:-}" = "custom-dashboard:env" ]; then
+  grep -q '^build dashboard$' "$COMPOSE_CALLS" || exit 1
   printf '%s\\n' sha256:candidate
   exit 0
 fi
