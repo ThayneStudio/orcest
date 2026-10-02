@@ -1,5 +1,80 @@
 # Local dashboard readiness milestone
 
+## Qualified private rollout — October 2, 2026 UTC
+
+The local milestone and separate dashboard rollout gates are complete. Independent
+reviews audited the raw samples, pinned manifests and terminal summaries before
+deployment; the published runtime and browser were checked afterward. Earlier
+September 18 and interrupted September 30/October 1 intervals remain unqualified
+and contribute no time to these completed runs.
+
+| Interval | Completed evidence |
+| --- | --- |
+| Synthetic: September 30 23:54:52 UTC to October 1 12:54:52 UTC | One unchanged thirteen-hour run; 781 samples, zero failures, 623 cursor reconnect checks, explicit stale/fresh recovery and normal twelve-hour session expiry. Maximum sampled RSS: 101748 KiB. |
+| Live: October 1 00:36:10 UTC to October 2 00:36:10 UTC | One unchanged twenty-four-hour run; 1441 samples, zero failures, 1417 complete and 24 partial samples. All 19 stale episodes recovered explicitly under the same IDs; longest approximately 180.14 seconds. Session expiry/reauthentication and final logout revocation passed. |
+
+The live run observed advancing output for fifteen new attempts and independently
+verified five merged GitHub heads for the same attempts. Orcest task
+`567952bb-bf9a-42a4-bd76-bc7a63a3d4c0` delivered
+[PR #839](https://github.com/ThayneStudio/orcest/pull/839), head
+`122b76a236a0b531e420ce689580d3455b93c7fa`, merged October 1 at 00:54:30 UTC.
+Synthetic outcomes, historical deliveries and idle uptime did not establish
+fresh live execution or delivery. Manually completed
+[PR #841](https://github.com/ThayneStudio/orcest/pull/841) is separate from this
+fleet-delivery evidence; its never-claimed queued task and matching pending
+marker were retired through independently reviewed atomic guards.
+
+Qualification covered dashboard `795042202e8037baf9216ed0225f95e46b3bfe82`,
+source-only observation producer backport
+`8a09f0bd6f4a80b18038c04230e5814cbfa1536a`, and workers
+`cb936ecb539fe0af4a5aaafbaf4e262bd575acb1`. This deliberately validated mixed
+runtime is not a whole-fleet revision upgrade or workflow v1 adoption.
+
+The exact staged dashboard image
+`sha256:23f62f362c6f2dedf81a6a11f4549135100ab6c7fc2d1f9dc968339a3fbbdd54`
+started on the fleet host at October 2 15:27:29 UTC without rebuilding. Independent
+readback verified all 21 pinned runtime/browser artifacts and served asset
+hashes, the full candidate revision above, healthy readiness, unauthorized HTTP 401,
+authorized HTTP 200 and the four intended project scopes. Protected old-image
+rollback inputs remain intact. See [private access and rollback](../fleet-dashboard.md#qualified-private-release--october-2-2026-utc).
+
+Published browser QA at 15:33:36–15:33:48 UTC passed fourteen checks with no
+console errors, page errors or failed requests: sign-in, project filters,
+search/details, actual retained output for an executing Transit task, fleet
+account/worker/pool distinctions, exceptional blockers, mobile layout and
+sign-out. A separate read-only historical lookup probe was OPEN immediately
+before logout and closed with code 1008, “Session ended”; the old cookie then
+returned HTTP 401. That probe establishes subscription revocation only, not
+execution or output. Actual nonempty task output was checked separately.
+The first failed browser attempt is preserved: its task socket completed
+naturally, so it could not establish logout revocation.
+
+No live provider cooldown was available during browser QA. Synthetic tests
+cover that behavior. No destructive outage or VM replacement was injected into
+the real fleet. Production v1 pilot, isolation, retirement and backup/restore
+observation gates remain unqualified under
+[issue #667](https://github.com/ThayneStudio/orcest/issues/667).
+
+Raw samples, manifests, summaries and independent audits are preserved privately
+under `/home/thayne/orcest-closeout/`: `synthetic-final-20261001/`,
+`live-producer-8a09f0bd-20261001/`, `published-browser-client/` and `evidence/`.
+These are private evidence locations, not public artifact links. Credentials,
+raw fleet samples and environment files are excluded from this repository.
+
+Independent replay checked raw timing, RSS, physical source observations,
+stale-ID recovery and output-cursor progression. Authentication expiry,
+reauthentication and logout, full inventory pagination/accounting, and
+per-sample process identity/readiness were enforced by assertions in the
+unchanged reviewed collector. The evidence does not serialize a complete
+HTTP or inventory trace, so those assertion-backed checks are not a claim
+that every authentication response or inventory page was independently replayed.
+
+## Historical milestone and validation records
+
+The dated records below preserve original observations and unresolved states at
+those times. Their pending gates, deployed revisions and initial local-only
+boundary are superseded by the qualification and authorized rollout above.
+
 Approved by Austin on 2026-09-17 as the next milestone of the existing dashboard
 hardening goal. Local development uses the isolated fake-fleet harness and does
 not depend on Tailscale connectivity.
@@ -13,14 +88,14 @@ and live-fleet qualification. Keep production services and Cloudflare unchanged.
 
 ## Completion criteria
 
-- [ ] Browser QA: card details, incrementally streamed output, project/search
+- [x] Browser QA: card details, incrementally streamed output, project/search
   filters, mobile layout, sign-in/logout, and understandable outage/stale states.
   Record findings, fix defects, and verify fixes in the browser.
-- [ ] Sustained local validation: record timestamped samples and exercise
+- [x] Sustained local validation: record timestamped samples and exercise
   reconnects, normal session expiry, memory behavior, and stale observations.
   Preserve interruptions and failures in durable evidence; do not silently
   restart or count gaps as healthy time.
-- [ ] Open a PR containing the local harness and dependency patch; address review
+- [x] Open a PR containing the local harness and dependency patch; address review
   findings and obtain passing CI for the final candidate. Report remaining
   limitations and link the validation evidence.
 
