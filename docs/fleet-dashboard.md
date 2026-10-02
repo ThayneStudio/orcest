@@ -160,3 +160,39 @@ and describe an empty, unavailable feed as a successful fleet integration.
 Rollback the affected images to the previous verified revision. The old runtime
 ignores `dashboard:*` keys, which can remain in Redis. Do not delete coordination
 keys or flush Redis. Restarting the dashboard requires users to sign in again.
+
+
+## Qualified private release — October 2, 2026 UTC
+
+The staged dashboard revision `795042202e8037baf9216ed0225f95e46b3bfe82`, image
+`sha256:23f62f362c6f2dedf81a6a11f4549135100ab6c7fc2d1f9dc968339a3fbbdd54`,
+started October 2 at 15:27:29 UTC on `10.20.1.129`. The host binds the dashboard
+only to `127.0.0.1:8080`. Operators can open a private tunnel from their workstation:
+
+```sh
+ssh -N -L 8080:127.0.0.1:8080 orcest@10.20.1.129
+```
+
+Then visit `http://localhost:8080` and sign in with the existing protected token.
+Keep tokens out of URLs and repository files. The Cloudflare container was
+unchanged and the current local configuration hash recorded; this closeout did
+not inspect prior configuration hashes or the external Cloudflare control plane,
+so it does not certify external routing or access-policy changes.
+
+Independent post-deploy readback matched all 21 pinned runtime/browser artifacts
+and served assets, health/readiness revision, authenticated four-project scope
+and HTTP 401/200 boundaries. Fourteen actual published browser checks passed,
+including nonempty retained output, mobile layout and logout revocation.
+See [qualification evidence and limits](operations/dashboard-local-readiness.md).
+The deployment used the reviewed staged image without rebuilding against the
+validated mixed baseline: observation producers `8a09f0bd`, workers `cb936ecb`
+and dashboard `7950422`. Workflow v1 production adoption remains separate.
+
+The protected previous-release Compose baseline is
+`/opt/orcest/dashboard-closeout-backups/20260930/dashboard-baseline.json`, with
+its original image retained. Use that protected baseline and its exact old
+image for rollback. The mutable last-known-good state at
+`/opt/orcest/releases/795042202e8037baf9216ed0225f95e46b3bfe82/rollout/dashboard-compose-state.json`
+now describes the candidate; it is not the original baseline. Preserve protected
+environment files and rollback images. Never flush Redis or delete coordination
+keys as part of dashboard rollback; restarting requires users to sign in again.

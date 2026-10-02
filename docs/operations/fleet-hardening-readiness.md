@@ -3,6 +3,18 @@
 Started 2026-09-05. This is the execution record for the approved hardening goal,
 not a declaration that the fleet is ready for broader access.
 
+## Current dashboard qualification — October 2, 2026 UTC
+
+Independent audits passed the fresh thirteen-hour synthetic and twenty-four-hour
+live dashboard intervals. The exact staged dashboard was deployed privately on
+October 2 and its published artifacts, authentication, four-project inventory
+and browser behavior verified. See the [completed readiness record](dashboard-local-readiness.md)
+and [private access/rollback record](../fleet-dashboard.md#qualified-private-release--october-2-2026-utc).
+This qualifies the dashboard and observation integration against the recorded
+mixed producer/worker revisions. It does not qualify production workflow v1
+adoption, destructive live recovery or broader external access. Earlier dated
+records below remain historical evidence; interrupted intervals count no time.
+
 ## Scope and release boundary
 
 Keep browser access on localhost and leave Cloudflare routes unchanged. Use
@@ -22,12 +34,12 @@ its store tests do not prove recovery of the currently deployed legacy queue.
 | Review findings | Every comment fixed or explicitly explained; review of final candidate | PR #817 approved with no blocking findings and merged; post-merge CI passed |
 | Supported runtime | Supported LTS Node, consistent build/deploy pins, type checks and image smoke | Node 24.20.0 passes local checks; candidate container authentication/assets/bundle smoke passed |
 | Dependency security | Audit locked dependencies; no unexplained high/critical findings | Updated lockfile reports zero npm advisories on 2026-09-05 |
-| Data correctness | Expiration, partial discovery, stale observations, completion evidence, account/worker distinction | Dashboard regression suite passes; previous candidate read live scoped data successfully; restored candidate awaits fleet connectivity |
-| Session/output behavior | Expiry, logout, token rotation, reconnect, bounded connections and output queues | Existing tests cover these boundaries; local process rehearsal passed |
+| Data correctness | Expiration, partial discovery, stale observations, completion evidence, account/worker distinction | Regression suite and published four-project scope checks pass; fresh live interval independently audited |
+| Session/output behavior | Expiry, logout, token rotation, reconnect, bounded connections and output queues | Existing tests and local rehearsal pass; completed intervals observed expiry/reconnects and published logout revocation |
 | Queue recovery | Crash before ACK, durable pending state, replay, ownership safety under concurrency | Existing unit and real-Redis tests identified; local process rehearsal passed; managed Redis integration/concurrency: 12 passed |
 | External outages | GitHub/Redis failures pause safely and recover without lost outcomes or repeated effects | Unit result-replay coverage passes; local process rehearsal passed |
-| Restore and rollback | Restore data into an isolated instance; verify candidate rollback with exact artifacts | Local restore and real-script rollback rehearsals passed; deployment-specific validation remains |
-| Sustained operation | 24 hours of timestamped measurements with representative work and no unexplained failure | Interrupted after 14h34m on 2026-09-06; a new full interval is required |
+| Restore and rollback | Restore data into an isolated instance; verify candidate rollback with exact artifacts | Isolated restore/rollback rehearsals passed; published exact-image/config rollback inputs independently verified intact |
+| Sustained operation | 24 hours of timestamped measurements with representative work and no unexplained failure | October 1–2 dashboard/observation interval passed: 1441 samples, zero failures, new output and five independently verified same-attempt deliveries |
 
 ## PR 814 comment dispositions
 
