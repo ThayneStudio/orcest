@@ -2773,8 +2773,8 @@ def test_rebake_pointer_swap_failure_prints_authenticated_redis_cli(
     assert "pointer swap failed" in result.output
     normalized_output = " ".join(result.output.split())
     assert "docker exec orcest-redis-redis-1" in normalized_output
-    assert 'redis-cli -a "$ORCEST_REDIS_PASSWORD"' in normalized_output
-    assert "--no-auth-warning" in normalized_output
+    assert 'export REDISCLI_AUTH="$ORCEST_REDIS_PASSWORD"' in normalized_output
+    assert "exec redis-cli -e" in normalized_output
 
 
 def test_destroy_template_refuses_active_pointer(runner, cfg_path, mocker):

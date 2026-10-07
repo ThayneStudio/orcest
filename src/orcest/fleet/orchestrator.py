@@ -52,10 +52,13 @@ _REDIS_CONTAINER = "orcest-redis-redis-1"
 # C1: Redis now requires AUTH, so the CLI must authenticate. The password is
 # read from the container's own environment (delivered via the redis stack's
 # --env-file) rather than interpolated by the outer ssh shell — that keeps the
-# secret off the fleet host's argv / process listing / ssh debug logs.
+# secret off the fleet host's argv / process listing / ssh debug logs. It is
+# handed to redis-cli via ``REDISCLI_AUTH`` rather than ``-a``: ``-a <pw>`` puts
+# the password on redis-cli's own argv, which ``ps`` on the orchestrator VM
+# shows to every local user for as long as the command runs.
 #
-# Form: ``docker exec C sh -c 'exec redis-cli -a "$ORCEST_REDIS_PASSWORD"
-# --no-auth-warning "$@"' redis-cli``. Call sites append a flat argument string
+# Form: ``docker exec C sh -c 'export REDISCLI_AUTH="$ORCEST_REDIS_PASSWORD";
+# exec redis-cli -e "$@"' redis-cli``. Call sites append a flat argument string
 # after the prefix (e.g. ``--raw SMEMBERS key``); the outer ssh shell word-splits
 # it and docker passes the tokens as separate argv to the in-container ``sh``,
 # where ``"$@"`` forwards them to redis-cli. The trailing ``redis-cli`` token
@@ -63,7 +66,7 @@ _REDIS_CONTAINER = "orcest-redis-redis-1"
 # real redis-cli exit status back through ``sh``/``docker exec``.
 _REDIS_CLI_PREFIX = (
     f"sudo docker exec {_REDIS_CONTAINER} "
-    'sh -c \'exec redis-cli -a "$ORCEST_REDIS_PASSWORD" --no-auth-warning -e "$@"\' redis-cli'
+    'sh -c \'export REDISCLI_AUTH="$ORCEST_REDIS_PASSWORD"; exec redis-cli -e "$@"\' redis-cli'
 )
 
 # Older redis-cli builds, wrappers, and test doubles can still report a Redis
@@ -464,12 +467,11 @@ def _is_source_root(path: Path) -> bool:
 def ensure_redis_password(ssh_target: str) -> str:
     """Mint + persist the Redis AUTH password on the orchestrator VM (idempotent).
 
-    C1: ``docker-compose.redis.yml`` runs ``redis-server --requirepass
-    ${ORCEST_REDIS_PASSWORD}``. That variable must come from somewhere, or Redis
-    boots with an *empty* requirepass — which Compose renders as
-    ``--requirepass --appendonly yes`` (the next flag is consumed as the
-    password's value), a FATAL misconfiguration / total outage. This helper is
-    the single source of truth for that secret.
+    C1: ``docker-compose.redis.yml`` sets Redis's ``requirepass`` from
+    ${ORCEST_REDIS_PASSWORD} (via an in-container config file, never argv).
+    That variable must come from somewhere, or the Redis container refuses to
+    start — a total outage. This helper is the single source of truth for that
+    secret.
 
     Behaviour:
       * If :data:`REDIS_ENV_PATH` already exists and is non-empty, its value is
@@ -535,8 +537,8 @@ def ensure_redis_stack(ssh_target: str) -> None:
     Idempotent -- safe to call if Redis is already running.
 
     C1: ``--env-file`` supplies ${ORCEST_REDIS_PASSWORD} (minted by
-    :func:`ensure_redis_password`) so ``redis-server --requirepass`` gets a real
-    value instead of booting unauthenticated / mis-parsing the next flag.
+    :func:`ensure_redis_password`) so Redis gets a real ``requirepass`` instead
+    of refusing to start.
     """
     logger.info("Ensuring shared Redis stack on %s", ssh_target)
     result = _ssh(
@@ -1384,7 +1386,7 @@ def generate_env_file(
     if redis_password:
         # C1: forwarded to the orchestrator container via docker-compose.yml so
         # it can AUTH to the now-password-protected Redis. The same value backs
-        # the redis stack's --requirepass; the .env is written 0600.
+        # the redis stack's requirepass; the .env is written 0600.
         _validate_env_value(redis_password, "redis_password")
         lines.append(f"ORCEST_REDIS_PASSWORD='{redis_password}'")
     if monitor_write_token:

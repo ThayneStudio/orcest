@@ -1070,9 +1070,9 @@ def create_orchestrator(vm_id: int | None, storage: str | None, config: str) -> 
     try:
         from orcest.fleet.orchestrator import ensure_redis_password, ensure_redis_stack
 
-        # C1: mint BEFORE the stack starts so --requirepass gets a real value
-        # (an empty ORCEST_REDIS_PASSWORD makes Redis consume the next flag as
-        # its password -- a FATAL boot / total outage).
+        # C1: mint BEFORE the stack starts so requirepass gets a real value
+        # (an empty ORCEST_REDIS_PASSWORD makes the Redis container refuse to
+        # start -- a total outage).
         console.print("  Minting Redis password...")
         ensure_redis_password(ssh_target)
         console.print("  Starting shared Redis stack...")
@@ -1380,8 +1380,8 @@ def update(ctx: click.Context, config: str, skip_pool_manager: bool) -> None:
         from orcest.fleet.orchestrator import ensure_redis_password, ensure_redis_stack
 
         # C1: ensure the password exists (idempotent; reuses an existing one) so
-        # the --env-file'd stack restarts with --requirepass populated rather
-        # than empty.
+        # the --env-file'd stack restarts with requirepass populated rather
+        # than refusing to start.
         redis_password = ensure_redis_password(ssh_target)
         ensure_redis_stack(ssh_target)
         console.print("[green]ok[/green]")
