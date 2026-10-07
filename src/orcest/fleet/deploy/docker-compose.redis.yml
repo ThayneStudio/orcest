@@ -15,18 +15,41 @@ services:
     # (multi-VM fleet: worker VMs reach Redis over the private subnet); the bind
     # is no longer unauthenticated.
     environment:
-      # --env-file only interpolates ${VAR} into the command above; it does NOT
-      # put the var into the container's runtime env. The healthcheck (below)
-      # and `docker exec ... redis-cli -a "$ORCEST_REDIS_PASSWORD"` (the fleet's
-      # _REDIS_CLI_PREFIX) read it INSIDE the container, so it must be here too,
-      # else the healthcheck auths with an empty password -> container reports
-      # "unhealthy" and fleet redis-cli ops fail WRONGPASS.
+      # --env-file only interpolates ${VAR} into this file; it does NOT put the
+      # var into the container's runtime env. The entrypoint wrapper, the
+      # healthcheck (below) and the fleet's _REDIS_CLI_PREFIX all read it INSIDE
+      # the container, so it must be here, else Redis refuses to start and fleet
+      # redis-cli ops fail NOAUTH.
       - ORCEST_REDIS_PASSWORD=${ORCEST_REDIS_PASSWORD}
-    command: redis-server --requirepass ${ORCEST_REDIS_PASSWORD} --appendonly yes --maxmemory 1gb --maxmemory-policy noeviction
+    # The password must never be on argv: `--requirepass <pw>` lands in the
+    # container's Config.Cmd, so `docker inspect` / `docker ps --no-trunc` print
+    # it (that is how it leaked during the 2026-10-02 audit). Instead this
+    # wrapper writes it into a 0600 config file (printf is a shell builtin, so
+    # the value is never on any process's argv) and hands off to the image's
+    # own entrypoint, which still drops to the redis user. $$ escapes Compose
+    # interpolation so only the variable *name* is stored in the container
+    # config. An empty password is refused rather than booting without AUTH.
+    # Minted passwords are hex (openssl rand -hex 32), so no config quoting.
+    # The rm comes first because on a container restart the previous file is
+    # owned by redis inside sticky /tmp, and fs.protected_regular stops even
+    # root from reopening it for writing; root may still unlink it.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        [ -n "$$ORCEST_REDIS_PASSWORD" ] || { echo "ORCEST_REDIS_PASSWORD is empty; refusing to start Redis without AUTH" >&2; exit 1; };
+        umask 077 &&
+        rm -f /tmp/orcest-auth.conf &&
+        printf 'requirepass %s\n' "$$ORCEST_REDIS_PASSWORD" > /tmp/orcest-auth.conf &&
+        chown redis:redis /tmp/orcest-auth.conf &&
+        exec docker-entrypoint.sh "$$@"
+      - orcest-redis-entrypoint
+    command: redis-server /tmp/orcest-auth.conf --appendonly yes --maxmemory 1gb --maxmemory-policy noeviction
     restart: unless-stopped
     healthcheck:
       # $$ escapes Compose interpolation so the var is read inside the container.
-      test: ["CMD-SHELL", "redis-cli -a $${ORCEST_REDIS_PASSWORD} --no-auth-warning ping | grep -q PONG"]
+      # REDISCLI_AUTH rather than -a keeps the password off redis-cli's argv.
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${ORCEST_REDIS_PASSWORD}\" redis-cli ping | grep -q PONG"]
       interval: 10s
       timeout: 3s
       retries: 3
