@@ -1,6 +1,7 @@
 """Tests for orcest.fleet.orchestrator pure functions."""
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -1599,12 +1600,13 @@ class TestRedisCliAuthenticates:
     op (pool SMEMBERS/HGETALL, clean_pending_tasks, template pointer) breaks with
     NOAUTH against the now-password-protected Redis."""
 
-    def test_prefix_passes_auth_flag(self):
+    def test_prefix_authenticates_via_env_not_argv(self):
+        """redis-cli gets the password through REDISCLI_AUTH. ``-a <pw>`` would put
+        it on redis-cli's argv, visible in ``ps`` to every user on the VM."""
         from orcest.fleet.orchestrator import _REDIS_CLI_PREFIX
 
-        # redis-cli must receive -a <password> and suppress the auth warning.
-        assert "-a " in _REDIS_CLI_PREFIX
-        assert "--no-auth-warning" in _REDIS_CLI_PREFIX
+        assert 'export REDISCLI_AUTH="$ORCEST_REDIS_PASSWORD"' in _REDIS_CLI_PREFIX
+        assert "-a " not in _REDIS_CLI_PREFIX
         assert " -e " in _REDIS_CLI_PREFIX
 
     def test_prefix_reads_password_from_container_env(self):
@@ -1640,15 +1642,15 @@ class TestRedisCliAuthenticates:
         ssh.reset_mock()
         get_pool_redis_members("user@host")
         for call in ssh.call_args_list:
-            assert "--no-auth-warning" in call[0][1]
+            assert "REDISCLI_AUTH" in call[0][1]
 
         ssh.reset_mock()
         clean_pool_redis("user@host", ["300"])
         cleanup_cmd = ssh.call_args_list[0][0][1]
         verify_cmd = ssh.call_args_list[1][0][1]
         # Seven cleanup operations plus five verification reads are authenticated.
-        assert cleanup_cmd.count("--no-auth-warning") == 7
-        assert verify_cmd.count("--no-auth-warning") == 5
+        assert cleanup_cmd.count("REDISCLI_AUTH") == 7
+        assert verify_cmd.count("REDISCLI_AUTH") == 5
 
     def test_raw_flag_preserved(self, mocker):
         """--raw is still appended for line-per-value parsing."""
@@ -1768,3 +1770,53 @@ def test_template_revision_tracks_pointer_rollback_and_unknown_templates(mocker)
     assert orch.get_current_template_revision("host") == "a" * 40
     redis.set("orcest:pool:current_template_vmid", 9003)
     assert orch.get_current_template_revision("host") is None
+
+
+class TestRedisComposeKeepsPasswordOffArgv:
+    """The deployed Redis stack must never put the password on argv. With
+    ``--requirepass ${ORCEST_REDIS_PASSWORD}`` Compose interpolated the value
+    into the container's Config.Cmd, so ``docker inspect`` and
+    ``docker ps --no-trunc`` printed it. Every reference must instead be an
+    escaped ``$$`` reference that the container's own shell expands."""
+
+    def _redis_service(self):
+        path = Path(__file__).parents[2] / "src/orcest/fleet/deploy/docker-compose.redis.yml"
+        return yaml.safe_load(path.read_text())["services"]["redis"]
+
+    def _argv_fields(self, service):
+        entrypoint = service["entrypoint"]
+        command = service["command"]
+        healthcheck = service["healthcheck"]["test"]
+        return [
+            *(entrypoint if isinstance(entrypoint, list) else [entrypoint]),
+            *(command if isinstance(command, list) else [command]),
+            *healthcheck,
+        ]
+
+    def test_no_compose_interpolated_password_on_argv(self):
+        for field in self._argv_fields(self._redis_service()):
+            # ``${VAR}`` / ``$VAR`` not preceded by another ``$`` is interpolated
+            # by Compose into the stored container config.
+            assert not re.search(r"(?<!\$)\$\{?ORCEST_REDIS_PASSWORD", field), field
+            assert "--requirepass" not in field
+            assert "redis-cli -a" not in field
+
+    def test_password_is_written_to_a_private_config_file(self):
+        service = self._redis_service()
+        script = service["entrypoint"][2]
+        assert "umask 077" in script
+        assert "printf 'requirepass %s\\n' \"$$ORCEST_REDIS_PASSWORD\"" in script
+        assert "rm -f /tmp/orcest-auth.conf" in script
+        # Hands off to the image entrypoint so Redis still drops to the redis user.
+        assert 'exec docker-entrypoint.sh "$$@"' in script
+        assert service["command"].startswith("redis-server /tmp/orcest-auth.conf ")
+
+    def test_empty_password_refuses_to_start(self):
+        script = self._redis_service()["entrypoint"][2]
+        assert '[ -n "$$ORCEST_REDIS_PASSWORD" ] || {' in script
+        assert "exit 1" in script
+
+    def test_healthcheck_authenticates_via_env(self):
+        test = self._redis_service()["healthcheck"]["test"]
+        assert test[0] == "CMD-SHELL"
+        assert 'REDISCLI_AUTH="$${ORCEST_REDIS_PASSWORD}" redis-cli ping' in test[1]
