@@ -716,6 +716,27 @@ export function createDashboardServer(
   };
 }
 
+/**
+ * Report the address the server actually bound. Inside the container that is
+ * every interface ([::] or 0.0.0.0), so other containers on the compose
+ * network, cloudflared included, can reach it. Only the host publish in
+ * docker-compose.dashboard.yml (127.0.0.1:8080) keeps it off the LAN, so the
+ * log must not claim a loopback-only listener.
+ */
+export function dashboardListeningMessage(
+  address: ReturnType<Server["address"]>,
+  fallbackPort: number,
+): string {
+  if (typeof address !== "object" || address === null) {
+    return `Orcest dashboard listening on port ${fallbackPort}`;
+  }
+  const host = address.family === "IPv6" ? `[${address.address}]` : address.address;
+  const scope = address.address === "::" || address.address === "0.0.0.0"
+    ? " (all interfaces in this container; host exposure is set by the port publish)"
+    : "";
+  return `Orcest dashboard listening on ${host}:${address.port}${scope}`;
+}
+
 export function startDashboardServer(
   options: DashboardServerOptions = {},
 ): DashboardServerInstance {
@@ -723,14 +744,7 @@ export function startDashboardServer(
   const logInfo = options.deps?.logInfo ?? console.log;
 
   instance.server.listen(instance.port, () => {
-    // The container binds 0.0.0.0 internally, but the port is published on
-    // host loopback only by docker-compose.dashboard.yml. Other containers on
-    // the compose network can still reach the internal listener.
-    const address = instance.server.address();
-    const boundPort = typeof address === "object" && address !== null
-      ? address.port
-      : instance.port;
-    logInfo(`Orcest dashboard listening on http://127.0.0.1:${boundPort}`);
+    logInfo(dashboardListeningMessage(instance.server.address(), instance.port));
   });
 
   return instance;
