@@ -149,8 +149,29 @@ app-level token check in `orcest.monitor.auth` runs regardless of how the
 request arrived. Do not treat "has an Access service token" as equivalent to
 "is allowed to read events/traces."
 
+**Check the tunnel's catch-all rule.** The production tunnel (remotely
+managed, token only, so its ingress lives in Cloudflare, not in this repo) has
+a legacy catch-all: every path on its hostname outside `^/api/v1/` goes to
+`http://host.docker.internal:8080`, the fleet dashboard's host port. The
+`extra_hosts` entry in `docker-compose.monitor.yml` exists only to make that
+target resolvable. Today the route fails because the dashboard is published on
+`127.0.0.1:8080`, and the dashboard deploy now refuses any non-loopback
+publish (#850). Two things would still expose the dashboard publicly behind
+nothing but its shared token:
+
+- a Cloudflare-side edit pointing any rule at `http://dashboard:8080`, since
+  cloudflared shares the `orcest` network with the dashboard, which listens
+  on all container interfaces;
+- any change that publishes host port 8080 beyond loopback outside the
+  deploy script.
+
+The fix is on the Cloudflare side: point the catch-all at `http_status:404`,
+or record which Access policy covers the hostname. Until then, treat the
+loopback publish as a hard requirement.
+
 **Ingest (`:9091`) must never get a tunnel hostname.** Only the query
-listener (`:9090`) is exposed through Cloudflare. The ingest listener stays
+listener (`:9090`) should be exposed through Cloudflare (but see the
+catch-all above). The ingest listener stays
 reachable only on the compose network, authenticated by the single write
 token from step 1 — there is no reader-scoped access control on it, so
 exposing it publicly would let anyone with the write token (or a leaked

@@ -12,6 +12,7 @@ import {
   createCoalescedFetch,
   createDashboardServer,
   dashboardBuildRevision,
+  dashboardListeningMessage,
   dashboardTaskOutputConnectionOptions,
   dashboardPortFromEnv,
   dashboardRevisionFromEnv,
@@ -154,16 +155,39 @@ describe("dashboardPortFromEnv", () => {
       const address = instance.server.address() as AddressInfo;
 
       expect(address.port).toBeGreaterThan(0);
-      expect(logInfo).toHaveBeenCalledWith(
-        `Orcest dashboard listening on http://127.0.0.1:${address.port}`,
-      );
-      expect(logInfo).not.toHaveBeenCalledWith(
-        "Orcest dashboard listening on http://127.0.0.1:0",
-      );
+      expect(logInfo).toHaveBeenCalledWith(dashboardListeningMessage(address, 0));
+      const logged = String(logInfo.mock.calls[0]?.[0]);
+      expect(logged).toContain(`:${address.port}`);
+      expect(logged).not.toContain("127.0.0.1");
     } finally {
       await instance.close();
       fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("dashboardListeningMessage", () => {
+  it("reports a wildcard listener as all interfaces, never as loopback", () => {
+    expect(
+      dashboardListeningMessage({ address: "::", family: "IPv6", port: 8080 }, 8080),
+    ).toBe(
+      "Orcest dashboard listening on [::]:8080 (all interfaces in this container; host exposure is set by the port publish)",
+    );
+    expect(
+      dashboardListeningMessage({ address: "0.0.0.0", family: "IPv4", port: 8080 }, 8080),
+    ).toBe(
+      "Orcest dashboard listening on 0.0.0.0:8080 (all interfaces in this container; host exposure is set by the port publish)",
+    );
+  });
+
+  it("reports a specific address as bound", () => {
+    expect(
+      dashboardListeningMessage({ address: "127.0.0.1", family: "IPv4", port: 9000 }, 8080),
+    ).toBe("Orcest dashboard listening on 127.0.0.1:9000");
+  });
+
+  it("falls back to the configured port when the address is unavailable", () => {
+    expect(dashboardListeningMessage(null, 8080)).toBe("Orcest dashboard listening on port 8080");
   });
 });
 

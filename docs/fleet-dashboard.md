@@ -174,6 +174,16 @@ ssh -N -L 8080:127.0.0.1:8080 orcest@10.20.1.129
 ```
 
 Then visit `http://localhost:8080` and sign in with the existing protected token.
+
+The loopback publish is the only thing keeping the dashboard private. The
+monitor's Cloudflare tunnel has a legacy catch-all that routes its public
+hostname's non-`/api/v1/` paths to this host's port 8080 (see the
+[monitor exposure runbook](monitor-exposure-runbook.md#4-external-exposure-via-cloudflare-tunnel--access)).
+Inside its container the dashboard listens on all interfaces, and its startup
+log says so. `dashboard/scripts/deploy-compose-dashboard.sh` reads Docker's
+actual bindings after starting a candidate and rolls back if anything is
+published beyond `127.0.0.0/8` or `[::1]`. Never publish 8080 on `0.0.0.0` or a
+LAN address.
 Keep tokens out of URLs and repository files. The Cloudflare container was
 unchanged and the current local configuration hash recorded; this closeout did
 not inspect prior configuration hashes or the external Cloudflare control plane,
