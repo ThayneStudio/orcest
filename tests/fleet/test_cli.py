@@ -1318,10 +1318,16 @@ def _codex_version_line() -> str:
     return f"codex-cli {_CODEX_VERSION}"
 
 
+def _grok_version_line() -> str:
+    from orcest.fleet.cloud_init import _GROK_VERSION
+
+    return f"grok {_GROK_VERSION}"
+
+
 def _successful_provider_cli_probe(host, user, cmd, timeout=60):
     """Return realistic per-binary output for template smoke-check callers."""
     if "grok" in cmd:
-        output = "grok 0.1.216"
+        output = _grok_version_line()
     elif "codex" in cmd:
         output = _codex_version_line()
     else:
@@ -1829,7 +1835,7 @@ class TestVerifyProviderClis:
 
         def fake_ssh(host, user, cmd, timeout=60):
             if "grok" in cmd:
-                output = "grok 0.1.216"
+                output = _grok_version_line()
             elif "codex" in cmd:
                 output = _codex_version_line()
             else:
@@ -1869,7 +1875,7 @@ class TestVerifyProviderClis:
         def fake_ssh(host, user, cmd, timeout=60):
             seen_cmds.append(cmd)
             if "grok" in cmd:
-                output = "grok 0.1.216"
+                output = _grok_version_line()
             elif "codex" in cmd:
                 output = _codex_version_line()
             else:
@@ -1897,7 +1903,7 @@ class TestVerifyProviderClis:
             if binary in cmd:
                 output = reported
             elif "grok" in cmd:
-                output = "grok 0.1.216"
+                output = _grok_version_line()
             elif "codex" in cmd:
                 output = _codex_version_line()
             else:
@@ -1918,7 +1924,7 @@ class TestVerifyProviderClis:
             if "codex" in cmd:
                 output = f"codex-cli 0.148.0\nUpdate available: {_CODEX_VERSION}"
             elif "grok" in cmd:
-                output = "grok 0.1.216"
+                output = _grok_version_line()
             else:
                 output = "claude 1.2.3"
             return mocker.MagicMock(returncode=0, stdout=output, stderr="")

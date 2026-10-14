@@ -90,9 +90,9 @@ _SUPABASE_VERSION = "2.95.4"
 _GROK_VERSION = PROVIDER_CLI_DESIRED_VERSIONS["grok"]
 # SHA-256 of the exact linux-x86_64 Grok binary for _GROK_VERSION. The worker
 # cloud image is amd64, so download the versioned artifact directly instead of
-# executing xAI's mutable bootstrap as root. The x.ai primary and the official
-# installer's GCS fallback returned identical 116,449,128-byte objects with
-# this digest on 2026-08-16 (GCS generation 1779443477078136).
+# executing xAI's mutable bootstrap as root. Two independent fetches of the
+# x.ai primary returned identical 166,079,904-byte objects with this digest on
+# 2026-10-14 (grok 1.0.13, build 5e9a58528b76).
 #
 # FAIL CLOSED: if this is empty or mismatched, the downloaded binary is not
 # installed or executed. Grok degrades gracefully when absent — grok-backed
@@ -101,7 +101,7 @@ _GROK_VERSION = PROVIDER_CLI_DESIRED_VERSIONS["grok"]
 #
 # Re-pin this digest for the manifest's Grok version after validating fixtures:
 #   curl -fsSL https://x.ai/cli/grok-VERSION-linux-x86_64 | sha256sum
-_GROK_BINARY_SHA256 = "01044edfadcddebdb1197195e692f351ad87569e079324b7feac6a08d692d8af"
+_GROK_BINARY_SHA256 = "edf79521581bb5e6b95abef848491a6a742e860da3e237ebe86a280d30dce4c1"
 
 # OpenAI Codex CLI — published as an npm package (@openai/codex). Pinned so
 # template rebakes are reproducible; the ``codex exec --json`` event vocabulary

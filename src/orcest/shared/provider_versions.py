@@ -17,7 +17,7 @@ PROVIDER_CLI_DESIRED_VERSIONS = MappingProxyType(
     {
         "claude": "2.1.235",
         "clauder": "2.1.235",
-        "grok": "0.1.216",
+        "grok": "1.0.13",
         "codex": "0.149.1",
     }
 )

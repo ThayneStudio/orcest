@@ -629,7 +629,7 @@ attest_worker_slots() {
   qm guest exec 10002 -- /bin/bash -lc \
     "systemctl is-active --quiet orcest-worker && \
      test \"\$(cat /etc/orcest/source-revision)\" = '$RELEASE_SHA' && \
-     test \"\$(sudo -u orcest -H grok --version | grep -Eo '[0-9]+\\.[0-9]+\\.[0-9]+' | head -1)\" = 0.1.216" | \
+     test \"\$(sudo -u orcest -H grok --version | grep -Eo '[0-9]+\\.[0-9]+\\.[0-9]+' | head -1)\" = 1.0.13" | \
     tee "$RELEASE_ROOT/guest-${evidence_suffix}-10002.json" | \
     jq -e '.exitcode == 0' >/dev/null
   qm guest exec 10003 -- /bin/bash -lc \
