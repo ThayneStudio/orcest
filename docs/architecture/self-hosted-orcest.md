@@ -71,14 +71,19 @@ Each fleet gets its own bounded VM ID range, and every cleanup path checks owner
 - **Allocation checks the whole cluster.** `_next_vm_id` in `src/orcest/fleet/pool_manager.py` builds its occupied set from VMs named `orcest-worker-*` only. It is replaced by the cluster-wide reservation ported from `selfhosted-runners` (see [carry-over](#selfhosted-runners-merges-into-orcest)).
 - **Fleet B gets its own scoped Proxmox token**, so its pool manager cannot act outside fleet B's VMs.
 
-**Not verified yet:**
+**Fleet A's templates sit inside the runner fleet's range.** Fleet A's current worker template is VM 9003, and `orcest-worker-10002` was cloned from VM 9002. Both are inside the runner fleet's 9000–9999, not the 10900–10999 fleet A templates range above. Left alone, `selfhosted-runners` with `MAX_VMID=9999` would treat them as its own to clean up, and fleet A's ownership checks would reject its own templates. Fleet A's `rebake` also rotates through every VMID in `pool.template_vmid_range`, not just the current one: the CLI's suggested value is `[9000, 9009]`, and template 9001 was in live use earlier (`docs/operations/fleet-dashboard-preflight.md`). One of these two fixes is part of the prerequisite:
+
+1. **Move (preferred).** At fleet A's next rebake, set `pool.template_vmid_range` to a range inside 10900–10999 and bake there. The old templates in 9000–9999 are destroyed only after no fleet A worker is still a linked clone of them, and only by fleet A's template cleanup.
+2. **Named temporary exception.** Until the move, list 9002 and 9003, plus every other VMID in fleet A's deployed `template_vmid_range`, as fleet A templates on loan from the runner range. Fleet B's ownership checks and `selfhosted-runners`' `MAX_VMID` reservation and cleanup must never touch them. The exception is removed once fleet A's templates are in 10900–10999.
+
+The pve.lab side, meaning which template VMIDs fleet A uses there and whether they collide with a runner range, is **Austin to confirm at promotion**.
+
+**Not verified yet.** These checks are read-only and run only on pve-test or the runner hosts. If a value lives on pve.lab, nobody logs in there: the item is marked **Austin to confirm at promotion**, and the work keeps moving. A first attempt on 2026-10-14 could not run. The machine doing the revision had no trusted SSH host key or usable credential for pve-test, and accepting an unknown host key was out of scope, so all four items are still open:
 
 - the live `/etc/github-runners.conf` values;
-- fleet A's deployed template range and `vm_id_end`;
+- fleet A's deployed template range and `vm_id_end`, including whether `template_vmid_range` is `[9000, 9009]` and which template VMIDs exist;
 - which cluster the runner fleet runs on;
 - whether the Proxmox API covers host-side disk cleanup.
-
-These are checked read-only, only on pve-test or the runner hosts. If a value lives on pve.lab, nobody logs in there: the item is marked **Austin to confirm at promotion**, and the work keeps moving.
 
 ### Code changes needed before fleet B can coexist with fleet A
 
@@ -635,7 +640,7 @@ Each stage has an exit check, and nothing advances on a calendar.
 
 | Stage | What happens | Exit check |
 |---|---|---|
-| **Prerequisite** | Austin deploys fleet A with `pool.vm_id_end: 19999`. `selfhosted-runners` gets `MAX_VMID=9999`. The [ownership checks](#vm-id-ownership) are in place. | Fleet A's deployed config shows `vm_id_end: 19999`, and the unverified items under [VM ID ownership](#vm-id-ownership) are checked or marked "Austin to confirm at promotion". **M0 does not start without it.** |
+| **Prerequisite** | Austin deploys fleet A with `pool.vm_id_end: 19999`. Fleet A's templates (9002, 9003 and the rest of its `template_vmid_range`) are either moved into 10900–10999 at the next rebake or listed as a named temporary exception, **before** `selfhosted-runners` gets `MAX_VMID=9999`. The [ownership checks](#vm-id-ownership) are in place. | Fleet A's deployed config shows `vm_id_end: 19999`, and the unverified items under [VM ID ownership](#vm-id-ownership) are checked or marked "Austin to confirm at promotion". **M0 does not start without it.** |
 | M0 | The coexistence code changes (prefix call sites, Terraform dir, whole-cluster allocation, ownership checks) and the Grok ≥ 1.0.13 pin merge to `master`. Fleet B's infrastructure is created on pve-test: controller, git host, dependency mirror, templates and workers. Snapshots are taken first, and fleet A's baseline is diffed after each step. Recovery point RP0 is recorded. | Fleet A's baseline is unchanged. Fleet B's health is green. Boot time and pve-test headroom are measured and the [capacity](#capacity) numbers confirmed. |
 | M1 | The orcest repo is imported into the git host. `main` is a fast-forward-only mirror of GitHub `master`. Fleet B's ready changes are published to GitHub as draft PRs from `selfhosted/*`; fleet A's loop skips drafts. Austin reviews and merges them on GitHub. | Draft PRs pass GitHub CI, and after Austin merges one, the mirror fast-forwards and the Change Request shows `merged`. |
 | M2 | The native backlog opens. Selected GitHub issues are imported under the [ownership rules](#imported-issues-are-owned-by-one-fleet-at-a-time). New work for fleet B is created through the API, MCP or dashboard. | Every imported item is owned by exactly one fleet, and reaches a terminal state with reasons. |
