@@ -2,7 +2,7 @@
 
 Status: **proposal, not approved.** The build is paused until Austin signs off.
 
-Revision 2 addressed the Critical and High findings of two reviews (Astra and Fable) and recorded the decisions Austin made on them. Revision 3 settled the second-round reviews (Astra-2 and Fable-2) with Austin's decisions: v1-aligned records, fresh approvals, protected-path globs, a test-count floor, same-Attempt checks, a reserved `main` CI share, a freeze on human merges, and a narrower M5. A follow-up to revision 3 checked every second-round finding and closed the ones still open. Revision 4 applies Austin's decisions on the third-round reviews: a container grading boundary, baselines pinned to each check, self-deploy deferred, merge-when-green, Verification Set identity and burst capacity for `main`, an explicit inventory pattern list, and a long-term private GitHub mirror per project. [Review findings addressed](#review-findings-addressed) maps each finding to the section that answers it. Medium findings are listed with their fixes in [Medium findings](#medium-findings-planned-fixes).
+Revision 2 addressed the Critical and High findings of two reviews (Astra and Fable) and recorded the decisions Austin made on them. Revision 3 settled the second-round reviews (Astra-2 and Fable-2) with Austin's decisions: v1-aligned records, fresh approvals, protected-path globs, a test-count floor, same-Attempt checks, a reserved `main` CI share, a freeze on human merges, and a narrower M5. A follow-up to revision 3 checked every second-round finding and closed the ones still open. Revision 4 applies Austin's decisions on the third-round reviews: a container grading boundary, baselines pinned to each check, self-deploy deferred, merge-when-green, Verification Set identity and burst capacity for `main`, an explicit inventory pattern list, and a long-term private GitHub mirror per project. Revision 5 closes the third-round Highs R1 (baseline race) and R2 (revert after migration), fixes the preemption state machine and the protected-path coverage gaps, and adds a rootless Docker check to M0. [Review findings addressed](#review-findings-addressed) maps each finding to the section that answers it. Medium findings are listed with their fixes in [Medium findings](#medium-findings-planned-fixes).
 
 This doc covers three separate pieces that let orcest run its own development loop on pve-test without GitHub in the loop:
 
@@ -358,7 +358,7 @@ A `FAILED`, `CANCELLED` or `SUPERSEDED` Activity, and every terminal Attempt oth
 
 | Field | Contents |
 |---|---|
-| `reason_code` | A closed enum: `provider_cli_rejected`, `provider_auth_failed`, `provider_quota_exhausted`, `worker_lost`, `no_progress`, `tool_loop`, `duration_ceiling`, `deadline_exceeded`, `step_timeout`, `verification_error`, `test_count_below_baseline`, `test_report_invalid`, `unprotected_grading_input`, `preempted_for_main`, `image_unavailable`, `pipeline_invalid`, `superseded`, `merge_conflict`, `clone_failed`, `admission_rejected`, `operator_kill`, `cancel_requested`, `cancel_escalated`, `unclassified`. |
+| `reason_code` | A closed enum: `provider_cli_rejected`, `provider_auth_failed`, `provider_quota_exhausted`, `worker_lost`, `no_progress`, `tool_loop`, `duration_ceiling`, `deadline_exceeded`, `step_timeout`, `verification_error`, `test_count_below_baseline`, `test_report_invalid`, `awaiting_baseline`, `preempted_for_main`, `image_unavailable`, `pipeline_invalid`, `superseded`, `merge_conflict`, `clone_failed`, `admission_rejected`, `operator_kill`, `cancel_requested`, `cancel_escalated`, `unclassified`. |
 | `failure_class` / `failure_code` | For a worker-reported failure, v1's class and the worker's code, kept as reported. |
 | `reason_detail` | Specific evidence, bounded and with secrets redacted. For example: `grok 0.1.216 rejected: HTTP 426 Upgrade Required (min 1.0.13)`, or the exit status plus the last classified stderr line. |
 | `stop` | `CONFIRMED` or `PENDING`, for each terminal Attempt. |
@@ -613,31 +613,31 @@ The **grading driver** is the program that reads the pipeline, runs each step, e
 
 **The pipeline is pinned, but its steps still run candidate code.** A step like `make check-fast` runs the candidate's `Makefile`, `tests/conftest.py`, `pyproject.toml` markers and package scripts. An agent could make a step pass by editing those without touching `.orcest/`. Two controls cover this:
 
-- **Protected paths need human review.** The policy lists, as globs, the files the steps delegate to. `**` matches any depth, including the repo root. For this repo the initial list is:
-  - pipeline and build entry points: `.orcest/**`, `Makefile`, `Dockerfile*`, `docker-compose*.yml`, `.github/workflows/**`;
-  - Python test and lint config: `**/conftest.py` (today that is `tests/`, `tests/integration/`, `tests/stress/` and `tests/workflow_store/`), `pyproject.toml`, `setup.cfg`, `pytest.ini`, `tox.ini`, `.coveragerc`, `mypy.ini`, `ruff.toml`, `.ruff.toml`, `.pre-commit-config.yaml`. These are protected whether or not they exist today, because creating one is the attack;
-  - CI and dashboard scripts: `scripts/**`, `dashboard/scripts/**`;
-  - dependency manifests and lockfiles: `requirements*.lock`, `**/package.json`, `**/package-lock.json`;
+- **Protected paths need human review.** The policy holds one list of **protected paths**: glob patterns for every file that can steer a check. `**` matches any depth, including the repo root. Every pattern applies at any depth, so a nested `Makefile`, `pytest.ini` or `scripts/` directory is covered as well as a root one. For this repo the initial list is:
+  - build and pipeline entry points: `.orcest/**`, `.github/workflows/**`, `**/Makefile`, `**/*.mk`, `**/Dockerfile*`, `**/docker-compose*.yml`, `**/noxfile.py`;
+  - Python test, lint and startup config: `**/conftest.py`, `**/pyproject.toml`, `**/setup.cfg`, `**/setup.py`, `**/pytest.ini`, `**/tox.ini`, `**/.coveragerc`, `**/mypy.ini`, `**/ruff.toml`, `**/.ruff.toml`, `**/.pre-commit-config.yaml`, and files Python runs at startup: `**/sitecustomize.py`, `**/usercustomize.py`, `**/*.pth`;
+  - scripts: `**/scripts/**`;
+  - dependency manifests, lockfiles and resolver config: `**/requirements*.lock`, `**/requirements*.txt`, `**/package.json`, `**/package-lock.json`, `**/.npmrc`, `**/pip.conf`, `**/pip.ini`;
+  - runtime version pins: `**/.python-version`, `**/.nvmrc`, `**/.node-version`;
   - TypeScript, Vite and lint config: `**/tsconfig*.json`, `**/vite.config.*`, `**/vitest.config.*`, `**/eslint.config.*`, `**/.eslintrc*`, `**/.prettierrc*`.
 
-  The controller computes from the diff whether a Change Request touches any of them. The flag comes from the diff, not from a branch name or task setting. Such a change needs a human approval that explicitly acknowledges the protected paths, from a subject that did not author it. The list itself is protected.
-- **The protected list is checked against an explicit list of grading-input patterns.** The policy holds a second list, the **grading-input patterns**: file patterns for everything that can steer a check. For this repo:
-  - `**/Makefile`, `**/*.mk`;
-  - `**/conftest.py`, `**/pytest.ini`, `**/tox.ini`, `**/setup.cfg`, `**/pyproject.toml`, `**/.coveragerc`, `**/mypy.ini`, `**/ruff.toml`, `**/.ruff.toml`, `**/.pre-commit-config.yaml`;
-  - `**/package.json`, `**/package-lock.json`, `**/tsconfig*.json`, `**/vite.config.*`, `**/vitest.config.*`, `**/eslint.config.*`, `**/.eslintrc*`, `**/.prettierrc*`;
-  - `**/scripts/**`, `**/Dockerfile*`, `**/docker-compose*.yml`, `requirements*.lock`;
-  - `.orcest/**`, `.github/workflows/**`;
-  - every repository path named literally in a step's command.
-
-  On every `main` set, the driver lists the files in the checkout that match a grading-input pattern. Any match not also covered by a protected glob is a policy error on that `main` set, reason `unprotected_grading_input`. It blocks merges like a red `main` until a human extends the protected list. The pattern list is itself protected. Both lists are plain patterns checked against the file tree, with no tracing or tool-specific detection.
-- **Deleting tests fails.** Every step marked `kind: test` in the policy must name its report; a test step without one is `pipeline_invalid`. The report is written to a directory the driver creates outside the checkout, and must parse as JUnit XML or Vitest JSON, be newer than the step's start, and name at least one test. Otherwise the step fails with `test_report_invalid`. Every required pipeline that runs tests has at least one test step. The driver counts the tests that ran and passed or failed; skipped tests do not count. The **floor** is that step's count from the same pipeline's last passing run on the target tip (the baseline), which is recorded with every `main` set. **Each check pins its baseline:** every member records the baseline ID and floor it was graded against. A candidate that runs fewer tests than the floor fails the step with `test_count_below_baseline`, showing both numbers. When tests are removed on purpose, a human with `admin` records a floor override for that exact head, target and policy, and the override is audited. A pipeline with no baseline yet uses the floor declared in the policy, and the set is labelled "no baseline". The required pipeline set must be non-empty, or the merge gate refuses.
+  These are protected whether or not they exist today, because creating one is the attack. The controller computes from the diff whether a Change Request adds, changes, renames or deletes a matching file. The flag comes from the diff, not from a branch name or task setting. Such a change needs a human approval that explicitly acknowledges the protected paths, from a subject that did not author it. The list itself is protected.
+- **Step commands are covered too.** Policy validation rejects a pipeline (`pipeline_invalid`) if any step command names a repository path, as a literal argument, that no protected pattern covers. A new entry point therefore cannot be added to a pipeline without also being protected.
+- **Coverage is checked on every set, not only after merge.** In revision 4, unprotected grading inputs were found only by an inventory check on `main` sets, after the change had merged. Now the protected list and the grading-input list are one list, and every pattern applies at any depth. So a change that adds a grading input always touches a protected path and needs the acknowledged approval before it can merge. The separate `main` inventory check and `unprotected_grading_input` are retired.
+- **Deleting tests fails.** Every step marked `kind: test` in the policy must name its report; a test step without one is `pipeline_invalid`. The report is written to a directory the driver creates outside the checkout, and must parse as JUnit XML or Vitest JSON, be newer than the step's start, and name at least one test. Otherwise the step fails with `test_report_invalid`. Every required pipeline that runs tests has at least one test step. The driver counts the tests that ran and passed or failed; skipped tests do not count. The **floor** is that step's count from the same pipeline's last passing run on the target tip (the baseline), which is recorded with every `main` set. **Each check pins its baseline:** every member records the baseline ID and floor it was graded against. A candidate that runs fewer tests than the floor fails the step with `test_count_below_baseline`, showing both numbers. When tests are removed on purpose, a human with `admin` records a floor override for that exact head, target and policy, and the override is audited. The required pipeline set must be non-empty, or the merge gate refuses.
+- **No baseline, no merge.** There is no fallback floor. Merges into a target are blocked until that target tip has a real baseline for every required test step:
+  - A member graded against a tip with no recorded baseline still runs and records its test counts. Its set stays `PENDING` with reason `awaiting_baseline`, and the gate refuses.
+  - When the tip's `main` set records the baseline, the controller compares each waiting member's recorded counts with it and pins that baseline ID to the member. No rerun is needed, because the counts were already recorded.
+  - A target's first baseline comes from its first `main` set. For this repo that runs at the M1 import, before any merge. A pipeline added by a policy change gets its baseline from the `main` set that runs after that change merges. Until then, merges into that target wait.
+  - This closes R1, the race where a check could pass against a fallback floor before the real baseline existed.
 - **A floor change invalidates earlier passes.** If the floor for a pipeline changes, for example from a new baseline on the same target tip or a floor override, every set that passed against the old baseline is invalidated. It must run again as the next rerun number. The gate never accepts a pass whose pinned baseline is no longer current.
 
 The specific attacks are tests:
 
 - replacing a delegated check target with `true` must raise the protected-path flag and fail the floor (no report, so a count of 0);
 - deleting a test, or adding a skip marker, must fail the floor;
-- adding a file that matches a grading-input pattern but no protected glob must be caught by the `main` inventory check;
+- adding a nested `pytest.ini`, `Makefile`, `sitecustomize.py`, `*.pth` file or `.npmrc` must raise the protected-path flag on the Change Request;
+- a pipeline step that names an unprotected repository path must be rejected as `pipeline_invalid`;
 - a step that writes a fake receipt or exit-code file inside the container must have no effect on the driver's receipt.
 
 **Every run starts fresh.**
@@ -678,10 +678,22 @@ Deploys get a **separate profile**, the `deploy` task type. They are never a var
 - **Execution:** the deploy script comes from trusted code at the `main` tip, as the grading driver does. Deploys to one target are serialized by a per-target lock. A deploy is never retried automatically; a failure leaves the target as it is and alarms.
 - **Rollback:** a deploy of the previous artifact digest, through the same command.
 - **The controller does not deploy itself until after M5.** No orcest deploy targets VM 20000 before then. Controller upgrades are a manual, out-of-band rollout on VM 20000:
-  1. Take a Run Store backup off the VM, and put fleet B in `MAINTENANCE`.
-  2. Install the new version into a new versioned venv beside the current one, and point the `current` symlink at it. Run Store schema migrations run under the single-writer lock before any ordinary endpoint opens.
-  3. Restart the systemd unit. A health check unit runs after start. If the health check fails, or the unit fails, systemd's `OnFailure=` starts a revert unit. The revert unit points `current` back at the previous venv and restarts the controller, so the revert happens at the systemd level and needs no working controller.
-  4. Leave `MAINTENANCE`. The rollout and any revert are recorded in the audit log under the subject `local-root`.
+  1. Put fleet B in `MAINTENANCE` and take a Run Store backup off the VM.
+  2. Install the new version into a new versioned venv beside the current one, and point the `current` symlink at it.
+  3. **Snapshot before every migration.** Before each Run Store schema migration, the controller takes a SQLite online backup of the store, copies it off the VM, and records its digest and schema version. Migrations then run under the single-writer lock before any ordinary endpoint opens.
+  4. Restart the systemd unit. A health check unit runs after start. If the health check fails, or the unit fails, systemd's `OnFailure=` starts a revert unit. The revert unit points `current` back at the previous venv and restarts the controller, so the revert happens at the systemd level and needs no working controller.
+  5. Leave `MAINTENANCE`. The rollout and any revert are recorded in the audit log under the subject `local-root`.
+
+  **Migrations are backward compatible**, so the systemd revert works after a migration (R2). The previous release must run correctly on the new schema:
+  - migrations only add tables, columns with defaults, and indexes;
+  - a removal or rename is split across releases. The new shape is added and written first, and the old one is dropped only in a later release, once no revert target still reads it;
+  - a change that adds a migration must pass the previous release's Run Store tests against the migrated schema before it can merge.
+
+  **The documented revert has two levels:**
+  - The systemd revert unit switches back to the previous venv and keeps the migrated schema, which that release can read. This is automatic, and no data is lost.
+  - If the migration itself is the fault (it failed partway, or left data wrong), the operator stops the controller and restores the pre-migration snapshot by digest, then starts the previous release. Writes made after the snapshot are lost. The recovery point is the snapshot, and that loss is recorded in the audit log.
+
+  Both levels are rehearsed on pve-test before M1.
 - **Future work: self-deploy through an external supervisor.** After M5, a supervisor process that is not the controller (for example on the Proxmox host) could run controller deploys and own their outcome. The deploy would then survive the controller's own restart. This is not designed yet.
 
 ### Capacity
@@ -715,7 +727,12 @@ From these numbers:
 - **Priority within the change-check slots:** required members on the newest heads first, then same-Attempt checks, then manual runs, then optional members; ties by age. **Aging crosses classes:** a member that has waited 10 minutes moves to the front of the next-higher class, so no class waits forever behind a stream of new heads.
 - **`main` is sized for bursts, not one set.** Merges come in bursts (22 in the peak day). Three rules keep `main` sets moving:
   - **Reserved slots:** a whole `main` set starts at once on the 2 reserved slots.
-  - **Preemption:** when a second `main` set is waiting, it preempts running manual and optional change-check members. Those members are cancelled with reason `preempted_for_main` and requeued, so the set starts at once. Required change-check members are never preempted.
+  - **Preemption:** when a second `main` set is waiting, it may preempt running manual and optional change-check members. Required change-check members are never preempted. Preemption uses v1's records, not cancellation, because a `CANCELLED` Activity is terminal and could not be requeued:
+    1. The controller fences the member's current Attempt through the [fence-first path](#termination-fence-first). The Attempt becomes `SUPERSEDED` with reason `preempted_for_main`.
+    2. The Activity returns to `PLANNED`, not `CANCELLED`. It is re-offered as the next generation when a change-check slot is free.
+    3. Preemption is not a failure. It does not spend the Activity's `max_attempts`, retry budget or `expires_at` budget; its fixed deadlines are not extended either. The member's set stays `PENDING`.
+    4. The freed slot goes to the `main` set only when the preempted Attempt's stop is `CONFIRMED`, because a pending stop still uses capacity.
+    5. An Activity can be preempted at most twice. After that it is not preemptible, so manual and optional runs cannot starve.
   - **Coalescing:** if `main` sets for several tips are still queued, only the newest tip's set runs. Each skipped tip was already checked as a Change Request head against its own target, and the skip is recorded.
 
   So a `main` set starts within one member's runtime (about 11 min at p95) of the merge, however many heads are queued.
@@ -790,13 +807,13 @@ After M5, GitHub holds a read-only copy: fleet B's controller pushes `main` to G
 
 ### Migration stages
 
-Each stage has an exit check, and nothing advances on a calendar.
+Each stage has an exit check, and nothing advances on a calendar. M0's code changes and the build of fleet B on pve-test may run in parallel. The two third-round Highs, R1 and R2, must both close before M1.
 
 | Stage | What happens | Exit check |
 |---|---|---|
 | **Prerequisite** | Austin deploys fleet A with `pool.vm_id_end: 19999`. Fleet A's templates (9002, 9003 and the rest of its `template_vmid_range`) are either moved into 10900–10999 at the next rebake or listed as a named temporary exception, **before** `selfhosted-runners` gets `MAX_VMID=9999`. The [ownership checks](#vm-id-ownership) are in place. | Fleet A's deployed config shows `vm_id_end: 19999`. The unverified items under [VM ID ownership](#vm-id-ownership) are checked read-only through the bastion's existing access to pve-test (not through Austin), or marked "Austin to confirm at promotion". **M0 does not start without it.** |
-| M0 | The coexistence code changes (prefix call sites, Terraform dir, whole-cluster allocation, ownership checks) and the Grok ≥ 1.0.13 pin merge to `master`. Fleet B's infrastructure is created on pve-test: controller, git host, dependency mirror, templates and workers. Snapshots are taken first, and fleet A's baseline is diffed after each step. Merge-when-green ships. Recovery point RP0 is recorded. | Fleet A's baseline is unchanged. Fleet B's health is green. Boot time and pve-test headroom are measured and the [capacity](#capacity) numbers confirmed. |
-| M1 | The orcest repo is imported into the git host. `main` is a fast-forward-only mirror of GitHub `master`. Fleet B's ready changes are published to GitHub as draft PRs from `selfhosted/*`; fleet A's loop skips drafts. Austin reviews and merges them on GitHub. | Draft PRs pass GitHub CI, and after Austin merges one, the mirror fast-forwards and the Change Request shows `merged`. |
+| M0 | The coexistence code changes (prefix call sites, Terraform dir, whole-cluster allocation, ownership checks) and the Grok ≥ 1.0.13 pin merge to `master`. Fleet B's infrastructure is created on pve-test: controller, git host, dependency mirror, templates and workers. Snapshots are taken first, and fleet A's baseline is diffed after each step. Merge-when-green ships. Recovery point RP0 is recorded. | Fleet A's baseline is unchanged. Fleet B's health is green. Boot time and pve-test headroom are measured and the [capacity](#capacity) numbers confirmed. **Rootless Docker works inside the candidate container** on a CI VM: with no Docker socket and no root daemon, a step builds the dashboard image and runs the compose smoke. |
+| M1 | **Entry:** R1 (baseline race) and R2 (revert after migration) are closed: implemented, tested, and the migration revert rehearsed. The orcest repo is imported into the git host, and its first `main` set records the baseline. `main` is a fast-forward-only mirror of GitHub `master`. Fleet B's ready changes are published to GitHub as draft PRs from `selfhosted/*`; fleet A's loop skips drafts. Austin reviews and merges them on GitHub. | Draft PRs pass GitHub CI, and after Austin merges one, the mirror fast-forwards and the Change Request shows `merged`. |
 | M2 | The native backlog opens. Selected GitHub issues are imported under the [ownership rules](#imported-issues-are-owned-by-one-fleet-at-a-time). New work for fleet B is created through the API, MCP or dashboard. | Every imported item is owned by exactly one fleet, and reaches a terminal state with reasons. |
 | M3 | CI parity: check tasks run alongside GitHub Actions on the same changes, against a frozen parity manifest. | The parity exit check in [Medium findings](#medium-findings-planned-fixes) passes. |
 | M4 | Cutover for the orcest project, by Austin's decision, as a single-writer handoff (below). The git host becomes canonical; GitHub becomes a mirror. | The handoff checks pass, the rollback export has been rehearsed against a restored copy, and the mirror shows `master` equal to `main`. |
@@ -868,13 +885,26 @@ Deleting fleet B is a separate, later decision by Austin. It deletes only VMs th
 
 ## Review findings addressed
 
+### Third round, revision 5
+
+The third- and fourth-round review files were not available on the machine that made revision 5. This table maps Austin's decisions to sections.
+
+| Decision | Section |
+|---|---|
+| R1 baseline race: no fallback floor; merges wait for a real baseline | [Grading driver](#the-grading-driver-is-trusted-code), M1 entry in [Migration stages](#migration-stages) |
+| R2 revert after migration: backward-compatible migrations, a snapshot before each, restore in the documented revert | [Deploys](#deploys), M1 entry |
+| Preemption state machine | [Capacity](#capacity): fence, `PLANNED`, no budget spent, slot on confirmed stop, at most 2 preemptions |
+| Protected-path coverage gaps | [Grading driver](#the-grading-driver-is-trusted-code): one list at any depth, Python startup files, resolver config and version pins, step-command paths validated |
+| Rootless Docker inside the candidate container | M0 exit check in [Migration stages](#migration-stages) |
+| M0 and fleet B in parallel; R1 and R2 close before M1 | [Migration stages](#migration-stages) |
+
 ### Second round (Astra-2, Fable-2), by finding
 
 Both second-round reviews were of revision 2 (`d3dc3fd`). Each finding was checked against revision 3, and anything still open was fixed in the follow-up commit to revision 3.
 
 | Finding | Where it is addressed |
 |---|---|
-| Astra-2 #2, Fable-2 N4 (protected paths, test counts) | [Grading driver](#the-grading-driver-is-trusted-code): globs including nested `conftest.py`, `pytest.ini`, `tox.ini`, `setup.cfg` and `.coveragerc` whether or not they exist; mandatory, validated test reports; the baseline floor; a `main` inventory check of what the steps actually use; adversarial tests. |
+| Astra-2 #2, Fable-2 N4 (protected paths, test counts) | [Grading driver](#the-grading-driver-is-trusted-code): globs including nested `conftest.py`, `pytest.ini`, `tox.ini`, `setup.cfg` and `.coveragerc` whether or not they exist; mandatory, validated test reports; the baseline floor with no fallback; one protected list applied at any depth, with step-command paths validated (revision 5); adversarial tests. |
 | Astra-2 #3 (patch-ID approval carry-over) | [Merge rules](#merge-rules): carry-over removed; a new approval for every head, target or policy change. |
 | Astra-2 #7, Fable-2 N1 (state model, worker-reported failures) | [v1 records](#v1-records-and-the-dashboard-view), [How an Attempt ends](#how-an-attempt-ends) with its race table, [Termination](#termination-fence-first). |
 | Astra-2 #8, Fable-2 N9 (starvation, admission limits) | [Capacity](#capacity): reserved `main` slots (2 in revision 4, with preemption and coalescing), aging across classes, per-subject, per-Attempt and per-project limits, pending stops counted, saturation test. |
