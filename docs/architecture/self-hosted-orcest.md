@@ -55,6 +55,37 @@ The forge-label intake path (`list_work_items_by_labels`) stays for GitHub proje
 
 **v1 amendment:** add `native` as a Work Item source, with create, edit and close operations as authenticated commands.
 
+### One task model with types
+
+Every task has a `type`. All types share one queue, one lifecycle (the state machine below), one log store and one set of controls.
+
+| Type | What runs | Examples |
+|---|---|---|
+| `agent` | A provider CLI (Claude, Codex or Grok) works a backlog item or a review follow-up. | Implement an item; address review comments; fix a failing check. |
+| `deterministic` | A fixed script from a versioned pipeline file, with no AI. | A CI check, a build, a deploy. |
+
+**What both types share:**
+
+- **Queue and claims:** the same queue and fenced worker claims. The pool keeps a per-type capacity share, so checks never wait behind long agent tasks.
+- **Lifecycle:** the same states, transitions, reaper, deadlines and terminal guarantee.
+- **Failures:** the same structured `reason_code` and `reason_detail` fields.
+- **Logs:** the same log stream and retention. A deterministic task logs per step, with each step's command and exit code.
+- **Controls:**
+  - requeue, cancel and kill. Requeueing a check re-runs it on the same commit as a new linked task.
+  - Pausing a worker and draining a host apply to both types.
+- **Audit:** the same audit events.
+
+**What differs:**
+
+| | `agent` | `deterministic` |
+|---|---|---|
+| Liveness | Heartbeat plus the liveness ladder (`SUSPECT`, `STUCK`, `LOOPING`). | Heartbeat plus a per-step timeout from the pipeline file. |
+| Credentials | Provider credential for this task only. | None (see [section 3](#3-ci-deterministic-check-tasks)). |
+| Result | A candidate commit, or a human-decision request. | Exit code only. |
+| Recorded usage | Provider, CLI version, model, tokens. | Pipeline file digest, image digest, commit SHA, and per-step exit codes and durations. Model and token fields are empty. |
+
+**Fleet view.** The dashboard lists all tasks in one view, filterable by type, repo, worker and state. The API and MCP list operations take the same four filters, as catalogue parameters.
+
 ### Task state machine
 
 Every task is in exactly one state:
@@ -64,7 +95,7 @@ Every task is in exactly one state:
 | `queued` | Admitted and waiting for a worker claim. |
 | `running` | Claimed by a worker that is heartbeating and making progress. |
 | `waiting` | Blocked on something outside the worker: a dependency, a human decision, a budget or quota reset, or CI. |
-| `stuck` | Claimed, but the liveness ladder sees no progress (`SUSPECT`, `STUCK` or `LOOPING`), or heartbeats are late. |
+| `stuck` | Claimed, but heartbeats are late, or there is no progress: the liveness ladder reports `SUSPECT`, `STUCK` or `LOOPING` for an agent task, or a step outlives its timeout for a deterministic task. |
 | `done` | Terminal: succeeded. |
 | `failed` | Terminal: did not succeed. Always carries a specific reason. |
 | `killed` | Terminal: stopped by an operator or a control command. |
@@ -95,7 +126,8 @@ The reaper is a controller loop. It is not part of any worker, so a dead worker 
 |---|---|
 | The worker VM no longer exists (destroyed, crashed, or missing from Proxmox) | `failed`, reason `worker_lost`, with the VMID and last-seen time. |
 | No heartbeat for longer than `heartbeat_timeout` (default 300 s) | `stuck`. If the heartbeat is still absent after `stuck_grace` (default 600 s), the task becomes `failed` with reason `heartbeat_lost`. |
-| The liveness ladder reports `LOOPING`, or `STUCK` past its kill budget | The worker is killed, then the task becomes `failed` with reason `no_progress` or `tool_loop`. |
+| Agent task: the liveness ladder reports `LOOPING`, or `STUCK` past its kill budget | The worker is killed, then the task becomes `failed` with reason `no_progress` or `tool_loop`. |
+| Deterministic task: a step exceeds its pipeline timeout | The step is killed, then the task becomes `failed` with reason `step_timeout`, naming the step. |
 | The absolute duration ceiling is reached | `failed`, reason `duration_ceiling`. |
 
 The reaper also runs once at controller startup. Every non-terminal task whose claim fence predates the restart is checked against live inventory. This closes today's gap, where 8 tasks from August and September still show as active.
@@ -108,7 +140,7 @@ A `failed` or `killed` task always has a structured `reason`. Free text never re
 
 | Field | Contents |
 |---|---|
-| `reason_code` | A closed enum, for example `provider_cli_rejected`, `provider_auth_failed`, `provider_quota_exhausted`, `worker_lost`, `heartbeat_lost`, `no_progress`, `tool_loop`, `duration_ceiling`, `deadline_exceeded`, `verify_failed`, `merge_conflict`, `clone_failed`, `operator_killed`. |
+| `reason_code` | A closed enum, for example `provider_cli_rejected`, `provider_auth_failed`, `provider_quota_exhausted`, `worker_lost`, `heartbeat_lost`, `no_progress`, `tool_loop`, `duration_ceiling`, `deadline_exceeded`, `check_failed` (with the step and exit code), `step_timeout`, `image_unavailable`, `pipeline_invalid`, `superseded`, `merge_conflict`, `clone_failed`, `operator_killed`. |
 | `reason_detail` | Specific evidence, bounded and with secrets redacted. For example: `grok 0.1.216 rejected: HTTP 426 Upgrade Required (min 1.0.13)`, or the exit status plus the last classified stderr line. |
 | `retryable` | Whether an automatic retry is allowed. Version and auth failures are not retryable. Quota failures wait for the reset, and only lost or late heartbeats are retried. |
 | `attempts` | The list of previous attempts, each with its own `reason_code`. |
@@ -119,7 +151,7 @@ Classifiers map provider output to reason codes. Some already exist, such as Gro
 
 ### Per-task usage
 
-Each task (attempt) stores:
+Each agent task (attempt) stores the fields below. Deterministic tasks record what they ran instead (see [task types](#one-task-model-with-types)).
 
 - **Provider and CLI:** the provider and runner (`claude`, `codex` or `grok`) and the CLI version, using the existing provider-version probe.
 - **Model:** the requested model and the model the CLI reported.
@@ -142,7 +174,8 @@ A parity test fails the build if any dashboard control, API route or MCP tool is
 
 | Group | Operations |
 |---|---|
-| Read (`read` scope) | List and get backlog items, runs, tasks and workers; events; per-task usage; diffs and CI results. |
+| Read (`read` scope) | List and get backlog items, runs, tasks (filtered by type, repo, worker and state) and workers; events; per-task usage; diffs and check results. |
+| Checks (`control`, or an agent's task capability) | Run a pipeline on a commit; read its results. |
 | Backlog (`control`) | Create, edit, reprioritize and close items, and change an item's state. |
 | Task (`control`) | Requeue (creates a new linked task), cancel (cooperative), kill (immediate: the worker VM's process tree is killed, then the task becomes `killed`). |
 | Worker (`control`) | Pause (finish the current task, then take no new claims), resume. |
@@ -155,7 +188,8 @@ A parity test fails the build if any dashboard control, API route or MCP tool is
 
 - There are two server-side principals: `reader` (`read` scope only) and `operator` (`read` and `control`).
 - Tokens are random 256-bit bearers. The server stores only their hashes, and they rotate through the CLI.
-- An agent's MCP session gets a token like any other client. Workers never receive control tokens.
+- An operator's or outside agent's MCP session gets a token like any other client.
+- Workers never receive `reader` or `operator` tokens. An agent task gets a capability that lasts only as long as the task. It can do two things for that task's own change: start check tasks and read their results. It cannot touch pipelines, reviews, merges or other tasks.
 - Transport is HTTPS only, as v1 requires, including on the LAN.
 
 **Audit**
@@ -212,19 +246,48 @@ Line-anchored comments can follow if Austin finds the first version too thin. If
 
 **GitHub link (both options).** During migration, merged `main` is pushed to GitHub as a branch, not as `master` (see [Migration](#coexistence-and-migration)).
 
-## 3. CI on orcest's own workers
+## 3. CI: deterministic check tasks
 
-There is no separate CI product. A check is a v1 **`VERIFY` activity**: a deterministic task run on a fresh linked-clone worker. It is already specified in [review-and-consensus.md](../wiki/review-and-consensus.md).
+There is no separate CI product. A check is a `deterministic` task (see [task types](#one-task-model-with-types)), run by orcest's own Proxmox workers. In v1 terms it is a `VERIFY` activity, already specified in [review-and-consensus.md](../wiki/review-and-consensus.md).
 
-- **What runs:** the repository's verification profile, which lists commands in order, for example `make check-fast`, then `make test-integration`, then the dashboard tests. The profile is pinned per run, so a change cannot weaken its own checks.
-- **When:** on every Change Request head update, and on `main` after each merge (the `master-verified` job moves here).
-- **Isolation:** CI workers get the candidate commit and nothing else:
-  - no provider credentials and no control or reader tokens;
-  - outbound network limited to package mirrors (the Docker mirror at 10.20.1.19 and PyPI).
-  - The worker is destroyed after each run.
-- **Results:** each check is a task in the state machine above. Pass and fail are `done` and `failed` with reason `verify_failed`, plus the failing command and a bounded log excerpt. Full logs go to the v1 blob store.
-- **Visibility:** results are shown in the dashboard, API and MCP. Merge requires a passing `VERIFY` for the exact head SHA.
-- **Capacity:** CI tasks and agent tasks share the pool, with a separate pool-size share for CI so checks never wait behind long agent tasks. Integration tests that need Redis start it inside the CI worker.
+**Pipelines live in the repo.** They are defined in a versioned file in the repository (v1's repository configuration under `.orcest/`). Each pipeline lists:
+
+- its trigger: Change Request head updates, `main` after a merge, or manual runs;
+- its image, pinned by digest (`…@sha256:…`), never by tag;
+- its steps in order, each with a command and a timeout.
+
+Builds and deploys are pipelines too. They differ from checks only by trigger, and deploys are manual control commands.
+
+**Triggers create check tasks automatically.**
+
+- **Change Request:** every push to a Change Request ref, including new commits made in response to review, creates one check task per matching pipeline for the exact new head SHA. Check tasks still running for an older head are cancelled with reason `superseded`.
+- **`main`:** each merge to `main` runs the `main` pipelines (the `master-verified` job moves here).
+
+**Every run starts fresh.**
+
+- A new linked-clone VM per task. Steps run inside the pinned image on that VM.
+- The checkout is the exact commit SHA, not a branch name.
+- Nothing carries over from an earlier run: no cache volume, workspace or credentials.
+- The VM is destroyed afterwards.
+- Outbound network reaches only the package mirrors (the Docker mirror at 10.20.1.19 and PyPI).
+
+**Pass or fail is the exit code only.**
+
+- All steps exit 0: the task ends `done` (pass).
+- The first non-zero exit ends the task `failed`, with reason `check_failed`, the step name and the exit code.
+- There is no log parsing, no AI judgement and no "allowed to fail" step.
+- A failure before any step ran is not a verdict. Examples are an image that can't be pulled (`image_unavailable`), a lost VM (`worker_lost`) or an unparseable pipeline file (`pipeline_invalid`). The check shows as an error, blocks merge like a failure, and may be retried automatically, unlike a `check_failed`.
+
+**An agent cannot grade its own pipeline change.**
+
+- The pipeline that grades a change is always read from the target branch's commit (the merge base), never from the change's head. The run records its digest.
+- An agent task can start checks on its own change and read their results, through its task capability. It cannot alter the pipeline those checks use.
+- A change that edits pipeline files is graded by the old pipeline. Its new pipeline only takes effect after merge.
+- The git host's `pre-receive` hook rejects pushes from an agent task's ref that touch pipeline files, unless an operator created the task as a pipeline-change task. Pipeline-change tasks need an operator's review to merge, and that review is audited.
+
+**Merge is gated on checks.** The merge command refuses unless every required pipeline has a passing check task for the exact head SHA being merged, graded by the base branch's pipeline. A rebase or new commit invalidates earlier passes.
+
+**Visibility.** Check tasks appear in the fleet view (filter `type=deterministic`), the API and MCP, with per-step logs. Full logs go to the v1 blob store.
 
 ## Coexistence and migration
 
@@ -244,7 +307,7 @@ There is no separate CI product. A check is a v1 **`VERIFY` activity**: a determ
 | M0 | The two coexistence fixes (worker-name prefix, Terraform dir) and the Grok ≥ 1.0.13 pin merge to `master`. Fleet B's infrastructure is created on pve-test: controller VM, git host, templates and 2 workers. Snapshots are taken first, and fleet A's baseline is diffed after each step. | Fleet A's baseline is unchanged. Fleet B's health is green. |
 | M1 | The orcest repo is imported into the git host. GitHub `master` is still canonical, and the git host fetches it on a schedule. Fleet B's merged work goes to GitHub as **draft PRs** from `selfhosted/*` branches; fleet A's deployed loop skips drafts. Austin reviews and merges them on GitHub. | Draft PRs pass GitHub CI. |
 | M2 | The native backlog opens. Selected GitHub issues are imported once, with the GitHub URL kept as provenance, so there is no continuous sync. New work for fleet B is created through the API, MCP or dashboard. | Every imported item reaches a terminal state, with reasons. |
-| M3 | CI parity: `VERIFY` runs alongside GitHub Actions on the same changes. | The results agree on N consecutive changes; mismatches are explained. |
+| M3 | CI parity: deterministic check tasks run alongside GitHub Actions on the same changes. | The results agree on N consecutive changes; mismatches are explained. |
 | M4 | Cutover for the orcest project, by Austin's decision. The git host becomes canonical and GitHub becomes a push-mirror. Fleet A stops taking `orcest:ready` for this repo, which is a change to Austin's fleet and his step. | The mirror is current, and the rollback below has been rehearsed. |
 | M5 | Promotion to pve.lab, done by Austin outside this design. | — |
 
