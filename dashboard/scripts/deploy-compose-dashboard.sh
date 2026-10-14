@@ -177,6 +177,27 @@ check_published_unpinned() {
   fi
 }
 
+# The dashboard must never be reachable beyond the host. A remotely managed
+# Cloudflare tunnel route already targets this host's port 8080, so a single
+# non-loopback publish (0.0.0.0, [::] or a LAN address) would put the dashboard
+# on the internet behind nothing but its shared token. Read what Docker actually
+# bound rather than trusting the Compose file, and accept only 127.0.0.0/8 and
+# [::1]. No publish at all is also private, so it passes.
+check_loopback_publish() {
+  container="$1"
+  if ! bindings="$(docker port "$container" 2>/dev/null)"; then
+    echo "Could not read dashboard port bindings for $container" >&2
+    return 1
+  fi
+  non_loopback="$(printf '%s\n' "$bindings" | awk 'NF { print $NF }' \
+    | grep -Ev '^(127\.[0-9]+\.[0-9]+\.[0-9]+|\[::1\]):[0-9]+$' || true)"
+  if [ -n "$non_loopback" ]; then
+    echo "Dashboard publishes a non-loopback host port: $(printf '%s' "$non_loopback" | tr '\n' ' ')" >&2
+    echo "Refusing to keep it live; publish it on 127.0.0.1 only (docker-compose.dashboard.yml)" >&2
+    return 1
+  fi
+}
+
 check_bundle_runtime() {
   "$@" exec -T dashboard node scripts/check-bundle-runtime.mjs
 }
@@ -652,6 +673,11 @@ fi
 if [ -z "$running_image_id" ] || [ "$running_image_id" != "$candidate_image_id" ]; then
   "$@" logs --tail=100 dashboard || true
   echo "Dashboard live container image did not match candidate image $candidate_image_id" >&2
+  rollback_dashboard "$@" || true
+  exit 1
+fi
+
+if ! check_loopback_publish "$running_container"; then
   rollback_dashboard "$@" || true
   exit 1
 fi

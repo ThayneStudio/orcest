@@ -1976,6 +1976,133 @@ exit 1
         assert "class SmokeWebSocket" in runtime_script
         assert "Dashboard bundle runtime verified" in runtime_script
 
+    @pytest.mark.parametrize(
+        ("bindings", "exposed"),
+        [
+            ("8080/tcp -> 0.0.0.0:8080\n8080/tcp -> [::]:8080\n", True),
+            ("8080/tcp -> 10.20.1.129:8080\n", True),
+            ("8080/tcp -> 127.0.0.1:8080\n8080/tcp -> 0.0.0.0:9999\n", True),
+            ("8080/tcp -> 127.0.0.1:8080\n", False),
+            ("8080/tcp -> [::1]:8080\n", False),
+            ("", False),
+        ],
+    )
+    def test_dashboard_deploy_refuses_non_loopback_publish(self, tmp_path, bindings, exposed):
+        """#850: a tunnel route already targets this host's port 8080, so any
+        non-loopback publish would expose the dashboard publicly. The deploy must
+        read Docker's real bindings and roll the candidate back before probing
+        readiness; loopback-only (or no) publishes proceed."""
+        calls = tmp_path / "compose-calls.log"
+        docker_calls = tmp_path / "docker-calls.log"
+        bindings_file = tmp_path / "bindings"
+        bindings_file.write_text(bindings)
+        compose = tmp_path / "compose"
+        compose.write_text(
+            """#!/usr/bin/env sh
+set -eu
+printf '%s\\n' "$*" >> "$COMPOSE_CALLS"
+case "$1" in
+  ps)
+    if [ -f "$COMPOSE_CALLS.up" ]; then
+      printf '%s\\n' candidate-container
+    fi
+    exit 0
+    ;;
+  build) exit 0 ;;
+  up)
+    : > "$COMPOSE_CALLS.up"
+    exit 0
+    ;;
+  exec)
+    printf '%s\\n' dist/assets/index-new.js dist/assets/index-new.css
+    exit 0
+    ;;
+  logs|rm) exit 0 ;;
+esac
+exit 1
+"""
+        )
+        compose.chmod(0o755)
+
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        docker = fake_bin / "docker"
+        docker.write_text(
+            """#!/usr/bin/env sh
+set -eu
+printf '%s\\n' "$*" >> "$DOCKER_CALLS"
+if [ "${1:-}" = "port" ]; then
+  cat "$BINDINGS_FILE"
+  exit 0
+fi
+if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then
+  printf '%s\\n' sha256:candidate
+  exit 0
+fi
+if [ "${1:-}" = "inspect" ] && [ "${3:-}" = "{{.Image}}" ]; then
+  printf '%s\\n' sha256:candidate
+  exit 0
+fi
+if [ "${1:-}" = "run" ]; then
+  if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "node" ]; then
+    exit 0
+  fi
+  if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "sh" ]; then
+    printf '%s\\n' dist/assets/index-new.js dist/assets/index-new.css
+    exit 0
+  fi
+  exit 1
+fi
+exit 0
+"""
+        )
+        docker.chmod(0o755)
+
+        env = os.environ.copy()
+        for key in [
+            "DASHBOARD_TOKEN",
+            "DASHBOARD_READY_ATTEMPTS",
+            "DASHBOARD_READY_INTERVAL_MS",
+            "DASHBOARD_ALLOW_DEGRADED",
+            "DASHBOARD_STRICT_DEGRADED",
+            "DASHBOARD_ALLOW_UNPINNED_ASSETS",
+        ]:
+            env.pop(key, None)
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env["COMPOSE_CALLS"] = str(calls)
+        env["DOCKER_CALLS"] = str(docker_calls)
+        env["BINDINGS_FILE"] = str(bindings_file)
+        env["DASHBOARD_TOKEN"] = "test-token"
+        env["DASHBOARD_READY_ATTEMPTS"] = "1"
+        env["DASHBOARD_NODE_IMAGE"] = "fake-node"
+        env["DASHBOARD_DEPLOY_LOCK_DIR"] = str(tmp_path / "deploy.lock")
+
+        result = subprocess.run(
+            ["sh", "dashboard/scripts/deploy-compose-dashboard.sh", str(compose)],
+            cwd=self._repo_root(),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert "port candidate-container" in docker_calls.read_text()
+        calls_text = calls.read_text()
+        assert "up -d --no-build --force-recreate dashboard" in calls_text
+        if exposed:
+            assert result.returncode == 1
+            assert "Dashboard publishes a non-loopback host port" in result.stderr
+            reported = result.stderr.split("host port: ", 1)[1].splitlines()[0]
+            assert "127.0.0.1" not in reported
+            # Rolled back before any readiness probe or bundle check ran.
+            assert "rm -sf dashboard" in calls_text
+            assert "exec -T dashboard" not in calls_text
+            assert "Dashboard did not become published-ready" not in result.stderr
+        else:
+            assert "non-loopback" not in result.stderr
+            # Proceeded past the bind check into the bundle/readiness checks.
+            assert "exec -T dashboard" in calls_text
+        assert not (tmp_path / "deploy.lock").exists()
+
     def test_dashboard_deploy_removes_failed_fresh_service(self, tmp_path):
         """A first dashboard deploy that fails published readiness must not
         leave the newly started bad service running."""
