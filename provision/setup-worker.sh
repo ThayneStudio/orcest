@@ -71,7 +71,7 @@ fi
 # parsers (tests/worker/test_grok_runner.py) when upgrading.
 #
 # Adding any future provider: see docs/adding-a-provider.md.
-GROK_VERSION="0.1.216"
+GROK_VERSION="1.0.13"
 # SHA-256 of the exact linux-x86_64 Grok binary for GROK_VERSION. Keep this in
 # lockstep with _GROK_BINARY_SHA256 in src/orcest/fleet/cloud_init.py — that
 # module is the source of truth for fleet template bakes and this script is the
@@ -98,7 +98,7 @@ GROK_VERSION="0.1.216"
 # string (the documented way to skip the grok install while a new digest is
 # being validated) would silently install the old pinned artifact here while
 # cloud-init skipped it -- and the empty-digest branch below would be dead code.
-GROK_BINARY_SHA256="${ORCEST_GROK_BINARY_SHA256-01044edfadcddebdb1197195e692f351ad87569e079324b7feac6a08d692d8af}"
+GROK_BINARY_SHA256="${ORCEST_GROK_BINARY_SHA256-edf79521581bb5e6b95abef848491a6a742e860da3e237ebe86a280d30dce4c1}"
 installed_grok_version="$([ -x /usr/local/bin/grok ] && /usr/local/bin/grok --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
 if [ "${installed_grok_version}" != "${GROK_VERSION}" ]; then
     echo "Installing Grok CLI ${GROK_VERSION}..."
