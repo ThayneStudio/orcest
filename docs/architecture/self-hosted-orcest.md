@@ -2,7 +2,7 @@
 
 Status: **proposal, not approved.** The build is paused until Austin signs off.
 
-Revision 2 addressed the Critical and High findings of two reviews (Astra and Fable) and recorded the decisions Austin made on them. Revision 3 settles the second-round reviews (Astra-2 and Fable-2) with Austin's decisions: v1-aligned records, fresh approvals, protected-path globs, a test-count floor, same-Attempt checks, a reserved `main` CI share, a freeze on human merges, and a narrower M5. [Review findings addressed](#review-findings-addressed) maps each finding to the section that answers it. Medium findings are listed with their fixes in [Medium findings](#medium-findings-planned-fixes).
+Revision 2 addressed the Critical and High findings of two reviews (Astra and Fable) and recorded the decisions Austin made on them. Revision 3 settled the second-round reviews (Astra-2 and Fable-2) with Austin's decisions: v1-aligned records, fresh approvals, protected-path globs, a test-count floor, same-Attempt checks, a reserved `main` CI share, a freeze on human merges, and a narrower M5. Revision 4 checks every second-round finding against revision 3 and closes the ones still open. [Review findings addressed](#review-findings-addressed) maps each finding to the section that answers it. Medium findings are listed with their fixes in [Medium findings](#medium-findings-planned-fixes).
 
 This doc covers three separate pieces that let orcest run its own development loop on pve-test without GitHub in the loop:
 
@@ -107,10 +107,10 @@ This section defines how each machine in fleet B proves who it is, and what each
 |---|---|---|---|
 | Controller (VM 20000) | Server certificate from the fleet CA. | Write to the git host (the only write key). Own the Run Store. Publish to GitHub through the bot token (see [migration](#coexistence-and-migration)). Hold deploy credentials. | — |
 | Pool manager (on VM 20000) | Fleet B's own scoped Proxmox API token. | Clone, start, stop and destroy fleet B's VMs, subject to the [ownership checks](#vm-id-ownership). Inject a one-time enrollment token per VM through its cloud-init snippet. | Touch any VM that fails the ownership checks. |
-| Worker VM | At boot, exchanges its one-time enrollment token for a **worker session** bound to its VMID and boot ID. The enrollment token is single-use and expires 10 minutes after the clone. Per task, it receives v1's signed attempt capability. | Fetch from the git host with a read-only key (forced command: `git-upload-pack` only). Upload candidate bundles (intermediate and final) and results for its own current Attempt. Start checks on commits the controller published from those bundles (agent tasks only). Write its own heartbeat and activity keys in Redis. | Push to the git host. Hold any person's or bot's token. Read or write another attempt's state. |
+| Worker VM | At boot, exchanges its one-time enrollment token for a **worker session** bound to its VMID and boot ID. The enrollment token is single-use and expires 10 minutes after the clone. Per task, it receives v1's signed attempt capability. | Fetch from the git host with a read-only key (forced command: `git-upload-pack` only). Upload candidate bundles (intermediate and final) and results for its own current Attempt. Start checks on commits the controller published from those bundles (agent tasks only). Write its own heartbeat and activity keys in Redis, with an allowlisted set of commands. | Push to the git host. Hold any person's or bot's token. Read or write another attempt's state. |
 | Git host (VM 20100) | SSH host key, pinned in every template's `known_hosts` and in the controller. | Serve fetches. Accept pushes from the controller's key only. | — |
 | Dependency mirror (VM 20101) | Server certificate from the fleet CA. | Proxy PyPI, npm and Docker pulls. | Accept uploads. |
-| Redis (on VM 20000) | TLS with the fleet CA certificate. **One ACL user per worker**, created at enrollment with its own password and deleted when the worker session is revoked. | A worker's ACL user may write only its own keys (`workers:heartbeat:<worker-id>`, `workers:activity:<worker-id>`) and read its own stream consumer group. No worker can write another worker's heartbeat. | Redis is never authority. No task is failed, fenced or retried because of a Redis value alone (see [the reaper](#the-reaper)). |
+| Redis (on VM 20000) | TLS with the fleet CA certificate. **One ACL user per worker**, created at enrollment with its own password and deleted when the worker session is revoked. | A worker's ACL user may touch only its own two keys (`workers:heartbeat:<worker-id>`, `workers:activity:<worker-id>`), with only `SET`, `HSET`, `EXPIRE` and `PING`. It has no stream access: offers and claims go through the controller's HTTPS endpoint, as in v1. A test checks that one worker cannot write another worker's keys or touch any queued work. | Redis is never authority. No task is failed, fenced or retried because of a Redis value alone (see [the reaper](#the-reaper)). |
 | Actions runner VMs (9000–9999, `selfhosted-runners`) | GitHub registration token, per VM, one job. | Run GitHub Actions jobs. | Reach VM 20000's API or Redis, or hold any fleet B token. |
 
 A worker session, and with it the worker's Redis ACL user, is revoked when its VM is destroyed or when the pool manager reports the boot gone. An attempt capability is revoked the moment its attempt is fenced (see [Termination](#termination-fence-first)).
@@ -240,13 +240,27 @@ An Attempt ends in one of two ways.
 
 **The controller proves it.** This covers a worker that cannot report. See [the reaper](#the-reaper).
 
+**Races.** The Run Store is the single writer, so every pair of events below is ordered by commit. This table is the one place their outcomes are defined.
+
+| First to commit | Then | Outcome |
+|---|---|---|
+| Claim | Claim deadline passes | The deadline does nothing; the Attempt is `CLAIMED`. |
+| Claim deadline passes (Attempt `EXPIRED`) | Claim arrives | The claim is rejected (v1). The Activity is re-offered as a new generation. |
+| Worker Result | Fence (reaper proof, cancel, kill, newer head) | The Result stands. The fence is a no-op on that Attempt. A cancel or kill then applies to the Activity: a `SUCCEEDED` Activity stays `SUCCEEDED` with the command recorded as too late; a `PLANNED` one becomes `CANCELLED`. |
+| Fence | Worker Result, upload or check request | Rejected and audited, because the generation is no longer current. |
+| Execution deadline passes (Attempt `EXPIRED`) | Worker Result | Rejected (v1), with timeout Recovery Evidence recorded. |
+| `suspect` flag set | Worker Result | Accepted. `suspect` is only an observation and never blocks a current Result. |
+| Cancel requested | Worker Result | The Result is accepted. If it is a success, the Activity is `SUCCEEDED` and the cancel is recorded as too late; otherwise the Activity becomes `CANCELLED`. |
+| Worker-loss proof | Worker Result | Rejected; the Attempt is already `FAILED`. |
+| Worker Result | Worker-loss proof | The proof is recorded as too late; the Result stands. |
+
 ### The reaper
 
 The reaper is a controller loop. It is not part of any worker, so a dead worker cannot block it. It reads heartbeats (`workers:heartbeat:*`), activity records, the liveness ladder, and the pool manager's inventory. **Heartbeats and activity records are signals; they never fail a task on their own.**
 
 **A task fails only on proof.** When the worker has not reported, only three things may end a `CLAIMED` Attempt. Each one fences the Attempt first:
 
-1. **The VM is confirmed gone.** A fresh, successful Proxmox inventory read shows the VMID absent, or present with a different boot ID than the Attempt's worker session (the VMID was reused). A failed or timed-out inventory read is "unknown", never "gone". This is v1's pool-manager worker-loss report. Attempt `FAILED`, reason `worker_lost`.
+1. **The VM is confirmed gone.** Either a fresh, successful Proxmox inventory read shows the VMID absent, or the VMID is present and the guest agent answers with a different boot ID than the Attempt's worker session, meaning the VMID was reused. The boot ID comes only from the guest agent; Proxmox inventory does not report it. A failed or timed-out inventory read, or an unanswered guest-agent query, is "unknown", never "gone", and the Attempt stays flagged `suspect`. This is v1's pool-manager worker-loss report. Attempt `FAILED`, reason `worker_lost`.
 2. **The reaper confirmed a kill.** The reaper fenced the Attempt, killed the process tree (or destroyed the VM), and the kill was acknowledged: the guest agent reports the process tree gone, or a fresh inventory read shows the VM gone. Reasons: `no_progress`, `tool_loop`, `step_timeout`, or `worker_lost` when the VM was up but the runner process had died.
 3. **The deadline passed.** The Attempt's fixed execution deadline: Attempt `EXPIRED`, reason `duration_ceiling`. Or the Activity's `expires_at`: reason `deadline_exceeded`.
 
@@ -344,7 +358,7 @@ A `FAILED`, `CANCELLED` or `SUPERSEDED` Activity, and every terminal Attempt oth
 
 | Field | Contents |
 |---|---|
-| `reason_code` | A closed enum: `provider_cli_rejected`, `provider_auth_failed`, `provider_quota_exhausted`, `worker_lost`, `no_progress`, `tool_loop`, `duration_ceiling`, `deadline_exceeded`, `step_timeout`, `verification_error`, `test_count_below_baseline`, `image_unavailable`, `pipeline_invalid`, `superseded`, `merge_conflict`, `clone_failed`, `admission_rejected`, `operator_kill`, `cancel_requested`, `cancel_escalated`, `unclassified`. |
+| `reason_code` | A closed enum: `provider_cli_rejected`, `provider_auth_failed`, `provider_quota_exhausted`, `worker_lost`, `no_progress`, `tool_loop`, `duration_ceiling`, `deadline_exceeded`, `step_timeout`, `verification_error`, `test_count_below_baseline`, `test_report_invalid`, `unprotected_grading_input`, `image_unavailable`, `pipeline_invalid`, `superseded`, `merge_conflict`, `clone_failed`, `admission_rejected`, `operator_kill`, `cancel_requested`, `cancel_escalated`, `unclassified`. |
 | `failure_class` / `failure_code` | For a worker-reported failure, v1's class and the worker's code, kept as reported. |
 | `reason_detail` | Specific evidence, bounded and with secrets redacted. For example: `grok 0.1.216 rejected: HTTP 426 Upgrade Required (min 1.0.13)`, or the exit status plus the last classified stderr line. |
 | `stop` | `CONFIRMED` or `PENDING`, for each terminal Attempt. |
@@ -371,7 +385,7 @@ A task's total is the sum of its Attempts, and a Run's is the sum of its tasks. 
 **One service layer, three transports.** Every operation is defined once, in a command catalogue with an input schema, a required scope and an audit event. The transports are:
 
 - **HTTPS API:** `/api/v1/...`, with an OpenAPI document.
-- **MCP server:** streamable HTTP on the same listener, plus stdio for local use. Stdio authenticates with a token like every other client; it gets no implicit authority from being local. One tool per catalogue entry.
+- **MCP server:** streamable HTTP on the same listener, plus stdio for local use. Stdio authenticates with a token like every other client; it gets no implicit authority from being local (the admin CLI below is the one exception, and it is not MCP). One tool per catalogue entry.
 - **Dashboard:** static files served from the same listener. It calls the API and holds no logic of its own (see [Dashboard sign-in](#dashboard-sign-in)).
 
 A parity test fails the build if any dashboard control, API route or MCP tool is missing from the catalogue, or exists outside it.
@@ -395,7 +409,8 @@ A parity test fails the build if any dashboard control, API route or MCP tool is
 
 **Tokens: one per person or bot**
 
-- A **subject** is one person or one bot: `austin`, `dashboard-session:<id>`, `mcp-agent-<name>`, `github-mirror-bot`. Each subject has a stable ID and a `human` flag. Only an `admin` subject can create a subject, and the `human` flag can only be set from the CLI on VM 20000.
+- A **subject** is one person or one bot: `austin`, `mcp-agent-<name>`, `github-mirror-bot`. A dashboard session is not a subject. It is derived from a person's token and audited as that person, with the session ID in the transport field. Each subject has a stable ID and a `human` flag. Only an `admin` subject can create a subject.
+- **Admin CLI and bootstrap.** The admin CLI on VM 20000 talks to the controller over a Unix socket owned by root with mode `0600`. Filesystem permission on that socket is its authority, and its actions are audited under the fixed subject `local-root`. The `human` flag can be set only over this socket. At install, the socket mints the first `admin` token. Everything over HTTPS, including MCP, uses tokens.
 - Each subject has **one active token**, with its own scope set, expiry and `revoked_at`. Revoking it affects that subject only. Rotation issues a new token and revokes the old one after a short overlap (default 10 min).
 - Tokens are random 256-bit bearers. The server stores only their hashes.
 - Outside agents' MCP tokens default to `read`, `backlog` and `checks`. `review` comments can be granted; approval and merge cannot, because they require a human subject.
@@ -407,7 +422,8 @@ A parity test fails the build if any dashboard control, API route or MCP tool is
 
 - Every dashboard page requires sign-in; there is no anonymous view.
 - A person signs in with their own token. The server exchanges it for a session: an `HttpOnly`, `Secure`, `SameSite=Strict` cookie, 12-hour lifetime, bound to that subject. Control actions also need a CSRF token.
-- A session is bound to the token it was exchanged from. **Revoking or rotating that token ends all of its dashboard sessions at once**: the session rows are deleted in the same transaction, and the next request gets 401.
+- A session is bound to the subject, the token it was exchanged from, and that subject's authorization revision. **Revoking or rotating that token ends all of its dashboard sessions at once**: the session rows are deleted in the same transaction, and the next request gets 401.
+- Every session request re-checks, against the store, that the token is not revoked or expired and that the subject's scopes and `human` flag are unchanged. A change to scopes or to the `human` flag bumps the authorization revision and ends the subject's sessions. During a rotation overlap, sessions from the old token end when the old token is revoked. A test checks that a signed-in dashboard loses its controls on the next request after a revocation or scope change, while the audit still names the original person.
 - Every action from the dashboard is audited under the signed-in person's subject. The dashboard process holds no token of its own and cannot act for anyone.
 - The listener binds the LAN and Tailscale interfaces of VM 20000 explicitly, and logs the real bind address at startup (as `bc179be` does for today's dashboard).
 
@@ -448,12 +464,14 @@ Worker VMs hold a read-only fetch key (forced command `git-upload-pack`). A fenc
 
 An agent can check a new commit without ending its Attempt:
 
-- During the Attempt, the worker uploads an **intermediate bundle** through its capability. The limit is 10 per Attempt, and each is validated like a final bundle.
+- During the Attempt, the worker uploads an **intermediate bundle** through its capability, under the current fence. The limit is 10 per Attempt. Each is validated like a final bundle and admitted as a v1 Candidate marked `intermediate`, linked to the Attempt and numbered in order.
 - Only the controller publishes. Each intermediate bundle goes to `orcest/cr/<cr-id>/wip/<attempt-id>/<n>`. It does not move the Change Request's head, and it cannot be approved or merged.
-- The capability can start a [Verification Set](#verification-sets) on that commit and read the result. Bundles from a fenced generation are rejected.
+- The capability can start a [Verification Set](#verification-sets) on that Candidate's commit and read the result. It is scoped to this Attempt's own intermediate Candidates; it cannot start checks on another Attempt's Candidates. Uploads and check requests from a fenced generation are rejected, and the normal-finish grace allows only Result submission, not new uploads or checks.
+- A later edit is a new commit, so it has no results until its own set runs. Results never carry from one commit to another.
+- **Retention:** `wip/` refs are deleted 7 days after the Attempt ends. Their Candidate records and receipts are kept with the Run.
 - Check evidence is bound to the commit, target tip and policy digest, not to the ref. If the final bundle's head is a commit that was already checked under the same target and policy, the evidence is reused and the checks do not run twice.
 
-**v1 amendment:** v1 accepts one candidate per Attempt, in its Result. Add intermediate candidate uploads under the same fence, with the limit above.
+**v1 amendment:** v1 accepts one Candidate per Attempt, in its Result. Add a fenced, non-terminal Candidate admission operation with the limit, scope and retention above.
 
 ### Change Request states
 
@@ -463,7 +481,7 @@ An agent can check a new commit without ending its Attempt:
 | `ready` | Required checks pass and a valid human approval exists, both for the current binding. |
 | `needs_rebase` | The target moved and the head no longer descends from it. The controller is rebasing it, or the rebase conflicted. |
 | `published` | Before M4 only: pushed to GitHub as a draft PR from `selfhosted/<cr-id>`; waiting for Austin to merge it there. |
-| `merged` | Terminal. After M4: `main` was moved to this head. Before M4: the mirror shows the GitHub PR merged. |
+| `merged` | Terminal. After M4: `main` was moved to this head. Before M4: GitHub shows the PR merged **and** the local mirror's `main` contains that merge. |
 | `closed` | Terminal. Abandoned or rejected. |
 
 ### Before cutover, `main` is a mirror
@@ -472,7 +490,7 @@ Until M4, the git host's `main` is a **fast-forward-only mirror of GitHub `maste
 
 - The controller fetches GitHub `master` on a schedule (default 2 min) and fast-forwards `main`. A non-fast-forward fetch is refused and alarms.
 - In M1 to M3, "merge" means **publish**: the Change Request is `ready`, a human runs the merge command, and the controller pushes the head to GitHub as `selfhosted/<cr-id>` and opens a draft PR. The Change Request becomes `published`.
-- It becomes `merged` when GitHub shows the PR merged. This is matched by PR number, not SHA, because squash merges change SHAs.
+- It becomes `merged` only when both are true: GitHub shows the PR merged, matched by PR number rather than SHA because squash merges change SHAs; and the local mirror's `main` contains that merge commit. Until the mirror catches up, the Change Request shows `published` and dependent items keep waiting.
 - Agents base their work on the mirror's `main`. An item that depends on an unmerged Change Request waits (`waiting(dependency)`) until that Change Request is `merged`; stacked changes are not supported before M4.
 - At M4 the direction flips in one audited step (see [Migration](#coexistence-and-migration)), and the merge command gains the right to move `main`.
 
@@ -481,7 +499,7 @@ Until M4, the git host's `main` is a **fast-forward-only mirror of GitHub `maste
 **Merges are fast-forward or rebase only.** No merge commits are created.
 
 - The gate requires that the head descends from the current `main` tip, so the tree that lands is exactly the tree that was checked.
-- **The system rebases open changes after a merge.** After every fast-forward of `main` (and, before M4, every mirror advance), the controller rebases each open Change Request onto the new tip. It works in its own workspace with hooks disabled, publishes the result as a new revision, and starts that revision's checks. If a rebase conflicts, the Change Request is marked `merge_conflict` and a follow-up agent task is created. A human can also run the **rebase** command at any time. A rebased head keeps its original author for the approval rules below.
+- **The system rebases open changes after a merge.** After `main` moves by fast-forward (and, before M4, after each mirror advance), the controller rebases each open Change Request onto the new tip. Rebases are debounced: they start once `main` has not moved for 2 minutes, so a burst of merges costs one rebase and one check run per open change, not one per merge. It works in its own workspace with hooks disabled, publishes the result as a new revision, and starts that revision's checks. If a rebase conflicts, the Change Request is marked `merge_conflict` and a follow-up agent task is created. A human can also run the **rebase** command at any time. A rebased head keeps its original author for the approval rules below.
 - `main` moves with compare-and-swap against the exact tip the evidence was bound to.
 
 **Evidence is bound, and re-checked when the binding changes.** A check result and an approval are each bound to:
@@ -539,7 +557,7 @@ There is no separate CI product. A check is a `deterministic` task, run by orces
 
 - its trigger: Change Request head updates, `main` after a merge, or manual runs;
 - whether it is **required** for merge;
-- its image, pinned by digest (`…@sha256:…`), never by tag;
+- its CI VM template, the **verification image**, pinned by digest (`…@sha256:…`), never by a name or tag;
 - its steps in order, each with a command (a literal argument array, run without a shell, as v1 requires), a timeout, and, for steps that run tests, the test report the driver reads (JUnit XML or Vitest JSON).
 
 The policy also lists **protected paths** (see below).
@@ -558,13 +576,14 @@ One structure is used everywhere checks are run or gated:
 - A **Verification Set** is keyed by (commit, target tip, policy digest). When it is created, it freezes the list of pipelines that apply, each marked `required` or `optional`.
 - Each member is one v1 `VERIFY` Activity, that is, one `deterministic` task, with its own Attempts. It ends with one v1 Verification Receipt: `PASS`, `FAIL` or `ERROR`.
 - Members keep v1's execution contract. Commands run in declared order, every command runs after an ordinary non-zero exit, and only a sandbox, tool, resource or integrity error may stop early. `ERROR` is not `FAIL`: it is a `FAILED_RETRYABLE` Result with `VERIFICATION_ERROR`, retried per the [retry policy](#retry-policy).
-- **Set result:**
-  - `PASS` when every required member is `SUCCEEDED` with a `PASS` receipt;
-  - `FAIL` when any required member has a `FAIL` receipt;
-  - `ERROR` when any required member ends `FAILED` after its retries;
-  - `PENDING` otherwise.
+- **Set result**, decided from the required members only:
+  - `FAIL` as soon as any required member has a `FAIL` receipt. A `FAIL` cannot become a pass, so it takes precedence over errors and pending members. The other members still run to completion, so the receipt lists every failure.
+  - `INCOMPLETE` when, with no `FAIL`, any required member ended `CANCELLED` or `SUPERSEDED`. It gates like an error, and a new set must be requested.
+  - `ERROR` when, with no `FAIL` or `INCOMPLETE`, any required member ended `FAILED` after its retries.
+  - `PASS` when every required member is `SUCCEEDED` with a `PASS` receipt.
+  - `PENDING` otherwise. This includes a member whose `ERROR` receipt sent it back to `PLANNED` for a retry: the set waits for the retry.
 
-  Optional members are shown but never gate.
+  The set is **final** when every required member is terminal, except that an early `FAIL` is final at once for the gate. Optional members are shown but never gate.
 - If any of the three keys changes for a Change Request, its set is superseded as a whole, and every unfinished member becomes `SUPERSEDED`.
 - The merge gate reads exactly one thing: the result of the set keyed by the current head, the current target tip and the current policy digest.
 
@@ -574,7 +593,7 @@ One structure is used everywhere checks are run or gated:
 
 The **grading driver** is the program that reads the pipeline, runs each step, enforces timeouts, captures exit codes and writes the verification receipt. It never comes from the candidate:
 
-- It is built from `main` by the controller and baked into the verification image, which the policy pins by digest.
+- It is built from `main` by the controller and baked into the verification image (the CI VM template), which the policy pins by digest.
 - It reads the pipeline and the protected-paths list from the **current target tip**, never from the change's head. The candidate is checked out into a separate directory and is only ever input to the driver.
 - A change that edits `.orcest/` is graded by the current policy. Its new policy takes effect only after merge.
 
@@ -582,22 +601,24 @@ The **grading driver** is the program that reads the pipeline, runs each step, e
 
 - **Protected paths need human review.** The policy lists, as globs, the files the steps delegate to. `**` matches any depth, including the repo root. For this repo the initial list is:
   - pipeline and build entry points: `.orcest/**`, `Makefile`, `Dockerfile*`, `docker-compose*.yml`, `.github/workflows/**`;
-  - Python test and lint config: `**/conftest.py` (today that is `tests/`, `tests/integration/`, `tests/stress/` and `tests/workflow_store/`), `pyproject.toml`, `setup.cfg`, `pytest.ini`, `tox.ini`, `mypy.ini`, `ruff.toml`, `.ruff.toml`, `.pre-commit-config.yaml`;
+  - Python test and lint config: `**/conftest.py` (today that is `tests/`, `tests/integration/`, `tests/stress/` and `tests/workflow_store/`), `pyproject.toml`, `setup.cfg`, `pytest.ini`, `tox.ini`, `.coveragerc`, `mypy.ini`, `ruff.toml`, `.ruff.toml`, `.pre-commit-config.yaml`. These are protected whether or not they exist today, because creating one is the attack;
   - CI and dashboard scripts: `scripts/**`, `dashboard/scripts/**`;
   - dependency manifests and lockfiles: `requirements*.lock`, `**/package.json`, `**/package-lock.json`;
   - TypeScript, Vite and lint config: `**/tsconfig*.json`, `**/vite.config.*`, `**/vitest.config.*`, `**/eslint.config.*`, `**/.eslintrc*`, `**/.prettierrc*`.
 
   The controller computes from the diff whether a Change Request touches any of them. The flag comes from the diff, not from a branch name or task setting. Such a change needs a human approval that explicitly acknowledges the protected paths, from a subject that did not author it. The list itself is protected.
-- **Deleting tests fails.** Each test step names its report, and the driver counts the tests that ran and passed or failed. Skipped tests do not count. The **floor** is that step's count from the same pipeline's last passing run on the target tip (the baseline), which is recorded with every `main` set. A candidate that runs fewer tests than the floor fails the step with `test_count_below_baseline`, showing both numbers. When tests are removed on purpose, a human with `admin` records a floor override for that exact head, target and policy, and the override is audited. A pipeline with no baseline yet uses the floor declared in the policy, and the set is labelled "no baseline". The required pipeline set must be non-empty, or the merge gate refuses.
+- **The protected list is checked against what the steps actually use.** On every `main` set, the driver traces the processes each step starts and records every file from the checkout that is executed, or read as configuration by a known tool (pytest, mypy, ruff, tsc, vite, vitest, npm, make, docker). Any recorded file not matched by a protected glob is a policy error on that `main` set, reason `unprotected_grading_input`. It blocks merges like a red `main` until a human adds it to the list or removes the dependency.
+- **Deleting tests fails.** Every step marked `kind: test` in the policy must name its report; a test step without one is `pipeline_invalid`. The report is written to a directory the driver creates outside the checkout, and must parse as JUnit XML or Vitest JSON, be newer than the step's start, and name at least one test. Otherwise the step fails with `test_report_invalid`. Every required pipeline that runs tests has at least one test step. The driver counts the tests that ran and passed or failed; skipped tests do not count. The **floor** is that step's count from the same pipeline's last passing run on the target tip (the baseline), which is recorded with every `main` set. A candidate that runs fewer tests than the floor fails the step with `test_count_below_baseline`, showing both numbers. When tests are removed on purpose, a human with `admin` records a floor override for that exact head, target and policy, and the override is audited. A pipeline with no baseline yet uses the floor declared in the policy, and the set is labelled "no baseline". The required pipeline set must be non-empty, or the merge gate refuses.
 
 The specific attacks are tests:
 
 - replacing a delegated check target with `true` must raise the protected-path flag and fail the floor (no report, so a count of 0);
-- deleting a test, or adding a skip marker, must fail the floor.
+- deleting a test, or adding a skip marker, must fail the floor;
+- editing a file a step executes that is not on the protected list must be caught by the `main` inventory check.
 
 **Every run starts fresh.**
 
-- A new linked-clone VM per task. Steps run inside the pinned image on that VM.
+- A new linked-clone VM per task, cloned from the pinned verification image. Steps run directly on that VM, not in a container. The VM has its own Docker daemon for steps that build images or run the compose smoke; it holds no credentials and is destroyed with the VM.
 - The checkout is the exact commit SHA, not a branch name.
 - Nothing carries over from an earlier run: no cache volume, workspace or credentials.
 - The VM is destroyed afterwards.
@@ -617,11 +638,11 @@ The specific attacks are tests:
 
 The achievable guarantee is **repeatable declared inputs**: two runs with the same execution manifest get the same inputs. M3 shows this with reruns before it is claimed.
 
-- **Images pinned by digest.** The verification image is pinned in the policy. Nested images are pinned too: `FROM python:3.12-slim` in `Dockerfile` and `Dockerfile.monitor` becomes `FROM python:3.12-slim@sha256:…`. The driver rejects a Dockerfile `FROM` without a digest.
+- **Images pinned by digest.** The verification image (the CI VM template) is pinned in the policy by the digest of its disk image. Container images the steps build or pull are pinned too: `FROM python:3.12-slim` in `Dockerfile` and `Dockerfile.monitor` becomes `FROM python:3.12-slim@sha256:…`. The driver rejects a Dockerfile `FROM` without a digest.
 - **Lockfiles with hashes.** `requirements-dev.lock` has no `--hash` lines today. It is regenerated with hashes, and installs run with `pip install --require-hashes`. `dashboard/package-lock.json` already carries `integrity` hashes, and installs use `npm ci`.
 - **Dependencies through a cache or mirror.** VM 20101 runs a PyPI pull-through proxy and an npm registry proxy; Docker pulls go through 10.20.1.19. CI VMs cannot reach `pypi.org` or `registry.npmjs.org` directly; only the mirror can. This also gives the `dashboard` check its npm path, which revision 1's network rule blocked.
-- **Services in the image.** Redis, which the integration and stress targets need, is in the verification image.
-- **Execution manifest.** Each check records: candidate SHA and tree, policy digest, VM template version, verification image digest, lockfile digests, a digest of the resolved package set (`pip freeze` and `npm ls` output), and nested base-image digests.
+- **Services in the template.** Redis, which the integration and stress targets need, and the Docker daemon are in the verification image.
+- **Execution manifest.** Each check records: candidate SHA and tree, policy digest, verification image (template) digest, lockfile digests, a digest of the resolved package set (`pip freeze` and `npm ls` output), and nested base-image digests.
 
 ### Deploys
 
@@ -632,7 +653,14 @@ Deploys get a **separate profile**, the `deploy` task type. They are never a var
 - **Network:** the deploy VM reaches only its target and the dependency mirror.
 - **Execution:** the deploy script comes from trusted code at the `main` tip, as the grading driver does. Deploys to one target are serialized by a per-target lock. A deploy is never retried automatically; a failure leaves the target as it is and alarms.
 - **Rollback:** a deploy of the previous artifact digest, through the same command.
-- **The controller deploying to itself is exempt from quarantine.** When the target is VM 20000, a stop left `PENDING` by an earlier self-deploy does not quarantine the target. Otherwise one failed self-deploy would leave no way to deploy a fix or roll the controller back. The exemption covers only that target, and every use of it is audited.
+- **The controller deploying to itself has its own procedure, and is exempt from quarantine.** A deploy to VM 20000 restarts the process that tracks it, so the ordinary deploy rules do not fit:
+  1. The controller enters `MAINTENANCE` and writes a "self-deploy in progress" row naming the artifact digest, the previous digest and a deadline that covers the restart.
+  2. The deploy runs and restarts the controller.
+  3. On start, before any reaper or deploy rule runs, startup reconciliation reads that row. It compares its own running version with the recorded digest, and marks the deploy `SUCCEEDED` or `FAILED` from that evidence. It never leaves the stop `PENDING`.
+  4. Run Store schema migrations run under the single-writer lock before any ordinary endpoint opens. The old process must have released the lock first.
+  5. The controller leaves `MAINTENANCE`.
+
+  A self-deploy never quarantines VM 20000. Otherwise one failed self-deploy would leave no way to deploy a fix, and rolling back to the previous digest is always allowed. The exemption covers only that target, and every use of it is audited.
 
 ### Capacity
 
@@ -662,8 +690,16 @@ From these numbers:
 
   That is at most 8 worker VMs at once, plus VMs 20000, 20100 and 20101. `main` sets may also use idle change slots; change checks never use the `main` slot.
 - **No borrowing at the start.** Agent tasks cannot use CI slots and checks cannot use agent slots. An agent Attempt waiting on its own checks holds only its agent slot, so there is no circular wait.
-- **Priority within the change-check slots:** required members on the newest heads first, then same-Attempt checks, then optional members; ties by age.
-- **Check-start latency target:** p95 under 5 min from push to first step, measured in M0 and M3.
+- **Priority within the change-check slots:** required members on the newest heads first, then same-Attempt checks, then manual runs, then optional members; ties by age. **Aging crosses classes:** a member that has waited 10 minutes moves to the front of the next-higher class, so no class waits forever behind a stream of new heads.
+- **`main` has a bounded start.** The reserved `main` slot means a `main` set's first member starts within one member's runtime (about 11 min at p95) of the merge, however many heads are queued.
+- **Admission limits:**
+  - each subject may start at most 10 manual check runs per hour;
+  - each Attempt may make at most 10 same-Attempt check requests;
+  - the project may have at most 20 queued change-check members. Beyond that, new requests wait as `waiting(capacity)`.
+
+  Superseded members leave the queue at once and stop counting toward these limits. A running member kept by the supersede debounce still counts.
+- **Pending stops still use capacity.** A VM whose stop is `PENDING` keeps its slot until the stop is confirmed or the VM is destroyed, so capacity accounting matches what is physically running.
+- **Check-start latency target:** p95 under 5 min from push to first step, measured in M0 and M3. M3 also includes a saturation case: new heads arriving continuously for an hour, during which every `main` set must start within the bound above.
 
 Not yet measured, and an M0 exit check: linked-clone boot time on pve-test, and pve-test's CPU, RAM, storage and clone I/O headroom with fleet A and the Actions runners at their own peaks. If the headroom does not cover 8 worker VMs, the agent slots drop to 1 first. The `main` slot is never given up.
 
@@ -733,13 +769,21 @@ Each stage has an exit check, and nothing advances on a calendar.
 
 ### M4: single-writer handoff
 
-1. **Freeze every writer.** Fleet A stops taking `orcest:ready` for this repo (Austin's step). Fleet B goes `DISPATCH_PAUSED`, and the controller refuses publication and merge commands, **including from humans**. On GitHub, Austin locks `master` against human merges. The freeze holds until step 7.
-2. Drain or fence in-flight work in both fleets. No fleet A run, PR merge or publication retry for this repo may remain.
+1. **Freeze every writer.**
+   - Fleet A stops taking `orcest:ready` for this repo (Austin's step).
+   - Fleet B goes `DISPATCH_PAUSED`. The controller writes a durable **publication freeze** row for the project, with a new **handoff epoch** number.
+   - While the row exists, the controller refuses publication and merge commands, **including from humans**. Queued publication and merge effects in the outbox are held, not run. Retries of earlier effects are held. Mirror fetch and push jobs stop.
+   - The row survives restarts: a restarted controller reads it before it starts the outbox.
+   - On GitHub, Austin locks `master` against human merges. The lock is the fence for fleet A's publishers, since stopping its intake alone does not stop a merge or publication already under way.
+   - The freeze holds until step 7.
+2. Drain or fence in-flight work in both fleets. No fleet A run, PR merge or publication retry for this repo may remain. Fleet B's held effects are reconciled one by one: each is applied deliberately or cancelled, and the choice is audited.
 3. Reconcile: every open fleet B Change Request is either merged on GitHub or closed; every open fleet A PR is merged, closed or handed to fleet B.
 4. Record the canonical SHA: GitHub `master` and the git host's `main` must be equal, and that SHA is written to the audit log.
 5. Remove the old write authority: GitHub branch protection on `master` allows only `github-mirror-bot`.
-6. Enable exactly one mirror direction (git host to GitHub), and give the merge command the right to move `main`.
+6. Invalidate every effect stamped with an older handoff epoch, so nothing queued before the handoff can run afterwards. Then enable exactly one mirror direction (git host to GitHub), and give the merge command the right to move `main`.
 7. Lift the freeze and resume fleet B.
+
+**Between M4 and M5**, GitHub keeps running `ci.yml` on each mirror push to `master`, as a cross-check against fleet B's own `main` sets, and `claude-review.yml` keeps running for any remaining published PRs. Austin watches `master-verified` in that window. A red `master-verified` alarms in fleet B's dashboard but does not block fleet B's merges; Austin decides whether it means a parity gap. The `push` trigger goes away with the rest of Actions at M5.
 
 ### Rollback never deletes data
 
@@ -752,7 +796,7 @@ Rollback is an ordered transfer of state, not a teardown. Nothing is destroyed a
 
 **Steps.**
 
-1. Freeze: fleet B goes `INTAKE_PAUSED` and `DISPATCH_PAUSED`, and the controller refuses publication and merge commands, including from humans.
+1. Freeze: fleet B goes `INTAKE_PAUSED` and `DISPATCH_PAUSED`, and writes the same durable publication freeze row as the M4 handoff, with a new handoff epoch.
 2. Drain or fence live work, using the fence-first path; wait for every stop to be confirmed or listed.
 3. Reconcile publications: push every open Change Request head to GitHub as a draft PR from `selfhosted/<cr-id>`.
 4. Export and verify, to storage off VMs 20000 and 20100:
@@ -761,7 +805,7 @@ Rollback is an ordered transfer of state, not a teardown. Nothing is destroyed a
    - the native backlog as JSON and as GitHub issues (created by Austin, or by `github-mirror-bot` with his approval).
 5. Compare exact refs: GitHub `master` must equal the git host's `main` (after M4), or the git host's `main` must still be a fast-forward mirror of GitHub (before M4).
 6. Hand the canonical writer back: after M4, re-enable GitHub as canonical (branch protection back to its pre-M4 state) and turn the mirror off. Before M4, GitHub never stopped being canonical.
-   - **After M5, also restore GitHub CI** before anyone merges on GitHub. Austin re-enables Actions for the repo, confirms that runners matching `[self-hosted, linux]` are registered (the shared fleet stayed, per M5), and confirms a `ci.yml` run on `master` is green. Then `master-verified` is re-enabled.
+   - **After M5, also restore GitHub CI before reopening GitHub merges and fleet A intake.** Austin re-enables Actions and the intended workflows for the repo. He confirms that runners matching `[self-hosted, linux]` are registered: the shared fleet stayed, per M5, and the registration assets and credentials stay with `selfhosted-runners`. Then the required `ci.yml` suite runs on the recovered canonical SHA. Only when it is green are `master` merges and fleet A intake reopened and `master-verified` re-enabled. This M5 branch is rehearsed along with the store and git restore.
 7. Stop fleet B's VMs. **Do not destroy them.** They stay stopped until Austin has confirmed the restored state and the recovered work.
 
 Deleting fleet B is a separate, later decision by Austin. It deletes only VMs that pass every [ownership check](#vm-id-ownership), then `/etc/orcest-sh`, `/opt/orcest-sh` and fleet B's snippets.
@@ -774,7 +818,7 @@ Deleting fleet B is a separate, later decision by Austin. It deletes only VMs th
 | Astra 11, Fable M4 (reproducibility) | Done above: [Reproducible builds](#reproducible-builds). |
 | Astra 12 (not the v1 VERIFY contract) | Done above: [Verification Sets](#verification-sets). |
 | Astra 13, Fable M7 (VM allocation and ownership) | Done above: [VM ID ownership](#vm-id-ownership). Remaining: the four unverified items listed there. |
-| Astra 14, Fable L5 (parity exit check) | Before M3, freeze a **parity manifest** mapping every GitHub job and trigger (including the advisory dashboard audit, `integration`, `docker` and `master-verified`) to its fleet B counterpart, with each intended difference approved by Austin. Compare exact trees, not just SHAs (GitHub CI checks out `github.sha`, a merge ref, for PRs). N = 20 consecutive changes, including at least one each of: a failing test, a setup failure, a step timeout, a superseded head, a controller restart mid-check, and a saturated CI pool. Any unexplained or unapproved mismatch blocks M4. |
+| Astra 14 (parity exit check; also the blank N noted in Fable L5) | Before M3, freeze a **parity manifest** mapping every GitHub job and trigger (including the advisory dashboard audit, `integration`, `docker` and `master-verified`) to its fleet B counterpart, with each intended difference approved by Austin. Compare exact trees, not just SHAs (GitHub CI checks out `github.sha`, a merge ref, for PRs). N = 20 consecutive changes, including at least one each of: a failing test, a setup failure, a step timeout, a superseded head, a controller restart mid-check, and a saturated CI pool. Any unexplained or unapproved mismatch blocks M4. |
 | Astra 15, Fable M3 (deploys) | Done above: [Deploys](#deploys). |
 | Fable M1 (state and reason overlap) | Done above: v1's `CANCELLED` and `SUPERSEDED` with reasons in place of a `killed` state, `cancelling` as a flag, check verdict separate from failure, and ladder `SUSPECT` not flagged. For deterministic tasks the `suspect` flag is heartbeat-only, because a step timeout fences at once. |
 | Fable M2 (human waits failing on deadline) | Done above: `waiting(human)` never fails on time. |
@@ -788,9 +832,35 @@ Deleting fleet B is a separate, later decision by Austin. It deletes only VMs th
 
 ## Review findings addressed
 
-### Second round (Astra-2, Fable-2)
+### Second round (Astra-2, Fable-2), by finding
 
-The second-round review files were not available on the machine that made this revision. This table maps Austin's decisions on them to sections, rather than mapping review finding numbers.
+Both second-round reviews were of revision 2 (`d3dc3fd`). Each finding was checked against revision 3, and anything still open was fixed in revision 4.
+
+| Finding | Where it is addressed |
+|---|---|
+| Astra-2 #2, Fable-2 N4 (protected paths, test counts) | [Grading driver](#the-grading-driver-is-trusted-code): globs including nested `conftest.py`, `pytest.ini`, `tox.ini`, `setup.cfg` and `.coveragerc` whether or not they exist; mandatory, validated test reports; the baseline floor; a `main` inventory check of what the steps actually use; adversarial tests. |
+| Astra-2 #3 (patch-ID approval carry-over) | [Merge rules](#merge-rules): carry-over removed; a new approval for every head, target or policy change. |
+| Astra-2 #7, Fable-2 N1 (state model, worker-reported failures) | [v1 records](#v1-records-and-the-dashboard-view), [How an Attempt ends](#how-an-attempt-ends) with its race table, [Termination](#termination-fence-first). |
+| Astra-2 #8, Fable-2 N9 (starvation, admission limits) | [Capacity](#capacity): reserved `main` slot, aging across classes, per-subject, per-Attempt and per-project limits, pending stops counted, saturation test. |
+| Astra-2 #9 (freeze not durable; mirror lag) | [M4 handoff](#m4-single-writer-handoff): durable freeze row, held effects, handoff epoch; [Before cutover](#before-cutover-main-is-a-mirror): `merged` needs the mirror to contain the merge. |
+| Astra-2 #12 (verification object model) | [Verification Sets](#verification-sets): per-pipeline Activities, outcome precedence, `INCOMPLETE`, retries and finality. |
+| Astra-2 N1 (same-Attempt loop vs. admission) | [Same-Attempt checks](#same-attempt-checks): fenced non-terminal Candidate admission, scope, retention, invalidation. |
+| Astra-2 N2 (shared runner retirement) | [Migration stages](#migration-stages) M5 and [selfhosted-runners](#selfhosted-runners-merges-into-orcest). |
+| Astra-2 N3 (sessions after revocation) | [Dashboard sign-in](#dashboard-sign-in): per-request checks, authorization revision, rotation overlap, test. |
+| Astra-2 N4 (Redis ACL) | [Fleet trust](#fleet-trust): one ACL user per worker, own keys only, command allowlist, no stream access. |
+| Astra-2 N5 (rollback after M5) | [Rollback](#rollback-never-deletes-data) step 6. |
+| Fable-2 N2 (controller self-deploy) | [Deploys](#deploys): self-deploy procedure and quarantine exemption. |
+| Fable-2 N3 (rebase per merge) | [Merge rules](#merge-rules): automatic, debounced rebase. A merge queue that carries approvals is not adopted, because approvals no longer carry over. |
+| Fable-2 N5 (dashboard session as subject) | [Tokens](#control-and-audit): sessions are not subjects. Several tokens per person is not adopted; one token per person or bot is Austin's decision. |
+| Fable-2 N6 (CLI bootstrap) | [Tokens](#control-and-audit): root-only Unix socket, `local-root`, first `admin` token. |
+| Fable-2 N7 (where steps run) | [Every run starts fresh](#3-ci-deterministic-check-tasks), [Reproducible builds](#reproducible-builds): the verification image is the CI VM template; steps run on the VM, with its own Docker daemon. |
+| Fable-2 N8 (boot ID source) | [The reaper](#the-reaper) rule 1. |
+| Fable-2 N10 (GitHub CI between M4 and M5) | [M4 handoff](#m4-single-writer-handoff), the closing paragraph. |
+| Fable-2 L5 note (label) | [Medium findings](#medium-findings-planned-fixes) parity row relabelled. |
+
+### Second round (Astra-2, Fable-2), by decision
+
+Austin's decisions on the second round, made before the review files were available here:
 
 | Decision | Section |
 |---|---|
@@ -808,7 +878,7 @@ The second-round review files were not available on the machine that made this r
 | Astra Mediums: revoking a token ends its dashboard sessions | [Dashboard sign-in](#dashboard-sign-in) |
 | Astra Mediums: one Redis ACL user per worker | [Fleet trust](#fleet-trust) |
 | Astra Mediums: a rollback after M5 restores GitHub CI | [Rollback](#rollback-never-deletes-data) |
-| Lows: Fable's wording issues | A general wording pass; see the note above about the review files. |
+| Lows: Fable's wording issues | Fable-2 N5 to N10 and the L5 label, in the table above. |
 
 ### First round (Astra, Fable)
 
